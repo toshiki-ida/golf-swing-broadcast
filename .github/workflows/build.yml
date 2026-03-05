@@ -1,0 +1,54 @@
+name: Build Golf Swing Broadcast EXE
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build EXE with PyInstaller
+        run: |
+          pyinstaller --onefile --windowed --name=GolfSwingBroadcast `
+            --hidden-import=tkinter `
+            --hidden-import=customtkinter `
+            --hidden-import=numpy `
+            --hidden-import=scipy `
+            --hidden-import=scipy.interpolate `
+            --hidden-import=cv2 `
+            --hidden-import=PIL `
+            --hidden-import=comtypes `
+            --hidden-import=comtypes.client `
+            --hidden-import=hid `
+            --collect-data customtkinter `
+            app.py
+        shell: pwsh
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: GolfSwingBroadcast-${{ github.sha }}
+          path: dist/*.exe
+          retention-days: 30
