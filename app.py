@@ -44,6 +44,7 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from decklink_io import DeckLinkInput, DeckLinkOutput, enumerate_decklink_devices
+from field_processor import CaptureMode, CAPTURE_MODE_LABELS, CAPTURE_MODE_EFFECTIVE_FPS
 from recorder import Recorder
 from clip_manager import ClipManager, ClipData, TrajectoryData
 from trajectory import (
@@ -142,6 +143,7 @@ class AppSettings:
             "width": 1920,
             "height": 1080,
             "fps": 29.97,
+            "capture_mode": "normal",
             "shuttle_buttons": dict(DEFAULT_SHUTTLE_BUTTONS),
         }
         self._load()
@@ -294,19 +296,77 @@ class GolfBroadcastApp(ctk.CTk):
         ctk.CTkButton(ctrl, text="入力停止", width=100,
                        command=self._stop_capture).pack(side="right", padx=5)
 
+        # 入力モード選択
+        mode_frame = ctk.CTkFrame(ctrl, fg_color="transparent")
+        mode_frame.pack(side="left", padx=15)
+
+        ctk.CTkLabel(mode_frame, text="入力モード:", font=("", 12)).pack(
+            side="left", padx=(0, 6))
+
+        saved_mode = self.settings.data.get("capture_mode", "normal")
+        mode_values = list(CAPTURE_MODE_LABELS.values())
+        self._capture_mode_seg = ctk.CTkSegmentedButton(
+            mode_frame,
+            values=mode_values,
+            command=self._on_capture_mode_changed,
+        )
+        default_label = CAPTURE_MODE_LABELS.get(
+            CaptureMode(saved_mode), CAPTURE_MODE_LABELS[CaptureMode.Normal]
+        )
+        self._capture_mode_seg.set(default_label)
+        self._capture_mode_seg.pack(side="left")
+
+        self._fps_display = ctk.CTkLabel(
+            mode_frame,
+            text=f"実効: {CAPTURE_MODE_EFFECTIVE_FPS[CaptureMode(saved_mode)]:.2f} fps",
+            font=("", 11),
+            text_color="#888888",
+        )
+        self._fps_display.pack(side="left", padx=(8, 0))
+
         # タイマー更新
         self._update_capture_timer_id = None
+
+    def _get_current_capture_mode(self) -> CaptureMode:
+        """現在選択中のキャプチャモードを返す"""
+        if hasattr(self, "_capture_mode_seg"):
+            label = self._capture_mode_seg.get()
+            for mode, lbl in CAPTURE_MODE_LABELS.items():
+                if lbl == label:
+                    return mode
+        saved = self.settings.data.get("capture_mode", "normal")
+        return CaptureMode(saved)
+
+    def _on_capture_mode_changed(self, value: str):
+        """モード切替コールバック: DeckLinkに即時反映"""
+        mode = CaptureMode.Normal
+        for m, lbl in CAPTURE_MODE_LABELS.items():
+            if lbl == value:
+                mode = m
+                break
+        # 設定保存
+        self.settings["capture_mode"] = mode.value
+        # 実効fps表示更新
+        fps = CAPTURE_MODE_EFFECTIVE_FPS[mode]
+        if hasattr(self, "_fps_display"):
+            self._fps_display.configure(text=f"実効: {fps:.2f} fps")
+        # キャプチャ中なら即時反映
+        if self.deck_input:
+            self.deck_input.capture_mode = mode
+        print(f"[App] キャプチャモード変更: {mode.value} (実効fps={fps:.2f})")
 
     def _start_capture(self):
         """DeckLink/カメラ入力開始"""
         if self.deck_input:
             self.deck_input.stop()
 
+        mode = self._get_current_capture_mode()
         self.deck_input = DeckLinkInput(
             self.settings["input_device"],
             self.settings["width"],
             self.settings["height"],
             self.settings["fps"],
+            capture_mode=mode,
         )
         try:
             self.deck_input.start(frame_callback=self._on_capture_frame)
@@ -400,7 +460,7 @@ class GolfBroadcastApp(ctk.CTk):
         else:
             if not self.deck_input:
                 self._start_capture()
-            # インタレース入力の場合は59.94fpsで録画
+            # 実効fps (通常=59.94fps / 倍速HFR 2x=119.88fps) で録画
             rec_fps = self.deck_input.effective_fps if self.deck_input else self.settings["fps"]
             self.recorder.start_recording(fps=rec_fps)
             fps_label = f" ({rec_fps:.2f}fps)" if rec_fps != self.settings["fps"] else ""
@@ -1999,6 +2059,9 @@ class GolfBroadcastApp(ctk.CTk):
             self.settings["fps"] = float(self.fps_combo.get())
         except ValueError:
             pass
+
+        # キャプチャモード
+        self.settings["capture_mode"] = self._get_current_capture_mode().value
 
         # ShuttlePRO ボタンマッピング
         btn_map = {}

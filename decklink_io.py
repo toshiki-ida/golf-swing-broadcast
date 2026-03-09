@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from field_processor import CaptureMode, make_processor, CAPTURE_MODE_EFFECTIVE_FPS
+
 # =============================================================================
 # DeckLink SDK COM type library の読み込み
 # =============================================================================
@@ -197,9 +199,11 @@ class DeckLinkCaptureDevice:
     UYVY → BGR 変換を行い、OpenCVフレームとして提供する。
     """
 
-    def __init__(self, device_com, width=1920, height=1080, fps=29.97):
+    def __init__(self, device_com, width=1920, height=1080, fps=29.97,
+                 capture_mode=None):
         """
-        device_com: comtypes POINTER(IDeckLink) デバイスオブジェクト
+        device_com:    comtypes POINTER(IDeckLink) デバイスオブジェクト
+        capture_mode:  CaptureMode.Normal または CaptureMode.HighFrameRate2x
         """
         self.width = width
         self.height = height
@@ -212,6 +216,11 @@ class DeckLinkCaptureDevice:
         self._user_callback = None
         self._interlaced = True  # 1080i: デインタレース有効
         self._upper_field_first = True  # 上フィールドが先 (field dominance = 5)
+
+        # フレーム処理モード (通常 / HFR 2x) — Strategy パターン
+        self._capture_mode = capture_mode if capture_mode is not None else CaptureMode.Normal
+        self._processor = make_processor(self._capture_mode)
+        self._input_frame_no = 0  # DeckLink 入力フレーム通番 (ログ用)
 
         # IDeckLinkInput を QueryInterface で取得
         self._input = _qi(
@@ -259,8 +268,23 @@ class DeckLinkCaptureDevice:
         print("[DeckLink Input] Capture started (1080i59.94 YUV422 + format detection)")
 
     @property
+    def capture_mode(self):
+        return self._capture_mode
+
+    @capture_mode.setter
+    def capture_mode(self, mode: CaptureMode):
+        """モードを動的に切り替える (キャプチャ中でも可)"""
+        self._capture_mode = mode
+        self._processor = make_processor(mode)
+        print(f"[DeckLink] キャプチャモード変更: {mode.value} "
+              f"(実効fps={self.effective_fps:.2f})")
+
+    @property
     def effective_fps(self):
-        """実効FPS (インタレース時は2倍)"""
+        """実効FPS: 通常モード=bob (fps*2) / 倍速モード=119.88fps"""
+        if self._capture_mode == CaptureMode.HighFrameRate2x:
+            # Sony HFR 2x: 1入力フレーム → 2独立フレーム → 約119.88fps
+            return 119.88
         return self.fps * 2 if self._interlaced else self.fps
 
     def _deliver_frame(self, bgr):
@@ -291,34 +315,28 @@ class DeckLinkCaptureDevice:
             uyvy_img = uyvy.reshape(height, width, 2)
             bgr = cv2.cvtColor(uyvy_img, cv2.COLOR_YUV2BGR_UYVY)
 
+            t_proc = time.time()
+
             if height >= 720 and self._interlaced:
-                # フィールド分離デインタレース (bob) → 59.94fps
-                # 上フィールド (偶数ライン: 0, 2, 4, ..., 1078)
-                frame_upper = np.empty_like(bgr)
-                frame_upper[0::2] = bgr[0::2]
-                frame_upper[1:-1:2] = ((bgr[0:-2:2].astype(np.uint16)
-                                        + bgr[2::2].astype(np.uint16)) >> 1
-                                       ).astype(np.uint8)
-                frame_upper[-1] = bgr[-2]
-
-                # 下フィールド (奇数ライン: 1, 3, 5, ..., 1079)
-                frame_lower = np.empty_like(bgr)
-                frame_lower[1::2] = bgr[1::2]
-                frame_lower[0] = bgr[1]
-                frame_lower[2::2] = ((bgr[1:-2:2].astype(np.uint16)
-                                      + bgr[3::2].astype(np.uint16)) >> 1
-                                     ).astype(np.uint8)
-
-                # フィールド順序に応じて配信 (各フィールド = 1フレーム)
-                if self._upper_field_first:
-                    self._deliver_frame(frame_upper)
-                    self._deliver_frame(frame_lower)
-                else:
-                    self._deliver_frame(frame_lower)
-                    self._deliver_frame(frame_upper)
+                # 処理モードに応じてフィールド分離
+                #   通常モード: bob デインターレース → 59.94fps 相当
+                #   倍速モード: フィールド独立展開 (Sony HFR 2x) → 119.88fps 相当
+                self._processor.process(
+                    bgr, self._upper_field_first,
+                    self._deliver_frame, self._input_frame_no,
+                )
             else:
                 # プログレッシブ: そのまま配信
                 self._deliver_frame(bgr)
+
+            proc_ms = (time.time() - t_proc) * 1000
+            import logging as _logging
+            _log = _logging.getLogger("decklink_capture")
+            _log.debug(
+                "frame#%d mode=%s proc=%.1fms",
+                self._input_frame_no, self._capture_mode.value, proc_ms,
+            )
+            self._input_frame_no += 1
 
         except Exception as e:
             import traceback
@@ -715,11 +733,13 @@ class DeckLinkInput:
 
     FRAME_TIMEOUT_SEC = 3.0  # フレーム未到着タイムアウト
 
-    def __init__(self, device_index=0, width=1920, height=1080, fps=29.97):
+    def __init__(self, device_index=0, width=1920, height=1080, fps=29.97,
+                 capture_mode=None):
         self.device_index = device_index
         self.width = width
         self.height = height
         self.fps = fps
+        self._capture_mode = capture_mode if capture_mode is not None else CaptureMode.Normal
         self._decklink = None
         self._fallback = None
         self._frame_callback = None
@@ -738,7 +758,8 @@ class DeckLinkInput:
             print(f"[DeckLink] 入力デバイス: {dev.name}")
             try:
                 self._decklink = DeckLinkCaptureDevice(
-                    dev._com_obj, self.width, self.height, self.fps
+                    dev._com_obj, self.width, self.height, self.fps,
+                    capture_mode=self._capture_mode,
                 )
                 self._decklink.start(frame_callback)
                 self._decklink_start_time = time.time()
@@ -777,11 +798,22 @@ class DeckLinkInput:
         self._fallback.start(frame_callback)
 
     @property
+    def capture_mode(self):
+        return self._capture_mode
+
+    @capture_mode.setter
+    def capture_mode(self, mode: CaptureMode):
+        """モードを動的に切り替える (キャプチャ中でも可)"""
+        self._capture_mode = mode
+        if self._decklink:
+            self._decklink.capture_mode = mode
+
+    @property
     def effective_fps(self):
-        """実効FPS (インタレース入力時は2倍)"""
+        """実効FPS"""
         if self._decklink:
             return self._decklink.effective_fps
-        return self.fps
+        return CAPTURE_MODE_EFFECTIVE_FPS.get(self._capture_mode, self.fps)
 
     def get_frame(self):
         # DeckLinkからフレームが取得できればそれを使う
