@@ -20,6 +20,7 @@ import argparse
 import json
 import logging
 import os
+import queue
 import sys
 import threading
 import time
@@ -217,6 +218,17 @@ class GolfBroadcastApp(ctk.CTk):
         self._playout_json = str(self.project_dir / "playout.json")
         self.playout.load_playlist(self._playout_json)
 
+        # 録画書き込みキュー
+        # DeckLink COMコールバックスレッドを録画I/Oから分離し、カクツキを防止する。
+        # コールバックはフレームをキューに入れるだけ (< 1ms)、
+        # 別スレッドが MP4書き込み + JPEGエンコードを担当する。
+        self._capture_queue: queue.Queue = queue.Queue(maxsize=60)
+        self._capture_write_running = True
+        self._capture_write_thread = threading.Thread(
+            target=self._capture_write_loop, daemon=True, name="CaptureWriteThread"
+        )
+        self._capture_write_thread.start()
+
         # ウィンドウサイズ
         self.geometry("1400x900")
         self.minsize(1200, 700)
@@ -381,9 +393,29 @@ class GolfBroadcastApp(ctk.CTk):
             self.deck_input = None
 
     def _on_capture_frame(self, frame):
-        """キャプチャフレーム受信コールバック"""
+        """キャプチャフレーム受信コールバック (DeckLink COMスレッドから呼ばれる)
+
+        このメソッドはできるだけ早く返す必要がある。
+        録画中はフレームをキューに追加するだけにし、
+        実際のディスク書き込みは _capture_write_loop に委譲する。
+        """
         if self.recorder.is_recording:
-            self.recorder.write_frame(frame)
+            try:
+                self._capture_queue.put_nowait(frame)
+            except queue.Full:
+                pass  # キューが満杯 = フレームドロップ (ディスクが遅い場合)
+
+    def _capture_write_loop(self):
+        """録画書き込みスレッド: キューからフレームを取り出してディスクに書き込む"""
+        while self._capture_write_running:
+            try:
+                frame = self._capture_queue.get(timeout=0.1)
+                self.recorder.write_frame(frame)
+                self._capture_queue.task_done()
+            except queue.Empty:
+                pass
+            except Exception as e:
+                print(f"[CaptureWrite] エラー: {e}")
 
     def _start_capture_preview(self):
         """キャプチャプレビュー更新ループ"""
@@ -2350,6 +2382,10 @@ class GolfBroadcastApp(ctk.CTk):
         self.shuttle.stop()
         if self.recorder.is_recording:
             self.recorder.stop_recording()
+        # 録画書き込みスレッドを停止 (キューを空にしてから終了)
+        self._capture_write_running = False
+        if self._capture_write_thread and self._capture_write_thread.is_alive():
+            self._capture_write_thread.join(timeout=3.0)
         if self.deck_input:
             self.deck_input.stop()
         if self.deck_output:
