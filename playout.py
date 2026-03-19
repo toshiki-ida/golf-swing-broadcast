@@ -12,6 +12,7 @@
 
 import json
 import logging
+import queue
 import threading
 import time
 from pathlib import Path
@@ -218,7 +219,10 @@ class PlayoutEngine:
                 render_trajectory_on_frame(frame, item.swings, adjusted)
             # DeckLink出力 (一時停止中/フレーム送り時もモニター出力)
             if self.output_device:
-                self.output_device.send_frame(frame)
+                clip = item.clip
+                spd = max(self.speed, 0.01)
+                tu = max(round(60000.0 / max(clip.fps, 1) / spd), 1001)
+                self.output_device.send_frame(frame, frame_duration_tu=tu)
             with self._lock:
                 self._preview_frame = frame
             if self.on_frame_update:
@@ -229,90 +233,200 @@ class PlayoutEngine:
         # 読み取りで1フレーム進むので位置を戻す
         self._cap.set(cv2.CAP_PROP_POS_FRAMES, self._current_frame_no)
 
+    # ----- フレーム先読みスレッド -----
+
+    @staticmethod
+    def _reader_fn(path, start_frame, out_frame, swings, clip_in_frame,
+                   stop_event, q):
+        """フレーム先読みスレッド: cap.read + 軌道描画をメインループから分離
+
+        独自の VideoCapture を開くため、メインスレッドと排他制御不要。
+        """
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            log.error(f"_reader_fn: cannot open {path}")
+            try:
+                q.put(None)
+            except Exception:
+                pass
+            return
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        pos = start_frame
+        while not stop_event.is_set() and pos <= out_frame:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if swings:
+                render_trajectory_on_frame(frame, swings, pos - clip_in_frame)
+            try:
+                q.put((frame, pos), timeout=0.2)
+            except queue.Full:
+                if stop_event.is_set():
+                    break
+                continue
+            pos += 1
+        cap.release()
+        try:
+            q.put(None)  # sentinel: 読み取り完了
+        except Exception:
+            pass
+
     # ----- 再生ループ (別スレッド) -----
 
     def _play_loop(self):
-        """再生ループ — このスレッドが _cap を排他使用する"""
+        """再生ループ — フレーム先読み + DeckLinkプリスケジュールで安定出力
+
+        スレッド設計:
+          - _reader_fn スレッド: VideoCapture.read + 軌道描画 → frame_q に積む
+          - _play_loop スレッド (本スレッド): frame_q から取り出し → DeckLink送出 + GUI更新
+          - ディスクI/Oジッターが出力タイミングに影響しない
+          - 再生開始時に PRE_SCHEDULE フレームをスリープなしで送り、
+            DeckLinkスケジュールバッファを事前に満たす
+        """
         log.debug("_play_loop: start")
 
-        # 再生開始時にcapを自分で開き直す (メインスレッドのcapと分離)
-        cap = None
+        # Windows: タイマー分解能を1msに設定 (デフォルト15.625ms → time.sleep精度が大幅改善)
+        _timer_period_set = False
+        try:
+            import ctypes as _ctypes
+            _ctypes.windll.winmm.timeBeginPeriod(1)
+            _timer_period_set = True
+        except Exception:
+            pass
+
+        reader_thread = None
+        reader_stop = threading.Event()
 
         try:
             while self._playing and self.current_index < len(self.playlist):
                 item = self.playlist[self.current_index]
                 clip = item.clip
-
-                # capを開く
-                if cap is None:
-                    path = clip.exported_path if clip.exported_path else clip.source_path
-                    cap = cv2.VideoCapture(path)
-                    if not cap.isOpened():
-                        log.error(f"_play_loop: 開けません: {path}")
-                        cap = None
-                        self.current_index += 1
-                        continue
-                    log.debug(f"_play_loop: opened {path}")
+                path = clip.exported_path if clip.exported_path else clip.source_path
 
                 out_frame = clip.get_out_frame()
                 base_frame_duration = 1.0 / max(clip.fps, 1)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, self._current_frame_no)
 
                 if self.on_clip_changed:
                     self.on_clip_changed(self.current_index, clip)
 
+                # --- フレーム先読みスレッド起動 ---
+                QUEUE_SIZE = 8
+                PRE_SCHEDULE = 4  # DeckLinkパイプラインを埋める初期フレーム数
+                frame_q = queue.Queue(maxsize=QUEUE_SIZE)
+
+                def start_reader(start_frame):
+                    reader_stop.clear()
+                    while not frame_q.empty():
+                        try:
+                            frame_q.get_nowait()
+                        except queue.Empty:
+                            break
+                    t = threading.Thread(
+                        target=self._reader_fn,
+                        args=(path, start_frame, out_frame,
+                              item.swings, clip.in_frame,
+                              reader_stop, frame_q),
+                        daemon=True,
+                    )
+                    t.start()
+                    return t
+
+                reader_thread = start_reader(self._current_frame_no)
+
+                frames_sent = 0
                 was_paused = False
-                while self._playing and self._current_frame_no <= out_frame:
+                gui_last_update = 0.0
+                GUI_INTERVAL = 1.0 / 30  # GUIプレビューは最大30fps
+
+                while self._playing:
+                    # --- 一時停止 ---
                     if self._paused:
                         was_paused = True
                         time.sleep(0.05)
                         continue
 
-                    # 一時停止中にseekされた可能性があるのでcap位置を再同期
+                    # --- 一時停止から復帰: リーダーを再起動 ---
                     if was_paused:
-                        cap.set(cv2.CAP_PROP_POS_FRAMES, self._current_frame_no)
+                        reader_stop.set()
+                        if reader_thread:
+                            reader_thread.join(timeout=1.0)
+                        reader_thread = start_reader(self._current_frame_no)
                         was_paused = False
+                        frames_sent = 0
 
-                    t0 = time.time()
-
-                    ret, frame = cap.read()
-                    if not ret:
-                        log.debug(f"_play_loop: read failed at frame {self._current_frame_no}")
+                    # --- フレーム取得 ---
+                    try:
+                        entry = frame_q.get(timeout=0.2)
+                    except queue.Empty:
+                        if not self._playing:
+                            break
+                        continue
+                    if entry is None:  # sentinel: 読み取り完了
                         break
 
-                    # 軌道を描画
-                    if item.swings:
-                        adjusted_frame = self._current_frame_no - clip.in_frame
-                        render_trajectory_on_frame(frame, item.swings, adjusted_frame)
+                    frame, frame_no = entry
+                    t0 = time.time()
+
+                    self._current_frame_no = frame_no
+
+                    # フレーム表示間隔の計算 (DeckLink + スリープ共通)
+                    spd = max(self.speed, 0.01)
+                    tu = max(round(60000.0 / max(clip.fps, 1) / spd), 1001)
 
                     # DeckLink出力
                     if self.output_device:
-                        self.output_device.send_frame(frame)
+                        self.output_device.send_frame(frame, frame_duration_tu=tu)
 
-                    # プレビュー
+                    # プレビュー保存
                     with self._lock:
                         self._preview_frame = frame
 
-                    if self.on_frame_update:
+                    # GUI更新 (間引き: 30fps上限)
+                    now = time.time()
+                    if self.on_frame_update and (now - gui_last_update) >= GUI_INTERVAL:
                         total = clip.get_duration_frames()
                         self.on_frame_update(
-                            frame, self._current_frame_no - clip.in_frame, total)
+                            frame, frame_no - clip.in_frame, total)
+                        gui_last_update = now
 
-                    self._current_frame_no += 1
+                    self._current_frame_no = frame_no + 1
+                    frames_sent += 1
 
-                    # スロー再生: speed < 1.0 ならフレーム表示時間を延長
-                    spd = max(self.speed, 0.01)
-                    frame_duration = base_frame_duration / spd
+                    # プリスケジュール: 最初の数フレームはスリープなしで
+                    # DeckLinkのスケジュールバッファを満たす
+                    if frames_sent <= PRE_SCHEDULE and self.output_device:
+                        continue
+
+                    # フレーム間タイミング制御
+                    # DeckLink出力時: スケジュール間隔 (tu/TIME_SCALE) に合わせる
+                    # → HFRクリップでも自動的にスローモーション再生
+                    # → フレームプール枯渇を防止 (読み込みが表示を追い越さない)
+                    if self.output_device:
+                        frame_duration = tu / 60000.0
+                    else:
+                        frame_duration = base_frame_duration / spd
                     elapsed = time.time() - t0
                     sleep_time = frame_duration - elapsed
                     if sleep_time > 0:
                         time.sleep(sleep_time)
 
+                # --- リーダースレッド停止 ---
+                reader_stop.set()
+                if reader_thread and reader_thread.is_alive():
+                    reader_thread.join(timeout=1.0)
+                    reader_thread = None
+
+                # 最終フレームのGUI更新 (間引きで未送信の場合)
+                if self.on_frame_update:
+                    total = clip.get_duration_frames()
+                    offset = min(
+                        max(self._current_frame_no - 1 - clip.in_frame, 0),
+                        total - 1)
+                    pf = self.preview_frame
+                    if pf is not None:
+                        self.on_frame_update(pf, offset, total)
+
                 # クリップ末尾で停止 (自動進行しない — 放送用途)
-                if cap:
-                    cap.release()
-                    cap = None
-                # 末尾フレームに留まる
                 clip = self.playlist[self.current_index].clip
                 self._current_frame_no = clip.get_out_frame()
                 break
@@ -320,8 +434,15 @@ class PlayoutEngine:
         except Exception as e:
             log.exception(f"_play_loop: exception: {e}")
         finally:
-            if cap:
-                cap.release()
+            reader_stop.set()
+            if reader_thread and reader_thread.is_alive():
+                reader_thread.join(timeout=1.0)
+            if _timer_period_set:
+                try:
+                    import ctypes as _ctypes
+                    _ctypes.windll.winmm.timeEndPeriod(1)
+                except Exception:
+                    pass
             log.debug("_play_loop: end")
 
         self._playing = False

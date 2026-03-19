@@ -12,6 +12,7 @@ rvm-decklink-app (C#) の DeckLinkWrapper.cs を参考に実装。
 
 import ctypes
 import ctypes.wintypes
+import queue
 import sys
 import threading
 import time
@@ -222,6 +223,17 @@ class DeckLinkCaptureDevice:
         self._processor = make_processor(self._capture_mode)
         self._input_frame_no = 0  # DeckLink 入力フレーム通番 (ログ用)
 
+        # DeckLink入力フレームレート自動測定
+        # settings["fps"] に依存せず、コールバック実測値から effective_fps を算出する。
+        # 1080i59.94: コールバック ~29.97fps × bob 2倍 = 59.94fps
+        self._callback_times: list = []
+        self._measured_callback_fps = None
+
+        # COMコールバックオフロード用: 生フレームキュー + 処理スレッド
+        # COMコールバックはmemmoveのみ → _process_loop が変換・配信を行う
+        self._raw_queue: queue.Queue = queue.Queue(maxsize=10)
+        self._process_thread = None
+
         # IDeckLinkInput を QueryInterface で取得
         self._input = _qi(
             ctypes.cast(device_com, ctypes.c_void_p).value,
@@ -265,6 +277,12 @@ class DeckLinkCaptureDevice:
         # ストリーム開始
         self._input.StartStreams()
         self._running = True
+
+        # フレーム処理スレッド開始 (UYVY→BGR変換・デインタレースをCOMコールバック外で実行)
+        self._process_thread = threading.Thread(
+            target=self._process_loop, daemon=True, name="DeckLinkProcessThread"
+        )
+        self._process_thread.start()
         print("[DeckLink Input] Capture started (1080i59.94 YUV422 + format detection)")
 
     @property
@@ -281,11 +299,53 @@ class DeckLinkCaptureDevice:
 
     @property
     def effective_fps(self):
-        """実効FPS: 通常モード=bob (fps*2) / 倍速モード=119.88fps"""
-        if self._capture_mode == CaptureMode.HighFrameRate2x:
-            # Sony HFR 2x: 1入力フレーム → 2独立フレーム → 約119.88fps
-            return 119.88
-        return self.fps * 2 if self._interlaced else self.fps
+        """実効FPS: DeckLinkコールバック実測値ベースで算出
+
+        settings["fps"] ではなく実測コールバックレートを使用し、
+        ユーザー設定ミスによる fps 不整合を防止する。
+
+        1080i59.94の場合:
+          コールバック: ~29.97fps (1完全インターレースフレーム/回)
+          bobデインターレース or HFR: 2出力/入力 → ~59.94fps実フレーム
+
+        通常モード: 59.94fps記録 → 等倍再生
+        HFRモード:  29.97fps記録 → 59.94実フレームが29.97fpsで再生
+                    → mp4の尺が実時間の2倍 → 1/2速スローモーション
+        """
+        # 実測値があればそれを優先 (settings["fps"] に依存しない)
+        base_fps = self._measured_callback_fps if self._measured_callback_fps else self.fps
+        if self._interlaced:
+            field_fps = base_fps * 2  # 29.97 × 2 = 59.94 (bob デインタレース)
+            if self._capture_mode == CaptureMode.HighFrameRate2x:
+                # HFR 2x: 59.94実フレームを29.97fpsで記録
+                # → mp4尺 = 実時間 × 2 → 1/2速スローモーション
+                return base_fps  # 29.97
+            return field_fps  # 通常: 59.94fps → 等倍
+        return base_fps
+
+    def _enqueue_raw_frame(self, frame_data_bytes, width, height, row_bytes):
+        """COMコールバックから呼ばれる: 生UYVYデータをキューに積む (超軽量)
+        重い処理 (UYVY→BGR変換、デインタレース) は _process_loop が行う。
+        """
+        try:
+            self._raw_queue.put_nowait((frame_data_bytes, width, height, row_bytes))
+        except queue.Full:
+            pass  # 処理が追いつかない場合はフレームドロップ
+
+    def _process_loop(self):
+        """フレーム処理スレッド: UYVY→BGR変換 + デインタレース + 配信
+        COMコールバックスレッドとは別スレッドで動作するため、
+        numpy演算・GCがDeckLinkタイミングに影響しない。
+        """
+        while self._running:
+            try:
+                item = self._raw_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:  # sentinel: 終了シグナル
+                break
+            frame_data_bytes, width, height, row_bytes = item
+            self._on_frame_arrived(frame_data_bytes, width, height, row_bytes)
 
     def _deliver_frame(self, bgr):
         """フレームを配信 (プレビュー更新 + コールバック)"""
@@ -304,6 +364,18 @@ class DeckLinkCaptureDevice:
         プログレッシブ時: そのまま1フレーム配信
         """
         try:
+            # DeckLinkコールバックレート自動測定
+            now = time.time()
+            self._callback_times.append(now)
+            if len(self._callback_times) > 120:
+                self._callback_times = self._callback_times[-120:]
+            if len(self._callback_times) >= 15:
+                elapsed = self._callback_times[-1] - self._callback_times[0]
+                if elapsed > 0.3:
+                    self._measured_callback_fps = (
+                        (len(self._callback_times) - 1) / elapsed
+                    )
+
             # UYVY → BGR 変換
             uyvy = np.frombuffer(frame_data_copy, dtype=np.uint8).reshape(height, row_bytes)
 
@@ -350,6 +422,13 @@ class DeckLinkCaptureDevice:
     def stop(self):
         """キャプチャ停止"""
         self._running = False
+        # 処理スレッドに終了シグナル (キューが満杯でも無視)
+        try:
+            self._raw_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self._process_thread and self._process_thread.is_alive():
+            self._process_thread.join(timeout=2.0)
         try:
             if self._input:
                 self._input.StopStreams()
@@ -443,7 +522,9 @@ if DECKLINK_AVAILABLE:
                         print(f"[DeckLink] Frame #{self._frame_count}: "
                               f"{width}x{height} rowBytes={row_bytes}")
 
-                    self._capture._on_frame_arrived(
+                    # COMコールバックは memmove + enqueue のみ (軽量)
+                    # 変換・配信は _process_loop スレッドが担う
+                    self._capture._enqueue_raw_frame(
                         bytes(frame_copy), width, height, row_bytes
                     )
 
@@ -483,6 +564,7 @@ class DeckLinkOutputDevice:
         self._frame_pool = []
         self._current_frame_index = 0
         self._scheduled_count = 0
+        self._scheduled_time = 0  # 累積display_time (可変frame_duration対応)
         self._frame_duration = self.FRAME_DURATION_2997
         self._lock = threading.Lock()
 
@@ -524,8 +606,12 @@ class DeckLinkOutputDevice:
         self._running = True
         print("[DeckLink Output] Playback started")
 
-    def _schedule_next_frame(self, frame_com):
-        """フレームをスケジュール"""
+    def _schedule_next_frame(self, frame_com, duration=None):
+        """フレームをスケジュール
+
+        duration: フレーム表示時間 (time-units)。None時はデフォルト値を使用。
+                  可変速再生や異なるfpsクリップに対応。
+        """
         if frame_com is None and self._frame_pool:
             frame_com = self._frame_pool[self._current_frame_index]
             self._current_frame_index = (self._current_frame_index + 1) % self.FRAME_POOL_SIZE
@@ -533,14 +619,20 @@ class DeckLinkOutputDevice:
         if frame_com is None:
             return
 
-        display_time = self._scheduled_count * self._frame_duration
+        dur = duration if duration is not None else self._frame_duration
         self._output.ScheduleVideoFrame(
-            frame_com, display_time, self._frame_duration, self.TIME_SCALE
+            frame_com, self._scheduled_time, dur, self.TIME_SCALE
         )
+        self._scheduled_time += dur
         self._scheduled_count += 1
 
-    def send_frame(self, bgr_frame):
-        """OpenCV BGRフレームをDeckLink出力に送出"""
+    def send_frame(self, bgr_frame, frame_duration_tu=None):
+        """OpenCV BGRフレームをDeckLink出力に送出
+
+        frame_duration_tu: フレーム表示時間 (time-units)。
+            None時はデフォルト値。クリップfpsと再生速度に応じて設定:
+            例: 59.94fps 1x → 1001, 0.5x → 2002, 119.88fps 0.25x → 2002
+        """
         if not self._running or not self._frame_pool:
             return
 
@@ -557,8 +649,6 @@ class DeckLinkOutputDevice:
             self._current_frame_index = (self._current_frame_index + 1) % self.FRAME_POOL_SIZE
 
             # IDeckLinkVideoBuffer に QI して GetBytes (rvm-decklink-app準拠)
-            # comtypes は IDeckLinkMutableVideoFrame の継承チェーンで
-            # GetBytes を解決できないため、明示的に QI が必要
             raw_frame = ctypes.cast(output_frame, ctypes.c_void_p).value
             buffer = _qi(raw_frame, _dl_mod.IDeckLinkVideoBuffer)
             if buffer:
@@ -571,8 +661,8 @@ class DeckLinkOutputDevice:
                 finally:
                     buffer.EndAccess(2)
 
-            # スケジュール
-            self._schedule_next_frame(output_frame)
+            # スケジュール (可変duration対応)
+            self._schedule_next_frame(output_frame, duration=frame_duration_tu)
 
         except Exception as e:
             if not hasattr(self, '_send_error_logged'):
@@ -874,9 +964,9 @@ class DeckLinkOutput:
         self._fallback = DummyOutputDevice()
         self._fallback.start(self.width, self.height, self.fps)
 
-    def send_frame(self, frame):
+    def send_frame(self, frame, frame_duration_tu=None):
         if self._decklink:
-            self._decklink.send_frame(frame)
+            self._decklink.send_frame(frame, frame_duration_tu=frame_duration_tu)
         elif self._fallback:
             self._fallback.send_frame(frame)
 

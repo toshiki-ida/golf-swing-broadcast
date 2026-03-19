@@ -525,12 +525,14 @@ class GolfBroadcastApp(ctk.CTk):
     # =========================================================================
     def _build_clips_tab(self):
         tab = self.tab_clips
-        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_columnconfigure(0, weight=0)
+        tab.grid_columnconfigure(1, weight=1)
         tab.grid_rowconfigure(0, weight=1)
 
-        # リスト
-        list_frame = ctk.CTkFrame(tab)
+        # リスト (左: 固定幅)
+        list_frame = ctk.CTkFrame(tab, width=300)
         list_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+        list_frame.grid_propagate(False)
         list_frame.grid_columnconfigure(0, weight=1)
         list_frame.grid_rowconfigure(1, weight=1)
 
@@ -557,9 +559,8 @@ class GolfBroadcastApp(ctk.CTk):
         self._growing_follow_live = True  # ライブ追従モード
 
         # 右パネル
-        right = ctk.CTkFrame(tab, width=350)
-        right.grid(row=0, column=1, sticky="ns", padx=5, pady=5)
-        right.grid_propagate(False)
+        right = ctk.CTkFrame(tab)
+        right.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
 
         ctk.CTkLabel(right, text="クリップ情報", font=("", 16, "bold")).pack(pady=10)
 
@@ -567,10 +568,9 @@ class GolfBroadcastApp(ctk.CTk):
                                              wraplength=300)
         self.clip_info_label.pack(padx=10, pady=5)
 
-        # プレビュー
-        self.clip_preview_canvas = Canvas(right, width=320, height=180,
-                                           bg="black", highlightthickness=0)
-        self.clip_preview_canvas.pack(padx=10, pady=5)
+        # プレビュー (可能な限り大きく)
+        self.clip_preview_canvas = Canvas(right, bg="black", highlightthickness=0)
+        self.clip_preview_canvas.pack(fill="both", expand=True, padx=10, pady=5)
         self._clip_preview_photo = None
 
         # 名称変更
@@ -683,6 +683,14 @@ class GolfBroadcastApp(ctk.CTk):
             traj = "✓" if clip.has_trajectory else ""
             ctk.CTkLabel(row, text=f"{dur}  {traj}", width=100).grid(row=0, column=2, padx=5)
 
+            # 削除ボタン
+            ctk.CTkButton(
+                row, text="×", width=28, height=28,
+                fg_color="#8B0000", hover_color="#A52A2A",
+                font=("", 14, "bold"),
+                command=lambda cid=clip.id: self._delete_clip_by_id(cid),
+            ).grid(row=0, column=3, padx=(0, 5))
+
             self.clip_widgets.append(row)
             row_idx += 1
 
@@ -718,9 +726,13 @@ class GolfBroadcastApp(ctk.CTk):
         ret, frame = cap.read()
         cap.release()
         if ret:
-            self._clip_preview_photo, _ = frame_to_photo(frame, 320, 180)
+            cw = self.clip_preview_canvas.winfo_width()
+            ch = self.clip_preview_canvas.winfo_height()
+            if cw < 10 or ch < 10:
+                cw, ch = 320, 180
+            self._clip_preview_photo, _ = frame_to_photo(frame, cw, ch)
             self.clip_preview_canvas.delete("all")
-            self.clip_preview_canvas.create_image(160, 90, anchor="center",
+            self.clip_preview_canvas.create_image(cw // 2, ch // 2, anchor="center",
                                                    image=self._clip_preview_photo)
 
     def _select_growing_clip(self):
@@ -758,9 +770,13 @@ class GolfBroadcastApp(ctk.CTk):
         """グローウィングバッファからプレビュー表示"""
         frame = self.recorder.get_buffered_frame(frame_idx)
         if frame is not None:
-            self._clip_preview_photo, _ = frame_to_photo(frame, 320, 180)
+            cw = self.clip_preview_canvas.winfo_width()
+            ch = self.clip_preview_canvas.winfo_height()
+            if cw < 10 or ch < 10:
+                cw, ch = 320, 180
+            self._clip_preview_photo, _ = frame_to_photo(frame, cw, ch)
             self.clip_preview_canvas.delete("all")
-            self.clip_preview_canvas.create_image(160, 90, anchor="center",
+            self.clip_preview_canvas.create_image(cw // 2, ch // 2, anchor="center",
                                                    image=self._clip_preview_photo)
 
     def _on_clip_slider(self, value):
@@ -871,6 +887,13 @@ class GolfBroadcastApp(ctk.CTk):
             self.clip_manager.remove_clip(self._selected_clip_id)
             self._selected_clip_id = None
             self._refresh_clips_list()
+
+    def _delete_clip_by_id(self, clip_id):
+        """クリップリストの行ボタンから直接削除"""
+        self.clip_manager.remove_clip(clip_id)
+        if self._selected_clip_id == clip_id:
+            self._selected_clip_id = None
+        self._refresh_clips_list()
 
     def _open_edit_for_clip(self):
         if not self._selected_clip_id:
@@ -1531,6 +1554,14 @@ class GolfBroadcastApp(ctk.CTk):
                 command=lambda idx=i: self._playout_open_in_edit(idx)
             ).grid(row=0, column=3, padx=3)
 
+            # 削除ボタン
+            ctk.CTkButton(
+                row, text="×", width=28, height=28,
+                fg_color="#8B0000", hover_color="#A52A2A",
+                font=("", 14, "bold"),
+                command=lambda idx=i: self._playout_remove_item(idx),
+            ).grid(row=0, column=4, padx=(0, 3))
+
             self._playout_widgets.append(row)
 
     def _on_playout_seek(self, value):
@@ -1713,6 +1744,15 @@ class GolfBroadcastApp(ctk.CTk):
             self.playout.remove_item(self._playout_selected_idx)
             self._playout_selected_idx = None
             self._refresh_playout_list()
+
+    def _playout_remove_item(self, idx):
+        """送出リストの行ボタンから直接削除"""
+        self.playout.remove_item(idx)
+        if self._playout_selected_idx == idx:
+            self._playout_selected_idx = None
+        elif self._playout_selected_idx is not None and self._playout_selected_idx > idx:
+            self._playout_selected_idx -= 1
+        self._refresh_playout_list()
 
     def _playout_clear(self):
         self.playout.playlist.clear()

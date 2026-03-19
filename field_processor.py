@@ -23,20 +23,23 @@ log = logging.getLogger("field_processor")
 
 
 class CaptureMode(enum.Enum):
-    Normal = "normal"            # 通常モード: bob デインターレース (59.94fps相当)
+    Normal = "normal"            # 通常モード: 上フィールドデインターレース (29.97fps)
     HighFrameRate2x = "hfr_2x"  # 倍速モード: フィールド独立展開 (119.88fps相当)
 
 
 # UI表示用ラベル
 CAPTURE_MODE_LABELS = {
     CaptureMode.Normal:          "通常 (59.94fps)",
-    CaptureMode.HighFrameRate2x: "倍速 HFR 2x (119.88fps)",
+    CaptureMode.HighFrameRate2x: "倍速 HFR 2x (29.97fps記録 → 1/2速スロー)",
 }
 
 # 実効出力fps (録画・表示用)
+# 通常: bob デインタレース → 59.94fps → 等倍再生
+# HFR 2x: フィールド分離 → 59.94fps実出力だが29.97fpsで記録
+#          → mp4尺 = 実時間 × 2 → 1/2速スローモーション
 CAPTURE_MODE_EFFECTIVE_FPS = {
     CaptureMode.Normal:          59.94,
-    CaptureMode.HighFrameRate2x: 119.88,
+    CaptureMode.HighFrameRate2x: 29.97,
 }
 
 
@@ -119,9 +122,11 @@ class IFrameProcessor:
 
 class NormalFrameProcessor(IFrameProcessor):
     """
-    通常モード: bob デインターレース。
-    1入力フレーム → 2出力フレーム (59.94fps相当)。
-    各フィールドの欠けラインを隣接フィールドの補間で埋める。
+    通常モード: bobデインターレース。
+    1入力フレーム → 2出力フレーム (59.94fps)。
+
+    各フィールドを独立にデインターレースして2枚のプログレッシブフレームを生成する。
+    先行フィールド → 後行フィールドの時系列順で emit する。
     """
 
     def process(
@@ -133,28 +138,29 @@ class NormalFrameProcessor(IFrameProcessor):
     ) -> None:
         h, w = bgr.shape[:2]
         if h >= 720:
-            # 上フィールド: 偶数ラインはそのまま、奇数ラインは隣接偶数ラインで補間
-            frame_upper = np.empty_like(bgr)
-            frame_upper[0::2] = bgr[0::2]
-            frame_upper[1:-1:2] = (
+            # 上フィールド: 偶数ラインそのまま、奇数ラインを補間
+            top_out = np.empty_like(bgr)
+            top_out[0::2] = bgr[0::2]
+            top_out[1:-1:2] = (
                 (bgr[0:-2:2].astype(np.uint16) + bgr[2::2].astype(np.uint16)) >> 1
             ).astype(np.uint8)
-            frame_upper[-1] = bgr[-2]
+            top_out[-1] = bgr[-2]
 
-            # 下フィールド: 奇数ラインはそのまま、偶数ラインは隣接奇数ラインで補間
-            frame_lower = np.empty_like(bgr)
-            frame_lower[1::2] = bgr[1::2]
-            frame_lower[0] = bgr[1]
-            frame_lower[2::2] = (
+            # 下フィールド: 奇数ラインそのまま、偶数ラインを補間
+            bot_out = np.empty_like(bgr)
+            bot_out[1::2] = bgr[1::2]
+            bot_out[0] = bgr[1]
+            bot_out[2::2] = (
                 (bgr[1:-2:2].astype(np.uint16) + bgr[3::2].astype(np.uint16)) >> 1
             ).astype(np.uint8)
 
+            # 先行フィールドから時系列順に emit
             if upper_field_first:
-                emit(frame_upper)
-                emit(frame_lower)
+                emit(top_out)
+                emit(bot_out)
             else:
-                emit(frame_lower)
-                emit(frame_upper)
+                emit(bot_out)
+                emit(top_out)
         else:
             emit(bgr)
 
