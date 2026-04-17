@@ -72,6 +72,10 @@ class TrajectoryData:
     color_start_hex: str = "#FFFF00"
     color_end_hex: str = "#FF0000"
     thickness: int = 3
+    end_frame: int = -1  # この時刻以降は軌跡を描画しない (-1=最後まで描画)
+    blur: int = 0        # エッジぼかし量 (0=なし, 最大20)
+    fade_frames: int = 0  # フェードイン/アウトのフレーム数 (0=なし)
+    alpha: float = 0.85  # 線の不透明度 (0.0=完全透明, 1.0=不透明)
 
 
 class ClipManager:
@@ -216,6 +220,10 @@ class ClipManager:
                 "color_start_hex": swing.color_start_hex,
                 "color_end_hex": swing.color_end_hex,
                 "thickness": swing.thickness,
+                "end_frame": getattr(swing, "end_frame", -1),
+                "blur": getattr(swing, "blur", 0),
+                "fade_frames": getattr(swing, "fade_frames", 0),
+                "alpha": getattr(swing, "alpha", 0.85),
             })
 
         with open(traj_path, "w", encoding="utf-8") as f:
@@ -252,6 +260,10 @@ class ClipManager:
                     color_start_hex=d.get("color_start_hex", "#FFFF00"),
                     color_end_hex=d.get("color_end_hex", "#FF0000"),
                     thickness=d.get("thickness", 3),
+                    end_frame=d.get("end_frame", -1),
+                    blur=d.get("blur", 0),
+                    fade_frames=d.get("fade_frames", 0),
+                    alpha=d.get("alpha", 0.85),
                 )
                 swings.append(td)
             return swings

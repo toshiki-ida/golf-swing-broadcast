@@ -299,29 +299,36 @@ class DeckLinkCaptureDevice:
 
     @property
     def effective_fps(self):
-        """実効FPS: DeckLinkコールバック実測値ベースで算出
-
-        settings["fps"] ではなく実測コールバックレートを使用し、
-        ユーザー設定ミスによる fps 不整合を防止する。
+        """実効FPS: bobデインターレース後の実フレームレート (プレビュー・表示用)
 
         1080i59.94の場合:
           コールバック: ~29.97fps (1完全インターレースフレーム/回)
           bobデインターレース or HFR: 2出力/入力 → ~59.94fps実フレーム
-
-        通常モード: 59.94fps記録 → 等倍再生
-        HFRモード:  29.97fps記録 → 59.94実フレームが29.97fpsで再生
-                    → mp4の尺が実時間の2倍 → 1/2速スローモーション
         """
-        # 実測値があればそれを優先 (settings["fps"] に依存しない)
         base_fps = self._measured_callback_fps if self._measured_callback_fps else self.fps
         if self._interlaced:
-            field_fps = base_fps * 2  # 29.97 × 2 = 59.94 (bob デインタレース)
-            if self._capture_mode == CaptureMode.HighFrameRate2x:
-                # HFR 2x: 59.94実フレームを29.97fpsで記録
-                # → mp4尺 = 実時間 × 2 → 1/2速スローモーション
-                return base_fps  # 29.97
-            return field_fps  # 通常: 59.94fps → 等倍
+            return base_fps * 2  # 29.97 × 2 = 59.94
         return base_fps
+
+    @property
+    def recording_fps(self):
+        """録画用FPS: VLC等で正しい速度で再生されるfps値
+
+        通常モード: base_fps (≈29.97) → bob 2フレーム中1つを記録 → 等倍再生
+        HFRモード:  base_fps (≈29.97) → 両フィールド全記録 → 1/2速スロー
+        """
+        return self._measured_callback_fps if self._measured_callback_fps else self.fps
+
+    @property
+    def recording_frame_divisor(self):
+        """録画時のフレーム間引き率
+
+        通常モード: 2 (bob deinterlace 2倍出力の半分を記録 → 等倍)
+        HFRモード:  1 (両フィールド全記録 → スローモーション)
+        """
+        if self._interlaced and self._capture_mode == CaptureMode.Normal:
+            return 2
+        return 1
 
     def _enqueue_raw_frame(self, frame_data_bytes, width, height, row_bytes):
         """COMコールバックから呼ばれる: 生UYVYデータをキューに積む (超軽量)
@@ -900,10 +907,24 @@ class DeckLinkInput:
 
     @property
     def effective_fps(self):
-        """実効FPS"""
+        """実効FPS (プレビュー・表示用)"""
         if self._decklink:
             return self._decklink.effective_fps
         return CAPTURE_MODE_EFFECTIVE_FPS.get(self._capture_mode, self.fps)
+
+    @property
+    def recording_fps(self):
+        """録画用FPS"""
+        if self._decklink:
+            return self._decklink.recording_fps
+        return self.fps
+
+    @property
+    def recording_frame_divisor(self):
+        """録画時フレーム間引き率"""
+        if self._decklink:
+            return self._decklink.recording_frame_divisor
+        return 1
 
     def get_frame(self):
         # DeckLinkからフレームが取得できればそれを使う

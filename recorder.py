@@ -129,6 +129,10 @@ class Recorder:
         with self._lock:
             if not self._recording or self._writer is None:
                 return
+            if not self._writer.isOpened():
+                print("[Recorder] VideoWriter is not opened, stopping")
+                self._recording = False
+                return
             if frame.shape[1] != self.width or frame.shape[0] != self.height:
                 frame = cv2.resize(frame, (self.width, self.height))
             self._writer.write(frame)

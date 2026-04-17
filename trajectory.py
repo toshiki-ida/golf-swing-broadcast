@@ -121,18 +121,49 @@ class TimedSpline:
 # 描画関数
 # =============================================================================
 def draw_gradient_trail(frame, curve_points, color_start_bgr, color_end_bgr,
-                        thickness, alpha=0.85):
-    """グラデーション付きスプライン曲線を描画"""
-    if len(curve_points) < 2:
+                        thickness, alpha=0.85, blur=0):
+    """グラデーション付きスプライン曲線を描画
+
+    Args:
+        blur: エッジぼかし量 (0=なし). 大きいほどトレイルが滑らかに減衰する。
+    """
+    if len(curve_points) < 2 or alpha <= 0.0:
         return
-    overlay = frame.copy()
+
+    if blur <= 0:
+        overlay = frame.copy()
+        total = len(curve_points) - 1
+        for i in range(total):
+            ratio = i / total
+            color = lerp_color_bgr(color_start_bgr, color_end_bgr, ratio)
+            cv2.line(overlay, curve_points[i], curve_points[i + 1],
+                     color, thickness, cv2.LINE_AA)
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        return
+
+    # ぼかしモード: トレイルを黒キャンバスに描画 → ブラー → マスク合成
+    h, w = frame.shape[:2]
+    trail = np.zeros_like(frame)
+    mask = np.zeros((h, w), dtype=np.uint8)
     total = len(curve_points) - 1
     for i in range(total):
         ratio = i / total
         color = lerp_color_bgr(color_start_bgr, color_end_bgr, ratio)
-        cv2.line(overlay, curve_points[i], curve_points[i + 1],
+        cv2.line(trail, curve_points[i], curve_points[i + 1],
                  color, thickness, cv2.LINE_AA)
-    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+        cv2.line(mask, curve_points[i], curve_points[i + 1],
+                 255, thickness, cv2.LINE_AA)
+
+    k = int(blur) * 2 + 1  # 奇数カーネル
+    trail = cv2.GaussianBlur(trail, (k, k), 0)
+    mask = cv2.GaussianBlur(mask, (k, k), 0)
+
+    # マスクを 0-1 に正規化して alpha を掛ける
+    mask_f = (mask.astype(np.float32) / 255.0) * alpha
+    mask_f = mask_f[:, :, np.newaxis]
+    frame_f = frame.astype(np.float32)
+    trail_f = trail.astype(np.float32)
+    np.copyto(frame, (frame_f * (1.0 - mask_f) + trail_f * mask_f).astype(np.uint8))
 
 
 def draw_markers(frame, timed_points, color_start_bgr, color_end_bgr, radius=6):
@@ -150,9 +181,15 @@ def render_trajectory_on_frame(frame, swings, current_frame=None):
 
     current_frame=None の場合は全体を描画
     current_frame=数値 の場合はフレーム同期で部分描画
+
+    swing.end_frame >= 0 の場合、current_frame > end_frame では描画しない
     """
     for swing in swings:
         if len(swing.points) < 2:
+            continue
+        # 終了フレーム以降は描画しない
+        end_f = getattr(swing, 'end_frame', -1)
+        if current_frame is not None and end_f >= 0 and current_frame > end_f:
             continue
 
         c_start = hex_to_bgr(swing.color_start_hex)
