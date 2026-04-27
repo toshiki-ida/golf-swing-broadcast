@@ -1384,6 +1384,7 @@ class GolfBroadcastApp(ctk.CTk):
         self.edit_canvas = Canvas(left, bg="black", highlightthickness=0)
         self.edit_canvas.grid(row=0, column=0, sticky="nsew")
         self.edit_canvas.bind("<Button-1>", self._edit_left_click)
+        self.edit_canvas.bind("<Button-2>", self._edit_middle_click)
         self.edit_canvas.bind("<Button-3>", self._edit_right_press)
         self.edit_canvas.bind("<B3-Motion>", self._edit_right_drag)
         self.edit_canvas.bind("<ButtonRelease-3>", self._edit_right_release)
@@ -1812,6 +1813,17 @@ class GolfBroadcastApp(ctk.CTk):
         swing.points.sort(key=lambda p: p[2])
         print(f"  Point: ({vx}, {vy}) @ frame {self._edit_frame_no}")
         self._edit_update_display()
+
+    def _edit_middle_click(self, event):
+        """中クリック: 最寄りの点を削除"""
+        vx, vy = self._edit_canvas_to_video(event.x, event.y)
+        result = self._edit_find_nearest(vx, vy)
+        thresh = POINT_GRAB_RADIUS / max(self._edit_scale, 0.1)
+        if result and result[2] < thresh:
+            si, pi = result[0], result[1]
+            removed = self._edit_swings[si].points.pop(pi)
+            print(f"  Point deleted: ({removed[0]}, {removed[1]}) @ frame {removed[2]}")
+            self._edit_update_display()
 
     def _edit_find_nearest(self, vx, vy):
         best = None
