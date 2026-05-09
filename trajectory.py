@@ -27,14 +27,57 @@ def lerp_color_bgr(c1, c2, ratio):
 # スプライン補間（フレーム同期版）
 # =============================================================================
 class TimedSpline:
-    """フレーム番号付きポイントからスプライン曲線を構築"""
+    """フレーム番号付きポイントからスプライン曲線を構築
+    handles が指定されている場合はキュービックベジェ補間を使用"""
 
-    def __init__(self, timed_points, resolution=300):
+    def __init__(self, timed_points, resolution=300, handles=None):
         self.points = timed_points
         self.resolution = resolution
+        self.handles = handles or []
         self._curve = []
         self._curve_frames = []
         self._build()
+
+    def _has_any_handle(self):
+        """ハンドルが1つでも設定されているか"""
+        for h in self.handles:
+            if h is not None:
+                return True
+        return False
+
+    def _get_handle(self, idx):
+        """指定indexのハンドルを返す (None なら None)"""
+        if idx < len(self.handles):
+            return self.handles[idx]
+        return None
+
+    def _compute_spline_tangents(self, xs, ys, u_pts):
+        """splprepの微分から各点の接線ベクトルを計算して返す。
+        ベジェモード時、ハンドルなしの点に使い曲線形状を保つ。"""
+        n = len(xs)
+        tangents = [(0.0, 0.0)] * n
+        if n == 2:
+            dx, dy = float(xs[1] - xs[0]), float(ys[1] - ys[0])
+            tangents[0] = (dx, dy)
+            tangents[1] = (dx, dy)
+            return tangents
+        try:
+            k = min(3, n - 1)
+            tck, _ = splprep([xs, ys], u=u_pts, s=0, k=k)
+            # 各制御点のu値での微分を取得
+            dxs, dys = splev(u_pts, tck, der=1)
+            for i in range(n):
+                tangents[i] = (float(dxs[i]), float(dys[i]))
+        except Exception:
+            # フォールバック: Catmull-Rom
+            for i in range(n):
+                if i == 0:
+                    tangents[i] = (float(xs[1] - xs[0]), float(ys[1] - ys[0]))
+                elif i == n - 1:
+                    tangents[i] = (float(xs[-1] - xs[-2]), float(ys[-1] - ys[-2]))
+                else:
+                    tangents[i] = ((xs[i+1] - xs[i-1]) * 0.5, (ys[i+1] - ys[i-1]) * 0.5)
+        return tangents
 
     def _build(self):
         n = len(self.points)
@@ -56,10 +99,17 @@ class TimedSpline:
         total_len = dists[-1]
         u_pts = [d / total_len for d in dists]
 
-        if n == 2:
+        if self._has_any_handle():
+            # splprepの接線を事前計算し、ハンドルなしの点に使う
+            spline_tangents = self._compute_spline_tangents(xs, ys, u_pts)
+            self._build_bezier(xs, ys, frames, u_pts, spline_tangents)
+        elif n == 2:
             u_new = np.linspace(0, 1, self.resolution)
             cx = xs[0] + (xs[1] - xs[0]) * u_new
             cy = ys[0] + (ys[1] - ys[0]) * u_new
+            curve_frames = np.interp(u_new, u_pts, frames)
+            self._curve = [(int(round(x)), int(round(y))) for x, y in zip(cx, cy)]
+            self._curve_frames = curve_frames.tolist()
         else:
             try:
                 k = min(3, n - 1)
@@ -70,10 +120,55 @@ class TimedSpline:
                 u_new = np.linspace(0, 1, self.resolution)
                 cx = np.interp(u_new, u_pts, xs)
                 cy = np.interp(u_new, u_pts, ys)
+            curve_frames = np.interp(u_new, u_pts, frames)
+            self._curve = [(int(round(x)), int(round(y))) for x, y in zip(cx, cy)]
+            self._curve_frames = curve_frames.tolist()
 
-        curve_frames = np.interp(u_new, u_pts, frames)
-        self._curve = [(int(round(x)), int(round(y))) for x, y in zip(cx, cy)]
-        self._curve_frames = curve_frames.tolist()
+    def _build_bezier(self, xs, ys, frames, u_pts, spline_tangents):
+        """ベジェ曲線によるセグメント単位の補間
+        spline_tangents: splprepから計算した各点の接線 (ハンドルなし点で使用)"""
+        n = len(xs)
+        all_pts = []
+        all_frames = []
+
+        for i in range(n - 1):
+            seg_frac = u_pts[i + 1] - u_pts[i]
+            seg_res = max(int(self.resolution * seg_frac), 4)
+
+            p0 = np.array([xs[i], ys[i]], dtype=float)
+            p3 = np.array([xs[i + 1], ys[i + 1]], dtype=float)
+
+            h0 = self._get_handle(i)
+            h1 = self._get_handle(i + 1)
+
+            # 出射制御点 (p0側)
+            if h0 is not None:
+                p1 = p0 + np.array([h0[2], h0[3]], dtype=float)
+            else:
+                # splprep接線をセグメント長でスケール → ベジェ制御点
+                tx, ty = spline_tangents[i]
+                scale = seg_frac / 3.0
+                p1 = p0 + np.array([tx * scale, ty * scale])
+
+            # 入射制御点 (p3側)
+            if h1 is not None:
+                p2 = p3 + np.array([h1[0], h1[1]], dtype=float)
+            else:
+                tx, ty = spline_tangents[i + 1]
+                scale = seg_frac / 3.0
+                p2 = p3 - np.array([tx * scale, ty * scale])
+
+            # キュービックベジェ
+            ts = np.linspace(0, 1, seg_res, endpoint=(i == n - 2))
+            for t in ts:
+                mt = 1 - t
+                pt = mt**3 * p0 + 3 * mt**2 * t * p1 + 3 * mt * t**2 * p2 + t**3 * p3
+                f = frames[i] + (frames[i + 1] - frames[i]) * t
+                all_pts.append((int(round(pt[0])), int(round(pt[1]))))
+                all_frames.append(f)
+
+        self._curve = all_pts
+        self._curve_frames = all_frames
 
     def get_curve_at_frame(self, current_frame):
         """current_frameまでの曲線を返す"""
@@ -194,7 +289,8 @@ def render_trajectory_on_frame(frame, swings, current_frame=None):
 
         c_start = hex_to_bgr(swing.color_start_hex)
         c_end = hex_to_bgr(swing.color_end_hex)
-        spline = TimedSpline(swing.points, 300)
+        handles = getattr(swing, 'handles', None) or None
+        spline = TimedSpline(swing.points, 300, handles=handles)
 
         if current_frame is not None:
             curve = spline.get_curve_at_frame(current_frame)
@@ -211,9 +307,9 @@ def render_trajectory_on_frame(frame, swings, current_frame=None):
                                     swing.thickness, 0.85)
 
 
-def compute_smooth_curve(timed_points, resolution=300):
+def compute_smooth_curve(timed_points, resolution=300, handles=None):
     """全体スプライン曲線を返す"""
     if len(timed_points) < 2:
         return [(p[0], p[1]) for p in timed_points]
-    spline = TimedSpline(timed_points, resolution)
+    spline = TimedSpline(timed_points, resolution, handles=handles)
     return spline.get_full_curve()

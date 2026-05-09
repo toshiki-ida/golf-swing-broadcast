@@ -501,7 +501,8 @@ class PlayoutEngine:
                      "color_start_hex": s.color_start_hex,
                      "color_end_hex": s.color_end_hex,
                      "thickness": s.thickness,
-                     "end_frame": getattr(s, "end_frame", -1)}
+                     "end_frame": getattr(s, "end_frame", -1),
+                     "handles": getattr(s, "handles", [])}
                     for s in item.swings
                 ],
             })
@@ -517,20 +518,20 @@ class PlayoutEngine:
         try:
             with open(p, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            self.playlist.clear()
             for entry in data:
                 clip = ClipData.from_dict(entry["clip"])
-                # ソースファイルが存在しなければスキップ
-                if not Path(clip.source_path).exists():
-                    log.warning(f"ファイルなしスキップ: {clip.source_path}")
-                    continue
                 swings = []
                 for s in entry.get("swings", []):
+                    raw_handles = s.get("handles", [])
+                    handles = [tuple(h) if h else None for h in raw_handles]
                     swings.append(TrajectoryData(
                         points=[tuple(pt) for pt in s.get("points", [])],
                         color_start_hex=s.get("color_start_hex", "#FFFF00"),
                         color_end_hex=s.get("color_end_hex", "#FF0000"),
                         thickness=s.get("thickness", 3),
                         end_frame=s.get("end_frame", -1),
+                        handles=handles,
                     ))
                 self.playlist.append(PlayoutItem(clip, swings))
             log.info(f"{len(self.playlist)}件 読み込み")

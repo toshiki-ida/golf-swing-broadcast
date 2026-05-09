@@ -1,13 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
 import importlib, os
+from PyInstaller.utils.hooks import collect_all
 _ctk_dir = os.path.dirname(importlib.import_module('customtkinter').__file__)
+
+# Collect all submodules, binaries and data for numpy/scipy 2.x compatibility
+_np_datas, _np_binaries, _np_hiddenimports = collect_all('numpy')
+_sp_datas, _sp_binaries, _sp_hiddenimports = collect_all('scipy')
 
 a = Analysis(
     ['app.py'],
     pathex=[],
-    binaries=[],
-    datas=[(_ctk_dir, 'customtkinter')],
-    hiddenimports=['comtypes.stream'],
+    binaries=_np_binaries + _sp_binaries,
+    datas=[(_ctk_dir, 'customtkinter')] + _np_datas + _sp_datas,
+    hiddenimports=['comtypes.stream'] + _np_hiddenimports + _sp_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -76,6 +76,10 @@ class TrajectoryData:
     blur: int = 0        # エッジぼかし量 (0=なし, 最大20)
     fade_frames: int = 0  # フェードイン/アウトのフレーム数 (0=なし)
     alpha: float = 0.85  # 線の不透明度 (0.0=完全透明, 1.0=不透明)
+    # ベジェハンドル: pointsと同じ長さのリスト。各要素は (dx1, dy1, dx2, dy2) または None。
+    # (dx1,dy1) = 入射ハンドル (前の点からの接線方向), (dx2,dy2) = 出射ハンドル (次の点への接線方向)
+    # None の場合はハンドルなし (自動スプライン)
+    handles: list = field(default_factory=list)
 
 
 class ClipManager:
@@ -183,7 +187,7 @@ class ClipManager:
         out_f = clip.get_out_frame()
 
         out_name = f"{clip.name}_trim_{in_f}_{out_f}.mp4"
-        out_path = self.export_dir / out_name
+        out_path = self.clips_dir / out_name
 
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(str(out_path), fourcc, clip.fps,
@@ -224,6 +228,7 @@ class ClipManager:
                 "blur": getattr(swing, "blur", 0),
                 "fade_frames": getattr(swing, "fade_frames", 0),
                 "alpha": getattr(swing, "alpha", 0.85),
+                "handles": getattr(swing, "handles", []),
             })
 
         with open(traj_path, "w", encoding="utf-8") as f:
@@ -255,6 +260,8 @@ class ClipManager:
 
             swings = []
             for d in swing_list:
+                raw_handles = d.get("handles", [])
+                handles = [tuple(h) if h else None for h in raw_handles]
                 td = TrajectoryData(
                     points=[tuple(p) for p in d["points"]],
                     color_start_hex=d.get("color_start_hex", "#FFFF00"),
@@ -264,6 +271,7 @@ class ClipManager:
                     blur=d.get("blur", 0),
                     fade_frames=d.get("fade_frames", 0),
                     alpha=d.get("alpha", 0.85),
+                    handles=handles,
                 )
                 swings.append(td)
             return swings
