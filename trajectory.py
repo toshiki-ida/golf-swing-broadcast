@@ -226,39 +226,63 @@ def draw_gradient_trail(frame, curve_points, color_start_bgr, color_end_bgr,
         return
 
     if blur <= 0:
-        overlay = frame.copy()
+        # ROI限定: フルフレームcopy を回避
+        h, w = frame.shape[:2]
+        margin = thickness + 2
+        pts_arr = np.array(curve_points)
+        x_min = max(0, int(pts_arr[:, 0].min()) - margin)
+        y_min = max(0, int(pts_arr[:, 1].min()) - margin)
+        x_max = min(w, int(pts_arr[:, 0].max()) + margin + 1)
+        y_max = min(h, int(pts_arr[:, 1].max()) + margin + 1)
+
+        roi = frame[y_min:y_max, x_min:x_max]
+        overlay = roi.copy()
         total = len(curve_points) - 1
         for i in range(total):
             ratio = i / total
             color = lerp_color_bgr(color_start_bgr, color_end_bgr, ratio)
-            cv2.line(overlay, curve_points[i], curve_points[i + 1],
-                     color, thickness, cv2.LINE_AA)
-        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+            p0 = (curve_points[i][0] - x_min, curve_points[i][1] - y_min)
+            p1 = (curve_points[i + 1][0] - x_min, curve_points[i + 1][1] - y_min)
+            cv2.line(overlay, p0, p1, color, thickness, cv2.LINE_AA)
+        cv2.addWeighted(overlay, alpha, roi, 1 - alpha, 0, roi)
         return
 
-    # ぼかしモード: トレイルを黒キャンバスに描画 → ブラー → マスク合成
+    # ぼかしモード: ROI限定で処理 (フル解像度float32を回避)
     h, w = frame.shape[:2]
-    trail = np.zeros_like(frame)
-    mask = np.zeros((h, w), dtype=np.uint8)
+    k = int(blur) * 2 + 1  # 奇数カーネル
+    margin = k + thickness  # ブラー + 線幅分のマージン
+
+    # カーブの座標バウンディングボックスを計算
+    pts_arr = np.array(curve_points)
+    x_min = max(0, int(pts_arr[:, 0].min()) - margin)
+    y_min = max(0, int(pts_arr[:, 1].min()) - margin)
+    x_max = min(w, int(pts_arr[:, 0].max()) + margin + 1)
+    y_max = min(h, int(pts_arr[:, 1].max()) + margin + 1)
+    rw, rh = x_max - x_min, y_max - y_min
+
+    # ROIサイズの小さなキャンバスに描画 (座標をオフセット)
+    trail = np.zeros((rh, rw, 3), dtype=np.uint8)
+    mask = np.zeros((rh, rw), dtype=np.uint8)
     total = len(curve_points) - 1
     for i in range(total):
         ratio = i / total
         color = lerp_color_bgr(color_start_bgr, color_end_bgr, ratio)
-        cv2.line(trail, curve_points[i], curve_points[i + 1],
-                 color, thickness, cv2.LINE_AA)
-        cv2.line(mask, curve_points[i], curve_points[i + 1],
-                 255, thickness, cv2.LINE_AA)
+        p0 = (curve_points[i][0] - x_min, curve_points[i][1] - y_min)
+        p1 = (curve_points[i + 1][0] - x_min, curve_points[i + 1][1] - y_min)
+        cv2.line(trail, p0, p1, color, thickness, cv2.LINE_AA)
+        cv2.line(mask, p0, p1, 255, thickness, cv2.LINE_AA)
 
-    k = int(blur) * 2 + 1  # 奇数カーネル
     trail = cv2.GaussianBlur(trail, (k, k), 0)
     mask = cv2.GaussianBlur(mask, (k, k), 0)
 
-    # マスクを 0-1 に正規化して alpha を掛ける
-    mask_f = (mask.astype(np.float32) / 255.0) * alpha
-    mask_f = mask_f[:, :, np.newaxis]
-    frame_f = frame.astype(np.float32)
-    trail_f = trail.astype(np.float32)
-    np.copyto(frame, (frame_f * (1.0 - mask_f) + trail_f * mask_f).astype(np.uint8))
+    # uint8演算で合成 (float32一時配列を回避、cv2 C++ SIMD使用)
+    mask_a = cv2.convertScaleAbs(mask, alpha=alpha)  # mask * alpha → uint8
+    mask3 = cv2.merge([mask_a, mask_a, mask_a])
+    inv_mask3 = cv2.bitwise_not(mask3)  # 255 - mask3
+    roi = frame[y_min:y_max, x_min:x_max]
+    weighted_frame = cv2.multiply(roi, inv_mask3, scale=1.0 / 255.0)
+    weighted_trail = cv2.multiply(trail, mask3, scale=1.0 / 255.0)
+    cv2.add(weighted_frame, weighted_trail, dst=roi)
 
 
 def draw_markers(frame, timed_points, color_start_bgr, color_end_bgr, radius=6):

@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-import importlib, os
+import glob, importlib, os
 from PyInstaller.utils.hooks import collect_all
 _ctk_dir = os.path.dirname(importlib.import_module('customtkinter').__file__)
 
@@ -7,10 +7,17 @@ _ctk_dir = os.path.dirname(importlib.import_module('customtkinter').__file__)
 _np_datas, _np_binaries, _np_hiddenimports = collect_all('numpy')
 _sp_datas, _sp_binaries, _sp_hiddenimports = collect_all('scipy')
 
+# ffmpeg 同梱 (EXEフォルダだけで動作するように)
+_ffmpeg_dir = r'C:\ffmpeg\bin'
+_ffmpeg_files = [(f, '.') for f in
+                 glob.glob(os.path.join(_ffmpeg_dir, 'ffmpeg.exe')) +
+                 glob.glob(os.path.join(_ffmpeg_dir, '*.dll'))
+                 if os.path.exists(f)]
+
 a = Analysis(
     ['app.py'],
     pathex=[],
-    binaries=_np_binaries + _sp_binaries,
+    binaries=_np_binaries + _sp_binaries + _ffmpeg_files,
     datas=[(_ctk_dir, 'customtkinter')] + _np_datas + _sp_datas,
     hiddenimports=['comtypes.stream'] + _np_hiddenimports + _sp_hiddenimports,
     hookspath=[],

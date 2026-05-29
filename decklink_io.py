@@ -231,7 +231,7 @@ class DeckLinkCaptureDevice:
 
         # COMコールバックオフロード用: 生フレームキュー + 処理スレッド
         # COMコールバックはmemmoveのみ → _process_loop が変換・配信を行う
-        self._raw_queue: queue.Queue = queue.Queue(maxsize=10)
+        self._raw_queue: queue.Queue = queue.Queue(maxsize=30)
         self._process_thread = None
 
         # IDeckLinkInput を QueryInterface で取得
@@ -314,20 +314,19 @@ class DeckLinkCaptureDevice:
     def recording_fps(self):
         """録画用FPS: VLC等で正しい速度で再生されるfps値
 
-        通常モード: base_fps (≈29.97) → bob 2フレーム中1つを記録 → 等倍再生
-        HFRモード:  base_fps (≈29.97) → 両フィールド全記録 → 1/2速スロー
+        実測値ではなくモードごとの公称値を返す。
+        DeckLinkハードウェアは正確に規定レートで出力するため、
+        処理負荷で実測が揺れても録画FPSは固定とする。
+        通常モード: 59.94fps (bob全フレーム記録 → 等倍再生)
+        HFRモード:  29.97fps (両フィールド全記録 → 1/2速スロー)
         """
+        if self._interlaced:
+            return CAPTURE_MODE_EFFECTIVE_FPS[self._capture_mode]
         return self._measured_callback_fps if self._measured_callback_fps else self.fps
 
     @property
     def recording_frame_divisor(self):
-        """録画時のフレーム間引き率
-
-        通常モード: 2 (bob deinterlace 2倍出力の半分を記録 → 等倍)
-        HFRモード:  1 (両フィールド全記録 → スローモーション)
-        """
-        if self._interlaced and self._capture_mode == CaptureMode.Normal:
-            return 2
+        """録画時のフレーム間引き率 — 全フレーム記録 (間引きなし)"""
         return 1
 
     def _enqueue_raw_frame(self, frame_data_bytes, width, height, row_bytes):
@@ -337,7 +336,9 @@ class DeckLinkCaptureDevice:
         try:
             self._raw_queue.put_nowait((frame_data_bytes, width, height, row_bytes))
         except queue.Full:
-            pass  # 処理が追いつかない場合はフレームドロップ
+            self._raw_dropped = getattr(self, '_raw_dropped', 0) + 1
+            if self._raw_dropped % 30 == 1:
+                print(f"[DeckLink] raw_queue full, dropped {self._raw_dropped} frames")
 
     def _process_loop(self):
         """フレーム処理スレッド: UYVY→BGR変換 + デインタレース + 配信
@@ -557,7 +558,7 @@ class DeckLinkOutputDevice:
     FRAME_DURATION_5994 = 1001   # 59.94fps
     FRAME_DURATION_2997 = 2002   # 29.97fps
     PREROLL_FRAMES = 4
-    FRAME_POOL_SIZE = 8
+    FRAME_POOL_SIZE = 16
 
     def __init__(self, device_com, width=1920, height=1080, fps=29.97):
         """
@@ -569,11 +570,14 @@ class DeckLinkOutputDevice:
         self._device_com = device_com
         self._running = False
         self._frame_pool = []
+        self._bgra_buf = np.empty((height, width, 4), dtype=np.uint8)
         self._current_frame_index = 0
         self._scheduled_count = 0
         self._scheduled_time = 0  # 累積display_time (可変frame_duration対応)
         self._frame_duration = self.FRAME_DURATION_2997
         self._lock = threading.Lock()
+        self._prev_bgra = None  # 再インターレース用: 前フレームのBGRA
+        self._last_written_frame = None  # 最後にsend_frameで書き込んだDeckLinkフレーム
 
         # IDeckLinkOutput を QueryInterface で取得
         self._output = _qi(
@@ -604,9 +608,24 @@ class DeckLinkOutputDevice:
             self._frame_pool.append(frame)
         print(f"[DeckLink Output] Created {self.FRAME_POOL_SIZE} frame pool")
 
+        # 黒フレーム専用バッファ (preroll用 — プール内フレームの古いデータが表示されるのを防ぐ)
+        self._black_frame = self._output.CreateVideoFrame(
+            self.width, self.height, row_bytes, 0x42475241, 0
+        )
+        raw = ctypes.cast(self._black_frame, ctypes.c_void_p).value
+        buf = _qi(raw, _dl_mod.IDeckLinkVideoBuffer)
+        if buf:
+            buf.StartAccess(2)
+            try:
+                dest = buf.GetBytes()
+                if dest:
+                    ctypes.memset(dest, 0, self.width * self.height * 4)
+            finally:
+                buf.EndAccess(2)
+
         # プリロール (黒フレームを送出)
         for i in range(self.PREROLL_FRAMES):
-            self._schedule_next_frame(None)
+            self._schedule_next_frame(self._black_frame)
 
         # 再生開始
         self._output.StartScheduledPlayback(0, self.TIME_SCALE, 1.0)
@@ -633,9 +652,10 @@ class DeckLinkOutputDevice:
         self._scheduled_time += dur
         self._scheduled_count += 1
 
-    def send_frame(self, bgr_frame, frame_duration_tu=None):
-        """OpenCV BGRフレームをDeckLink出力に送出
+    def send_frame(self, frame, frame_duration_tu=None):
+        """OpenCV BGR/BGRAフレームをDeckLink出力に送出
 
+        frame: BGR (3ch) or BGRA (4ch) numpy配列。4chの場合cvtColorをスキップ。
         frame_duration_tu: フレーム表示時間 (time-units)。
             None時はデフォルト値。クリップfpsと再生速度に応じて設定:
             例: 59.94fps 1x → 1001, 0.5x → 2002, 119.88fps 0.25x → 2002
@@ -644,12 +664,15 @@ class DeckLinkOutputDevice:
             return
 
         try:
-            # BGR → BGRA 変換
-            bgra = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2BGRA)
-            if bgra.shape[1] != self.width or bgra.shape[0] != self.height:
-                bgra = cv2.resize(bgra, (self.width, self.height))
+            if frame.shape[1] != self.width or frame.shape[0] != self.height:
+                frame = cv2.resize(frame, (self.width, self.height))
 
-            frame_data = bgra.tobytes()
+            # BGR→BGRA変換 (4chならスキップ — リーダーで事前変換済み)
+            if frame.shape[2] == 3:
+                cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA, dst=self._bgra_buf)
+                src = self._bgra_buf
+            else:
+                src = frame
 
             # フレームプールの次のフレームにコピー
             output_frame = self._frame_pool[self._current_frame_index]
@@ -664,9 +687,13 @@ class DeckLinkOutputDevice:
                 try:
                     dest_ptr = buffer.GetBytes()
                     if dest_ptr:
-                        ctypes.memmove(dest_ptr, frame_data, len(frame_data))
+                        # numpy配列から直接コピー (tobytes()の中間コピーを回避)
+                        ctypes.memmove(dest_ptr, src.ctypes.data, src.nbytes)
                 finally:
                     buffer.EndAccess(2)
+
+            # 最後に書き込んだフレームを記録 (reset_scheduleのpreroll用)
+            self._last_written_frame = output_frame
 
             # スケジュール (可変duration対応)
             self._schedule_next_frame(output_frame, duration=frame_duration_tu)
@@ -676,9 +703,34 @@ class DeckLinkOutputDevice:
                 print(f"[DeckLink Output] send_frame error: {e}")
                 self._send_error_logged = True
 
+    def reset_schedule(self):
+        """スケジュール時間をリセット (新コンテンツ再生開始時)
+
+        DeckLinkのスケジュール再生クロックを停止→再開し、
+        _scheduled_time を 0 に戻す。プリロールには直前にcue/seekで
+        表示していたフレームを使い、スムーズに再生開始する。
+        """
+        try:
+            self._output.StopScheduledPlayback(0, 0)
+        except Exception:
+            pass
+        self._scheduled_time = 0
+        self._scheduled_count = 0
+        self._current_frame_index = 0
+        # プリロール (cueフレーム優先 → なければ黒)
+        preroll_frame = self._last_written_frame or self._black_frame
+        for i in range(self.PREROLL_FRAMES):
+            self._schedule_next_frame(preroll_frame)
+        self._output.StartScheduledPlayback(0, self.TIME_SCALE, 1.0)
+
+    def clear_interlace_buffer(self):
+        """再インターレース用の前フレームバッファをクリア"""
+        self._prev_bgra = None
+
     def stop(self):
         """出力停止"""
         self._running = False
+        self._prev_bgra = None
         try:
             if self._output:
                 self._output.StopScheduledPlayback(0, 0)
@@ -990,6 +1042,16 @@ class DeckLinkOutput:
             self._decklink.send_frame(frame, frame_duration_tu=frame_duration_tu)
         elif self._fallback:
             self._fallback.send_frame(frame)
+
+    def reset_schedule(self):
+        """スケジュール時間をリセット (新コンテンツ再生開始時)"""
+        if self._decklink:
+            self._decklink.reset_schedule()
+
+    def clear_interlace_buffer(self):
+        """再インターレース用の前フレームバッファをクリア"""
+        if self._decklink:
+            self._decklink.clear_interlace_buffer()
 
     def stop(self):
         if self._decklink:

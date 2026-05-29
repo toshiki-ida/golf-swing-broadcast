@@ -17,14 +17,19 @@ DeckLink入出力、録画、In/Out編集、軌道描画、送出を統合管理
 """
 
 import argparse
+import collections
+import datetime
 import json
 import logging
 import os
 import queue
+import shutil
+import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+import tkinter
 from tkinter import colorchooser, filedialog, Canvas, PanedWindow
 
 # mp4vコーデックのマルチスレッドデコードでクラッシュする問題の対策
@@ -54,6 +59,7 @@ from trajectory import (
 )
 from playout import PlayoutEngine
 from shuttle_pro import ShuttlePRO
+from ffmpeg_writer import FFmpegWriter, find_ffmpeg
 
 # ShuttlePRO v2 ボタンアクション定義
 SHUTTLE_ACTIONS = [
@@ -82,6 +88,49 @@ DEFAULT_SHUTTLE_BUTTONS = {
     "9": "stop",
 }
 
+# キーボードショートカットアクション定義
+# (action_id, label, default_key, tab_context)
+KEYBOARD_ACTIONS = [
+    # 共通 (クリップ・編集・送出)
+    ("frame_fwd",       "+1F",              "d",       "共通"),
+    ("frame_back",      "-1F",              "a",       "共通"),
+    ("frame_fwd_fast",  "+5F",              "w",       "共通"),
+    ("frame_back_fast", "-5F",              "s",       "共通"),
+    ("step_1",          "ステップ 1F",      "F2",      "共通"),
+    ("step_2",          "ステップ 2F",      "F3",      "共通"),
+    ("step_5",          "ステップ 5F",      "F4",      "共通"),
+    ("step_10",         "ステップ 10F",     "F6",      "共通"),
+    # クリップ
+    ("set_in",          "IN点設定",         "i",       "クリップ"),
+    ("set_out",         "OUT点設定",        "o",       "クリップ"),
+    # 編集
+    ("edit_play",       "再生/停止 (編集)", "space",   "編集"),
+    ("edit_set_in",     "IN点設定 (編集)",  "i",       "編集"),
+    ("edit_set_out",    "OUT点設定 (編集)", "o",       "編集"),
+    ("zoom_reset",      "ズームリセット",   "Home",    "編集"),
+    # 送出
+    ("po_play_pause",   "PLAY/PAUSE",       "space",   "送出"),
+    ("po_play",         "PLAY",             "Return",  "送出"),
+    ("po_cue_top",      "CUE (頭出し)",     "Escape",  "送出"),
+    ("po_next",         "次クリップ",       "n",       "送出"),
+    ("po_prev",         "前クリップ",       "p",       "送出"),
+    ("po_speed_1x",     "速度 1x",          "1",       "送出"),
+    ("po_speed_1_2",    "速度 1/2",         "2",       "送出"),
+    ("po_speed_1_4",    "速度 1/4",         "3",       "送出"),
+    ("po_speed_1_8",    "速度 1/8",         "4",       "送出"),
+    # 収録
+    ("toggle_rec",      "REC/STOP",         "F9",      "収録"),
+]
+DEFAULT_KEYBOARD_SHORTCUTS = {a[0]: a[2] for a in KEYBOARD_ACTIONS}
+
+# keysym 表示名マッピング
+KEYSYM_DISPLAY = {
+    "space": "Space", "Return": "Enter", "Escape": "Esc",
+    "Left": "←", "Right": "→", "Up": "↑", "Down": "↓",
+    "Home": "Home", "End": "End",
+    "BackSpace": "BS", "Delete": "Del", "Tab": "Tab",
+}
+
 
 # =============================================================================
 # 設定
@@ -103,8 +152,9 @@ def _compute_fade_alpha(swing, current_frame, base_alpha=0.85):
     """軌道のフェードイン/アウトを考慮した実効アルファを返す。
 
     fade_frames=0 の場合は end_frame を過ぎたら 0、それ以外は base_alpha。
-    fade_frames>0 の場合、最初の点出現から fade_frames かけてフェードイン、
-    終了基準フレーム (end_frame があればそれ、なければ最後の点) 付近で fade_frames かけてフェードアウト。
+    fade_frames>0 の場合、最初の点出現から fade_frames かけてフェードイン。
+    end_frame が設定されていれば、その付近で fade_frames かけてフェードアウト。
+    end_frame 未設定 (-1) の場合はフェードアウトしない (軌道を残す)。
     """
     fade = getattr(swing, "fade_frames", 0)
     end_f = getattr(swing, "end_frame", -1)
@@ -112,8 +162,6 @@ def _compute_fade_alpha(swing, current_frame, base_alpha=0.85):
         return 0.0
 
     first_f = swing.points[0][2]
-    last_f = swing.points[-1][2]
-    end_ref = end_f if end_f >= 0 else last_f
 
     if fade <= 0:
         # 従来挙動: end_frame を過ぎたら非表示
@@ -127,12 +175,15 @@ def _compute_fade_alpha(swing, current_frame, base_alpha=0.85):
     else:
         fi_ratio = min(1.0, (current_frame - first_f) / fade)
 
-    # フェードアウト (end_ref の fade フレーム前から end_ref+fade まで)
-    # end_ref を超えたらフェードアウト中
-    if current_frame <= end_ref:
-        fo_ratio = 1.0
+    # フェードアウト (end_frame 設定時のみ)
+    if end_f >= 0:
+        if current_frame <= end_f:
+            fo_ratio = 1.0
+        else:
+            fo_ratio = max(0.0, 1.0 - (current_frame - end_f) / fade)
     else:
-        fo_ratio = max(0.0, 1.0 - (current_frame - end_ref) / fade)
+        # end_frame 未設定: フェードアウトしない
+        fo_ratio = 1.0
 
     return base_alpha * min(fi_ratio, fo_ratio)
 
@@ -141,12 +192,27 @@ def _compute_fade_alpha(swing, current_frame, base_alpha=0.85):
 # フレームキャッシュ
 # =============================================================================
 class FrameCache:
+    """JPEG圧縮フレームキャッシュ (メモリ効率版)
+
+    フレームをJPEG圧縮して保持し、取得時にデコードする。
+    BGR生フレーム (~6MB/枚) → JPEG (~200KB/枚) で約30倍のメモリ節約。
+    直近アクセスされたフレームはデコード済みLRUキャッシュに保持し、
+    次フレームを先読みデコードして連続コマ送りを高速化する。
+    """
+    _JPEG_QUALITY = 92
+    _LRU_SIZE = 30   # デコード済みフレームのLRU保持数 (~180MB)
+    _PREFETCH = 3    # 先読みフレーム数
+
     def __init__(self, video_path, in_frame=0, out_frame=-1):
-        self.frames = []
+        self._frames_jpg = []  # JPEG bytes のリスト
         self._total_expected = 0
         self._loading = False
         self._video_path = str(video_path)
         self._in_frame = in_frame
+        # デコード済みLRUキャッシュ
+        self._lru_cache = collections.OrderedDict()
+        self._lru_lock = threading.Lock()
+        self._prefetching = set()  # 先読み中のインデックス
 
         cap = cv2.VideoCapture(self._video_path)
         if not cap.isOpened():
@@ -162,8 +228,19 @@ class FrameCache:
         cap.set(cv2.CAP_PROP_POS_FRAMES, in_frame)
         ret, f = cap.read()
         if ret:
-            self.frames.append(f)
+            self._frames_jpg.append(self._encode(f))
         cap.release()
+
+    @staticmethod
+    def _encode(frame):
+        _, buf = cv2.imencode('.jpg', frame,
+                              [cv2.IMWRITE_JPEG_QUALITY, FrameCache._JPEG_QUALITY])
+        return buf.tobytes()
+
+    @staticmethod
+    def _decode(jpg_bytes):
+        arr = np.frombuffer(jpg_bytes, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
     def load_remaining(self, on_done=None):
         """残りフレームをバックグラウンドで読み込み"""
@@ -183,7 +260,7 @@ class FrameCache:
                 ret, f = cap.read()
                 if not ret:
                     break
-                self.frames.append(f)
+                self._frames_jpg.append(self._encode(f))
             cap.release()
             self._loading = False
             if on_done:
@@ -192,11 +269,54 @@ class FrameCache:
         threading.Thread(target=_load, daemon=True).start()
 
     def __len__(self):
-        return self._total_expected if self._total_expected > 0 else len(self.frames)
+        return self._total_expected if self._total_expected > 0 else len(self._frames_jpg)
+
+    def _lru_put(self, idx, frame):
+        """LRUキャッシュにフレームを格納 (スレッドセーフ)"""
+        with self._lru_lock:
+            self._lru_cache[idx] = frame
+            if len(self._lru_cache) > self._LRU_SIZE:
+                self._lru_cache.popitem(last=False)
+
+    def _prefetch(self, current_idx):
+        """隣接フレームをバックグラウンドで先読みデコード"""
+        targets = []
+        for d in range(1, self._PREFETCH + 1):
+            for idx in (current_idx + d, current_idx - d):
+                if 0 <= idx < len(self._frames_jpg) and idx not in self._lru_cache:
+                    targets.append(idx)
+        if not targets:
+            return
+
+        def _do_prefetch():
+            for idx in targets:
+                if idx in self._prefetching:
+                    continue
+                self._prefetching.add(idx)
+                try:
+                    with self._lru_lock:
+                        if idx in self._lru_cache:
+                            continue
+                    if 0 <= idx < len(self._frames_jpg):
+                        frame = self._decode(self._frames_jpg[idx])
+                        self._lru_put(idx, frame)
+                finally:
+                    self._prefetching.discard(idx)
+
+        threading.Thread(target=_do_prefetch, daemon=True).start()
 
     def __getitem__(self, idx):
-        if 0 <= idx < len(self.frames):
-            return self.frames[idx].copy()
+        # LRUキャッシュにヒットすれば即返却 (読み取り専用 — 変更禁止)
+        with self._lru_lock:
+            if idx in self._lru_cache:
+                self._lru_cache.move_to_end(idx)
+                self._prefetch(idx)
+                return self._lru_cache[idx]
+        if 0 <= idx < len(self._frames_jpg):
+            frame = self._decode(self._frames_jpg[idx])
+            self._lru_put(idx, frame)
+            self._prefetch(idx)
+            return frame
         return None
 
 
@@ -219,6 +339,8 @@ class AppSettings:
             "playout_sash_x": 0,   # 0=未設定 (デフォルト width 使用)
             "clips_sash_x": 0,     # 0=未設定
             "edit_sash_x": 0,      # 0=未設定
+            "crf": 18,             # 録画・書き出し品質 (0=ロスレス, 18=高品質, 23=標準, 28=低品質)
+            "growing_buffer_sec": 60,  # グローウィングバッファ最大秒数
             "trajectory_style": {  # 最後に使った軌道スタイル
                 "color_start_hex": "#FFFF00",
                 "color_end_hex": "#FF0000",
@@ -227,6 +349,7 @@ class AppSettings:
                 "fade_frames": 0,
                 "alpha": 0.85,
             },
+            "keyboard_shortcuts": dict(DEFAULT_KEYBOARD_SHORTCUTS),
         }
         self._load()
 
@@ -259,10 +382,12 @@ def frame_to_photo(frame, max_w, max_h):
 
     アスペクト比を維持して、キャンバスに収まる最大サイズに拡縮する。
     拡大もOK (映像全体が切れずに表示される)。
+    BGR (3ch) / BGRA (4ch) 両対応。
     """
     h, w = frame.shape[:2]
     if w <= 0 or h <= 0 or max_w <= 0 or max_h <= 0:
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        code = cv2.COLOR_BGRA2RGB if frame.shape[2] == 4 else cv2.COLOR_BGR2RGB
+        rgb = cv2.cvtColor(frame, code)
         return ImageTk.PhotoImage(Image.fromarray(rgb)), 1.0
     scale = min(max_w / w, max_h / h)
     if scale != 1.0:
@@ -270,7 +395,8 @@ def frame_to_photo(frame, max_w, max_h):
         new_h = max(1, int(h * scale))
         interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
         frame = cv2.resize(frame, (new_w, new_h), interpolation=interp)
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    code = cv2.COLOR_BGRA2RGB if frame.shape[2] == 4 else cv2.COLOR_BGR2RGB
+    rgb = cv2.cvtColor(frame, code)
     img = Image.fromarray(rgb)
     return ImageTk.PhotoImage(img), scale
 
@@ -287,11 +413,32 @@ class GolfBroadcastApp(ctk.CTk):
         ctk.set_default_color_theme("blue")
 
         # プロジェクト
-        self.project_dir = Path(project_dir or DEFAULT_PROJECT_DIR)
-        self.project_dir.mkdir(parents=True, exist_ok=True)
+        # 1) デフォルトor引数のディレクトリで設定を読み込む
+        init_dir = Path(project_dir or DEFAULT_PROJECT_DIR)
+        init_dir.mkdir(parents=True, exist_ok=True)
+        self.settings = AppSettings(init_dir)
 
-        self.settings = AppSettings(self.project_dir)
+        # 2) 保存済みの project_dir があればそちらを使う (--project 指定時は引数優先)
+        if project_dir is None and self.settings["project_dir"] != str(init_dir):
+            saved_dir = Path(self.settings["project_dir"])
+            if saved_dir.exists() or saved_dir.parent.exists():
+                self.project_dir = saved_dir
+                self.project_dir.mkdir(parents=True, exist_ok=True)
+                # 新フォルダの settings.json があればそこから全設定を再読み込み
+                new_settings_path = self.project_dir / "settings.json"
+                if new_settings_path.exists():
+                    self.settings = AppSettings(self.project_dir)
+                else:
+                    self.settings.path = new_settings_path
+            else:
+                self.project_dir = init_dir
+        else:
+            self.project_dir = init_dir
+
         self.clip_manager = ClipManager(str(self.project_dir))
+
+        # HWエンコーダを事前検出 (初回書き出しの待ち時間を削減)
+        threading.Thread(target=self._predetect_hw_encoder, daemon=True).start()
 
         # デバイス
         self.deck_input = None
@@ -301,6 +448,8 @@ class GolfBroadcastApp(ctk.CTk):
             self.settings["width"],
             self.settings["height"],
             self.settings["fps"],
+            crf=self.settings["crf"],
+            growing_buffer_sec=self.settings["growing_buffer_sec"],
         )
 
         # 送出エンジン
@@ -316,7 +465,7 @@ class GolfBroadcastApp(ctk.CTk):
         # DeckLink COMコールバックスレッドを録画I/Oから分離し、カクツキを防止する。
         # コールバックはフレームをキューに入れるだけ (< 1ms)、
         # 別スレッドが MP4書き込み + JPEGエンコードを担当する。
-        self._capture_queue: queue.Queue = queue.Queue(maxsize=1800)
+        self._capture_queue: queue.Queue = queue.Queue(maxsize=600)
         self._capture_dropped = 0
         self._capture_write_running = True
         self._capture_write_thread = threading.Thread(
@@ -330,6 +479,14 @@ class GolfBroadcastApp(ctk.CTk):
 
         # フレーム送りステップ (編集/送出タブ共通)
         self._frame_step = 1
+
+        # グローウィング再書き出しキュー: [(rec_path, in_f, out_f, clip_path, fps), ...]
+        self._growing_reexport_queue = []
+
+        # ダーティフラグ: タブ切替時の無駄なスキャンを抑制
+        self._clips_tab_dirty = True   # クリップタブ再構築が必要
+        self._edit_tab_dirty = True    # 編集タブクリップリスト再構築が必要
+        self._playout_dirty = True     # 送出リスト再スキャンが必要
 
         # UI
         self._build_ui()
@@ -373,20 +530,21 @@ class GolfBroadcastApp(ctk.CTk):
         self.tabview.configure(command=self._on_tab_changed)
 
     def _on_tab_changed(self):
-        """タブ切り替え時の処理"""
+        """タブ切り替え時の処理 (ファイルシステムスキャンは行わない)"""
         current = self.tabview.get()
         if current == "クリップ":
-            self._refresh_clips_list()
+            if self._clips_tab_dirty:
+                self._refresh_clips_list(scan=False)
         elif current == "編集":
-            self._sync_folder_clips()
-            self._refresh_edit_clips_list()
+            if self._edit_tab_dirty:
+                self._refresh_edit_clips_list()
+                self._edit_tab_dirty = False
         elif current == "送出":
             # 編集中の軌道を自動保存
             self._edit_autosave_trajectory()
-            # ディレクトリと送出リストを同期
-            self.playout.scan_directory(str(self._exports_dir))
-            self.playout.save_playlist(self._playout_json)
-            self._refresh_playout_list()
+            if self._playout_dirty:
+                self._refresh_playout_list()
+                self._playout_dirty = False
 
     # =========================================================================
     # 収録タブ
@@ -472,8 +630,6 @@ class GolfBroadcastApp(ctk.CTk):
             if lbl == value:
                 mode = m
                 break
-        # 設定保存
-        self.settings["capture_mode"] = mode.value
         # 実効fps表示更新
         fps = CAPTURE_MODE_EFFECTIVE_FPS[mode]
         if hasattr(self, "_fps_display"):
@@ -527,6 +683,7 @@ class GolfBroadcastApp(ctk.CTk):
                     return
             try:
                 self._capture_queue.put_nowait(frame)
+                self._capture_enqueued = getattr(self, '_capture_enqueued', 0) + 1
             except queue.Full:
                 self._capture_dropped += 1  # キューが満杯 = フレームドロップ (ディスクが遅い場合)
 
@@ -535,12 +692,14 @@ class GolfBroadcastApp(ctk.CTk):
         while self._capture_write_running:
             try:
                 frame = self._capture_queue.get(timeout=0.1)
-                self.recorder.write_frame(frame)
-                self._capture_queue.task_done()
             except queue.Empty:
-                pass
+                continue
+            try:
+                self.recorder.write_frame(frame)
             except Exception as e:
                 print(f"[CaptureWrite] エラー: {e}")
+            finally:
+                self._capture_queue.task_done()
 
     def _start_capture_preview(self):
         """キャプチャプレビュー更新ループ"""
@@ -588,15 +747,34 @@ class GolfBroadcastApp(ctk.CTk):
                     # グローウィングクリッププレビュー更新
                     if (self._selected_clip_id == "__growing__"
                             and self._growing_follow_live):
+                        buf_start = self.recorder.buffer_start
                         buf_cnt = self.recorder.buffered_frame_count
                         if buf_cnt > 0:
-                            self.clip_slider.configure(to=max(buf_cnt - 1, 1))
+                            self.clip_slider.configure(
+                                from_=buf_start,
+                                to=max(buf_cnt - 1, buf_start),
+                                command=None)
                             self.clip_slider.set(buf_cnt - 1)
+                            self.clip_slider.configure(command=self._on_clip_slider)
+                            self._clip_slider_frame = buf_cnt - 1
                             self._show_growing_preview(buf_cnt - 1)
 
             self._update_capture_timer_id = self.after(33, update)
 
         update()
+
+    @staticmethod
+    def _predetect_hw_encoder():
+        """HWエンコーダを事前検出 (結果はffmpeg_writerモジュールにキャッシュされる)"""
+        try:
+            from ffmpeg_writer import detect_hw_encoder
+            enc = detect_hw_encoder()
+            if enc:
+                print(f"[Startup] HWエンコーダ検出: {enc}")
+            else:
+                print("[Startup] HWエンコーダなし、ソフトウェアエンコードを使用")
+        except Exception:
+            pass
 
     def _toggle_rec(self):
         """REC/STOP切り替え"""
@@ -606,45 +784,97 @@ class GolfBroadcastApp(ctk.CTk):
             g_out = self.recorder.growing_out
             # 新規フレームのキュー投入を停止 (コールバック側で判定)
             self._rec_stopping = True
-            # キューに残っているフレームを全て書き出してから停止
-            # (即座にstopするとVideoWriter.release()でmoov atomが不完全になる)
-            try:
-                self._capture_queue.join()
-            except Exception:
-                pass
-            self._rec_stopping = False
-            frames = self.recorder.frame_count
-            if self._capture_dropped > 0:
-                print(f"[Capture] 録画中にドロップしたフレーム数: {self._capture_dropped}")
-            path = self.recorder.stop_recording()
+            # UI即時更新 (ブロック防止)
             self.rec_btn.configure(text="⏺ REC", fg_color="#8B0000")
-            self.rec_status.configure(text="STANDBY", text_color="white")
-            if path and frames > 0:
-                self.after(500, lambda p=str(path), gi=g_in, go=g_out:
-                           self._add_recorded_clip(p, growing_in=gi, growing_out=go))
-            elif path and frames == 0:
-                print(f"[Capture] 0フレーム録画のためスキップ: {path}")
-            self._refresh_clips_list()
+            self.edit_rec_btn.configure(text="⏺ REC", fg_color="#8B0000")
+            self.po_rec_btn.configure(text="⏺ REC", fg_color="#8B0000")
+            self.rec_status.configure(text="停止中...", text_color="yellow")
+
+            def do_stop():
+                # キュー残りを書き出し → ffmpeg終了 (バックグラウンドで実行)
+                try:
+                    self._capture_queue.join()
+                except Exception:
+                    pass
+                self._rec_stopping = False
+                frames = self.recorder.frame_count
+                enqueued = getattr(self, '_capture_enqueued', 0)
+                dropped = self._capture_dropped
+                remaining = self._capture_queue.qsize()
+                print(f"[REC DIAG] enqueued={enqueued}, written={frames}, "
+                      f"dropped={dropped}, queue_remaining={remaining}")
+                path = self.recorder.stop_recording()
+                # GUIスレッドに戻して後処理
+                self.after(0, lambda: self._finish_rec_stop(
+                    path, frames, dropped, g_in, g_out))
+
+            threading.Thread(target=do_stop, daemon=True,
+                             name="RecStopThread").start()
         else:
             if not self.deck_input:
                 self._start_capture()
             # 録画fps: 通常=29.97fps(等倍再生), HFR=29.97fps(スロー)
             rec_fps = self.deck_input.recording_fps if self.deck_input else self.settings["fps"]
             self._rec_frame_count = 0  # フレーム間引きカウンタリセット
+            self._capture_enqueued = 0  # エンキューカウンタ
             self._capture_dropped = 0  # ドロップカウンタリセット
+            if self.deck_input:
+                cb_fps = getattr(self.deck_input, '_decklink', self.deck_input)
+                mfps = getattr(cb_fps, '_measured_callback_fps', None)
+                efps = getattr(self.deck_input, 'effective_fps', None)
+                print(f"[REC] callback_fps={mfps}, effective_fps={efps}, recording_fps={rec_fps}")
             self.recorder.start_recording(fps=rec_fps)
             fps_label = f" ({rec_fps:.2f}fps)" if rec_fps != self.settings["fps"] else ""
             self.rec_btn.configure(text="⏹ STOP", fg_color="#FF0000")
+            self.edit_rec_btn.configure(text="⏹ STOP", fg_color="#FF0000")
+            self.po_rec_btn.configure(text="⏹ STOP", fg_color="#FF0000")
             self.rec_status.configure(text=f"● REC{fps_label}", text_color="red")
-            self._refresh_clips_list()
+            self._clips_tab_dirty = self._edit_tab_dirty = True
+            self._refresh_clips_list(scan=False)
+
+    def _finish_rec_stop(self, path, frames, dropped, g_in, g_out):
+        """録画停止の後処理 (GUIスレッドで実行)"""
+        self.rec_status.configure(text="STANDBY", text_color="white")
+        if dropped > 0:
+            print(f"[Capture] 録画中にドロップしたフレーム数: {dropped}")
+        if path and frames > 0:
+            self.after(500, lambda p=str(path), gi=g_in, go=g_out:
+                       self._add_recorded_clip(p, growing_in=gi, growing_out=go))
+            # グローウィング切り出しクリップの高品質再書き出し
+            self._start_growing_reexport()
+        elif path and frames == 0:
+            print(f"[Capture] 0フレーム録画のためスキップ: {path}")
+        self._clips_tab_dirty = self._edit_tab_dirty = True
+        self._refresh_clips_list(scan=False)
+
+    def _start_growing_reexport(self):
+        """グローウィング切り出しクリップをREC本体から高品質再書き出し (バックグラウンド)"""
+        queue = self._growing_reexport_queue[:]
+        self._growing_reexport_queue.clear()
+        if not queue:
+            return
+        print(f"[Capture] グローウィング再書き出し: {len(queue)} 件")
+
+        def do_reexport():
+            from recorder import Recorder
+            for rec_path, in_f, out_f, clip_path, fps in queue:
+                ok = Recorder.re_export_clip(rec_path, in_f, out_f, clip_path, fps,
+                                             crf=self.settings["crf"],
+                                             hw_encode=True)
+                if ok:
+                    print(f"[Capture] 高品質差し替え完了: {Path(clip_path).name}")
+                else:
+                    print(f"[Capture] 高品質差し替え失敗: {Path(clip_path).name}")
+
+        threading.Thread(target=do_reexport, daemon=True, name="GrowingReexport").start()
 
     def _add_recorded_clip(self, path, retries=3, growing_in=0, growing_out=-1):
         """録画ファイルをクリップに追加 (リトライ付き、グローウィングIn/Out引き継ぎ)"""
         try:
             # フォルダスキャンで既に登録済みなら再追加しない
-            resolved = str(Path(path).resolve())
+            norm = os.path.normpath(path)
             clip = next((c for c in self.clip_manager.clips
-                         if str(Path(c.source_path).resolve()) == resolved), None)
+                         if os.path.normpath(c.source_path) == norm), None)
             if clip is None:
                 clip = self.clip_manager.add_clip(path)
             # グローウィング中に設定されたIn/Outを引き継ぎ
@@ -653,7 +883,12 @@ class GolfBroadcastApp(ctk.CTk):
                 out_f = growing_out if growing_out >= 0 else clip.total_frames - 1
                 self.clip_manager.set_in_out(clip.id, in_f, out_f)
                 print(f"[Capture] グローウィングIn/Out引き継ぎ: {in_f}-{out_f}")
-            self._refresh_clips_list()
+            self._clips_tab_dirty = self._edit_tab_dirty = True
+            self._refresh_clips_list(scan=False)
+            # 編集タブ表示中なら即座にクリップリストを更新
+            if self.tabview.get() == "編集":
+                self._refresh_edit_clips_list()
+                self._edit_tab_dirty = False
             print(f"[Capture] クリップ追加: {path}")
         except Exception as e:
             if retries > 0:
@@ -693,13 +928,16 @@ class GolfBroadcastApp(ctk.CTk):
                        fg_color="#8B0000", hover_color="#A52A2A",
                        command=self._delete_selected_clip).pack(side="left", padx=5)
         ctk.CTkButton(toolbar, text="更新", width=80,
-                       command=self._refresh_clips_list).pack(side="left", padx=5)
+                       command=lambda: self._refresh_clips_list(scan=True)).pack(side="left", padx=5)
 
         # クリップリスト（スクロール可能）
         self.clips_scroll = ctk.CTkScrollableFrame(list_frame)
         self.clips_scroll.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
         self.clips_scroll.grid_columnconfigure(0, weight=1)
         self.clip_widgets = []
+        self._collapsed_clip_groups = set()    # 折りたたみ中の日付グループ
+        self._collapsed_playout_groups = set() # 送出リスト折りたたみ
+        self._collapsed_edit_groups = set()   # 編集タブ折りたたみ
         self._selected_clip_id = None
         self._rec_live_row = None
         self._rec_live_label = None
@@ -749,6 +987,16 @@ class GolfBroadcastApp(ctk.CTk):
         self.clip_slider.pack(fill="x", padx=10, pady=5)
         self._clip_slider_frame = 0
 
+        # グローウィング更新ボタン (最新フレームに追従再開)
+        self.growing_refresh_btn = ctk.CTkButton(
+            right, text="⟳ 最新に更新", width=150, height=30,
+            font=("", 12),
+            fg_color="#2E4057", hover_color="#3D5A80",
+            command=self._refresh_growing,
+        )
+        self.growing_refresh_btn.pack(padx=10, pady=(2, 0))
+        self.growing_refresh_btn.pack_forget()  # 初期非表示
+
         # グローウィングクリップ切り出しボタン
         self.clip_extract_btn = ctk.CTkButton(
             right, text="クリップ切り出し", width=250, height=40,
@@ -772,7 +1020,7 @@ class GolfBroadcastApp(ctk.CTk):
         self.clip_preview_canvas.bind("<Configure>", self._on_clip_preview_resize)
         self._clip_preview_resize_after = None
 
-        self._refresh_clips_list()
+        self._refresh_clips_list(scan=True)
 
     def _clips_paned_configure(self, event):
         """PanedWindow初回表示時にサッシ位置を復元"""
@@ -833,8 +1081,22 @@ class GolfBroadcastApp(ctk.CTk):
             title="動画ファイルを選択",
             filetypes=[("Video", "*.mp4 *.mov *.avi *.mkv"), ("All", "*.*")]
         )
+        today_dir = (self.clip_manager.clips_dir
+                     / datetime.date.today().strftime("%m-%d"))
+        today_dir.mkdir(parents=True, exist_ok=True)
         for p in paths:
-            self.clip_manager.add_clip(p)
+            src = Path(p)
+            dest = today_dir / src.name
+            # 重複回避
+            if dest.exists():
+                stem, suffix = src.stem, src.suffix
+                i = 1
+                while dest.exists():
+                    dest = today_dir / f"{stem}_{i}{suffix}"
+                    i += 1
+            shutil.copy2(str(src), str(dest))
+            self.clip_manager.add_clip(str(dest))
+        self._clips_tab_dirty = self._edit_tab_dirty = True
         self._refresh_clips_list()
 
     def _sync_folder_clips(self):
@@ -842,6 +1104,7 @@ class GolfBroadcastApp(ctk.CTk):
         - 実ファイルが無いエントリは除去
         - 同一ファイルの重複エントリは除去
         - フォルダにあって未登録のファイルは追加
+        Path.resolve() を避け os.path.normpath で高速化。
         """
         VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv"}
         dirty = False
@@ -855,11 +1118,11 @@ class GolfBroadcastApp(ctk.CTk):
             print(f"[Clips] ファイルなし {before - len(self.clip_manager.clips)} 件除去")
             dirty = True
 
-        # 2) 同一source_pathの重複を除去 (最初のエントリを残す)
+        # 2) 同一source_pathの重複を除去 (normpath で比較)
         seen = set()
         deduped = []
         for c in self.clip_manager.clips:
-            key = str(Path(c.source_path).resolve())
+            key = os.path.normpath(c.source_path)
             if key not in seen:
                 seen.add(key)
                 deduped.append(c)
@@ -876,14 +1139,14 @@ class GolfBroadcastApp(ctk.CTk):
             Path(self.settings["record_dir"]),
             self.clip_manager.clips_dir,
         ]
-        known_paths = {str(Path(c.source_path).resolve()) for c in self.clip_manager.clips}
+        known_paths = {os.path.normpath(c.source_path) for c in self.clip_manager.clips}
         added = 0
         for d in scan_dirs:
             if not d.exists():
                 continue
-            for f in d.iterdir():
+            for f in d.rglob("*"):
                 if f.is_file() and f.suffix.lower() in VIDEO_EXTS:
-                    key = str(f.resolve())
+                    key = os.path.normpath(str(f))
                     if key not in known_paths:
                         try:
                             self.clip_manager.add_clip(str(f))
@@ -894,8 +1157,10 @@ class GolfBroadcastApp(ctk.CTk):
         if added:
             print(f"[Clips] フォルダスキャンで {added} 件追加")
 
-    def _refresh_clips_list(self):
-        self._sync_folder_clips()
+    def _refresh_clips_list(self, scan=False):
+        self._clips_tab_dirty = False
+        if scan:
+            self._sync_folder_clips()
         for w in self.clip_widgets:
             w.destroy()
         self.clip_widgets.clear()
@@ -931,27 +1196,63 @@ class GolfBroadcastApp(ctk.CTk):
             self.clip_widgets.append(row)
             row_idx += 1
 
-        # --- 保存済みクリップ ---
-        for i, clip in enumerate(self.clip_manager.clips):
+        # --- 保存済みクリップ (日付グループ表示 / 折りたたみ対応) ---
+        def _date_key(clip):
+            parent = Path(clip.source_path).parent.name
+            if (len(parent) == 5 and parent[2] == '-') or (len(parent) == 10 and parent[4] == '-' and parent[7] == '-'):
+                return parent
+            return ""
+
+        # 日付の新しい順 → "その他" は末尾
+        sorted_clips = sorted(self.clip_manager.clips,
+                              key=lambda c: _date_key(c) or "0000", reverse=True)
+        current_group = None
+        collapsed = False
+        clip_num = 0
+        for clip in sorted_clips:
+            group = _date_key(clip)
+            if group != current_group:
+                current_group = group
+                collapsed = group in self._collapsed_clip_groups
+                arrow = "▶" if collapsed else "▼"
+                label = group if group else "その他"
+                header = ctk.CTkFrame(self.clips_scroll, height=25,
+                                      fg_color="#1a3a1a", cursor="hand2")
+                header.grid(row=row_idx, column=0, sticky="ew", pady=(6, 1))
+                header.grid_columnconfigure(0, weight=1)
+                hdr_btn = ctk.CTkButton(
+                    header, text=f"{arrow} {label}",
+                    font=("", 11, "bold"), text_color="#88CC88",
+                    fg_color="transparent", hover_color="#2a4a2a",
+                    anchor="w",
+                    command=lambda g=group: self._toggle_clip_group(g))
+                hdr_btn.grid(row=0, column=0, sticky="ew", padx=4)
+                # 右クリック → フォルダを開く
+                dir_path = str(Path(clip.source_path).parent)
+                hdr_btn.bind("<Button-3>",
+                             lambda e, d=dir_path: self._show_folder_menu(e, d))
+                self.clip_widgets.append(header)
+                row_idx += 1
+
+            if collapsed:
+                continue
+
+            clip_num += 1
             row = ctk.CTkFrame(self.clips_scroll, height=40)
             row.grid(row=row_idx, column=0, sticky="ew", pady=2)
             row.grid_columnconfigure(1, weight=1)
 
-            # 番号
-            ctk.CTkLabel(row, text=f"{i+1}", width=30).grid(row=0, column=0, padx=5)
-            # 名前
+            ctk.CTkLabel(row, text=f"{clip_num}", width=30).grid(row=0, column=0, padx=5)
             name_btn = ctk.CTkButton(
                 row, text=clip.name, anchor="w",
                 fg_color="transparent", hover_color="#333333",
                 command=lambda cid=clip.id: self._select_clip(cid)
             )
             name_btn.grid(row=0, column=1, sticky="ew", padx=5)
-            # 情報
             dur = f"{clip.duration_sec:.1f}s"
             traj = "✓" if clip.has_trajectory else ""
             ctk.CTkLabel(row, text=f"{dur}  {traj}", width=100).grid(row=0, column=2, padx=5)
 
-            # 削除ボタン
             ctk.CTkButton(
                 row, text="×", width=28, height=28,
                 fg_color="#8B0000", hover_color="#A52A2A",
@@ -961,6 +1262,37 @@ class GolfBroadcastApp(ctk.CTk):
 
             self.clip_widgets.append(row)
             row_idx += 1
+
+    def _toggle_clip_group(self, group):
+        """クリップリストの日付グループ折りたたみ切替"""
+        if group in self._collapsed_clip_groups:
+            self._collapsed_clip_groups.discard(group)
+        else:
+            self._collapsed_clip_groups.add(group)
+        self._refresh_clips_list()
+
+    def _toggle_playout_group(self, group):
+        """送出リストの日付グループ折りたたみ切替"""
+        if group in self._collapsed_playout_groups:
+            self._collapsed_playout_groups.discard(group)
+        else:
+            self._collapsed_playout_groups.add(group)
+        self._refresh_playout_list()
+
+    def _toggle_edit_group(self, group):
+        """編集タブの日付グループ折りたたみ切替"""
+        if group in self._collapsed_edit_groups:
+            self._collapsed_edit_groups.discard(group)
+        else:
+            self._collapsed_edit_groups.add(group)
+        self._refresh_edit_clips_list()
+
+    def _show_folder_menu(self, event, dir_path):
+        """右クリックでフォルダを開くコンテキストメニュー"""
+        menu = tkinter.Menu(self, tearoff=0)
+        menu.add_command(label="フォルダを開く",
+                         command=lambda: os.startfile(dir_path))
+        menu.tk_popup(event.x_root, event.y_root)
 
     def _select_clip(self, clip_id):
         self._selected_clip_id = clip_id
@@ -981,21 +1313,35 @@ class GolfBroadcastApp(ctk.CTk):
         self.out_entry.delete(0, "end")
         self.out_entry.insert(0, str(clip.get_out_frame()))
 
-        self.clip_slider.configure(to=max(clip.total_frames - 1, 1))
+        self.clip_slider.configure(from_=0, to=max(clip.total_frames - 1, 1))
         self.clip_slider.set(clip.in_frame)
         self._show_clip_preview(clip, clip.in_frame)
 
-        # クリップ切り出しボタンを表示
+        # グローウィング更新ボタンを非表示、切り出しボタンを表示
+        self.growing_refresh_btn.pack_forget()
         self.clip_extract_btn.configure(text="クリップ切り出し", state="normal")
         self.clip_extract_btn.pack(padx=10, pady=(5, 0))
 
+    def _release_clip_preview_cap(self):
+        cap = getattr(self, '_clip_preview_cap', None)
+        if cap:
+            cap.release()
+        self._clip_preview_cap = None
+        self._clip_preview_cap_path = None
+
     def _show_clip_preview(self, clip, frame_no):
-        cap = cv2.VideoCapture(clip.source_path)
+        # VideoCapture を使い回す (同じソースなら再オープンしない)
+        if (getattr(self, '_clip_preview_cap_path', None) != clip.source_path
+                or not getattr(self, '_clip_preview_cap', None)
+                or not self._clip_preview_cap.isOpened()):
+            self._release_clip_preview_cap()
+            self._clip_preview_cap = cv2.VideoCapture(clip.source_path)
+            self._clip_preview_cap_path = clip.source_path
+        cap = self._clip_preview_cap
         if not cap.isOpened():
             return
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
         ret, frame = cap.read()
-        cap.release()
         if ret:
             cw = self.clip_preview_canvas.winfo_width()
             ch = self.clip_preview_canvas.winfo_height()
@@ -1028,14 +1374,34 @@ class GolfBroadcastApp(ctk.CTk):
         out_display = out_val if out_val >= 0 else max(buf_cnt - 1, 0)
         self.out_entry.insert(0, str(out_display))
 
-        slider_max = max(buf_cnt - 1, 1)
-        self.clip_slider.configure(to=slider_max)
-        self.clip_slider.set(min(max(buf_cnt - 1, 0), slider_max))
+        buf_start = self.recorder.buffer_start
+        slider_max = max(buf_cnt - 1, buf_start)
+        self.clip_slider.configure(from_=buf_start, to=slider_max, command=None)
+        self.clip_slider.set(min(max(buf_cnt - 1, buf_start), slider_max))
+        self.clip_slider.configure(command=self._on_clip_slider)
+        self._clip_slider_frame = min(max(buf_cnt - 1, buf_start), slider_max)
         if buf_cnt > 0:
             self._show_growing_preview(buf_cnt - 1)
 
-        # 切り出しボタン表示
+        # グローウィング用ボタン表示
+        self.growing_refresh_btn.pack(padx=10, pady=(2, 0))
         self.clip_extract_btn.pack(padx=10, pady=(5, 0))
+
+    def _refresh_growing(self):
+        """グローウィングのスライダー最大値を更新し、最新フレームに追従再開"""
+        if self._selected_clip_id != "__growing__":
+            return
+        buf_start = self.recorder.buffer_start
+        buf_cnt = self.recorder.buffered_frame_count
+        if buf_cnt <= 0:
+            return
+        slider_max = max(buf_cnt - 1, buf_start)
+        self.clip_slider.configure(from_=buf_start, to=slider_max, command=None)
+        self.clip_slider.set(buf_cnt - 1)
+        self.clip_slider.configure(command=self._on_clip_slider)
+        self._clip_slider_frame = buf_cnt - 1
+        self._growing_follow_live = True
+        self._show_growing_preview(buf_cnt - 1)
 
     def _show_growing_preview(self, frame_idx):
         """グローウィングバッファからプレビュー表示"""
@@ -1067,13 +1433,15 @@ class GolfBroadcastApp(ctk.CTk):
         new_f = self._clip_slider_frame + delta
         # 上限
         if self._selected_clip_id == "__growing__":
-            max_f = max(self.recorder.frame_count - 1, 0)
+            min_f = self.recorder.buffer_start
+            max_f = max(self.recorder.buffered_frame_count - 1, min_f)
         else:
             clip = self.clip_manager.get_clip(self._selected_clip_id)
             if not clip:
                 return
+            min_f = 0
             max_f = max(clip.total_frames - 1, 0)
-        new_f = max(0, min(new_f, max_f))
+        new_f = max(min_f, min(new_f, max_f))
         self._clip_slider_frame = new_f
         try:
             self.clip_slider.set(new_f)
@@ -1252,7 +1620,9 @@ class GolfBroadcastApp(ctk.CTk):
         if not self._selected_clip_id:
             return
         self._apply_in_out()
-        path = self.clip_manager.export_trimmed(self._selected_clip_id)
+        path = self.clip_manager.export_trimmed(self._selected_clip_id,
+                                                 crf=self.settings["crf"],
+                                                 hw_encode=True)
         if path:
             print(f"トリム書き出し完了: {path}")
 
@@ -1268,13 +1638,21 @@ class GolfBroadcastApp(ctk.CTk):
             if in_f >= out_f:
                 print("[Capture] In/Outが不正です")
                 return
-            ts = time.strftime("%Y%m%d_%H%M%S")
+            ts = time.strftime("%m%d_%H%M%S")
             clip_name = f"clip_{ts}_{in_f}_{out_f}"
-            out_path = self.project_dir / "clips" / f"{clip_name}.mp4"
+            out_dir = self.project_dir / "clips" / datetime.date.today().strftime("%m-%d")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"{clip_name}.mp4"
+
+            rec_path = str(self.recorder.current_file)
+            rec_fps = self.recorder.fps
 
             def do_export():
                 count = self.recorder.export_clip(in_f, out_f, str(out_path))
                 if count > 0:
+                    # REC停止後に高品質再書き出しするためキューに追加
+                    self._growing_reexport_queue.append(
+                        (rec_path, in_f, out_f, str(out_path), rec_fps))
                     self.after(0, lambda: self._finish_extract(str(out_path)))
                 else:
                     print(f"[Capture] クリップ切り出し失敗 (0 frames)")
@@ -1300,7 +1678,9 @@ class GolfBroadcastApp(ctk.CTk):
         clip_id = self._selected_clip_id
 
         def do_trim():
-            path = self.clip_manager.export_trimmed(clip_id)
+            path = self.clip_manager.export_trimmed(clip_id,
+                                                     crf=self.settings["crf"],
+                                                     hw_encode=True)
             if path:
                 self.after(0, lambda: self._finish_extract(str(path)))
             else:
@@ -1314,7 +1694,12 @@ class GolfBroadcastApp(ctk.CTk):
         """切り出し完了後、クリップリストに追加"""
         try:
             clip = self.clip_manager.add_clip(path)
-            self._refresh_clips_list()
+            self._clips_tab_dirty = self._edit_tab_dirty = True
+            self._refresh_clips_list(scan=False)
+            # 編集タブ表示中なら即座にクリップリストを更新
+            if self.tabview.get() == "編集":
+                self._refresh_edit_clips_list()
+                self._edit_tab_dirty = False
             # 新しいクリップを選択
             self._select_clip(clip.id)
             print(f"[Capture] グローウィングクリップ追加: {clip.name}")
@@ -1352,6 +1737,7 @@ class GolfBroadcastApp(ctk.CTk):
             self._delete_clip_files(self._selected_clip_id)
             self.clip_manager.remove_clip(self._selected_clip_id)
             self._selected_clip_id = None
+            self._clips_tab_dirty = self._edit_tab_dirty = True
             self._refresh_clips_list()
 
     def _delete_clip_by_id(self, clip_id):
@@ -1360,6 +1746,7 @@ class GolfBroadcastApp(ctk.CTk):
         self.clip_manager.remove_clip(clip_id)
         if self._selected_clip_id == clip_id:
             self._selected_clip_id = None
+        self._clips_tab_dirty = self._edit_tab_dirty = True
         self._refresh_clips_list()
 
     def _open_edit_for_clip(self):
@@ -1401,10 +1788,13 @@ class GolfBroadcastApp(ctk.CTk):
         self.edit_canvas = Canvas(left, bg="black", highlightthickness=0)
         self.edit_canvas.grid(row=0, column=0, sticky="nsew")
         self.edit_canvas.bind("<Button-1>", self._edit_left_click)
-        self.edit_canvas.bind("<Button-2>", self._edit_middle_click)
+        self.edit_canvas.bind("<Button-2>", self._edit_middle_press)
+        self.edit_canvas.bind("<B2-Motion>", self._edit_middle_drag)
+        self.edit_canvas.bind("<ButtonRelease-2>", self._edit_middle_release)
         self.edit_canvas.bind("<Button-3>", self._edit_right_press)
         self.edit_canvas.bind("<B3-Motion>", self._edit_right_drag)
         self.edit_canvas.bind("<ButtonRelease-3>", self._edit_right_release)
+        self.edit_canvas.bind("<MouseWheel>", self._edit_on_wheel)
         self._edit_photo = None
 
         # タイムライン
@@ -1418,6 +1808,17 @@ class GolfBroadcastApp(ctk.CTk):
         self.edit_slider = ctk.CTkSlider(tl_frame, from_=0, to=100,
                                           command=self._on_edit_slider)
         self.edit_slider.grid(row=0, column=1, sticky="ew")
+
+        # IN/OUT マーカー (▲をドラッグ or ショートカットキーで設定)
+        # シークバーと同じカラム (column=1) に配置して位置を揃える
+        self._edit_in = 0
+        self._edit_out = 0
+        self._io_canvas = Canvas(tl_frame, height=28, bg="#2b2b2b", highlightthickness=0)
+        self._io_canvas.grid(row=1, column=1, sticky="ew", pady=(0, 0))
+        self._io_canvas.bind("<Configure>", self._io_redraw)
+        self._io_canvas.bind("<Button-1>", self._io_press)
+        self._io_canvas.bind("<B1-Motion>", self._io_drag)
+        self._io_dragging = None  # "in" or "out"
 
         # 再生ボタン
         ctrl = ctk.CTkFrame(left, fg_color="transparent")
@@ -1447,8 +1848,15 @@ class GolfBroadcastApp(ctk.CTk):
         right = ctk.CTkFrame(self.edit_paned, width=280)
         right.pack_propagate(False)
 
-        # --- クリップリスト (上端固定) ---
-        ctk.CTkLabel(right, text="クリップ", font=("", 14, "bold")).pack(pady=(8, 2))
+        # --- RECボタン + クリップリスト (上端固定) ---
+        self.edit_rec_btn = ctk.CTkButton(
+            right, text="⏺ REC", width=250, height=36,
+            font=("", 14, "bold"),
+            fg_color="#8B0000", hover_color="#B22222",
+            command=self._toggle_rec
+        )
+        self.edit_rec_btn.pack(padx=10, pady=(8, 2))
+        ctk.CTkLabel(right, text="クリップ", font=("", 14, "bold")).pack(pady=(4, 2))
         self.edit_clips_scroll = ctk.CTkScrollableFrame(right, height=160)
         self.edit_clips_scroll.pack(fill="x", padx=5, pady=(0, 5))
         self.edit_clips_scroll.grid_columnconfigure(0, weight=1)
@@ -1575,14 +1983,25 @@ class GolfBroadcastApp(ctk.CTk):
         self._edit_frame_no = 0
         self._edit_total = 0
         self._edit_swings = []      # [TrajectoryData, ...]
+        self._edit_spline_cache = {}  # swing_idx → (key, TimedSpline)
         self._edit_swing_idx = 0
         self._edit_playing = False
+        self._edit_slider_updating = False  # スライダー循環呼び出し防止
+        self._edit_slider_after = None       # スライダーデバウンス用 after ID
         self._edit_scale = 1.0
+        self._edit_zoom = 1.0             # ユーザーズーム倍率 (1.0=フィット)
+        self._edit_pan_vx = 0.0           # パンオフセット (動画座標)
+        self._edit_pan_vy = 0.0
+        self._edit_mid_press = None       # 中ボタンドラッグ開始位置
+        self._edit_mid_moved = False
         self._edit_dragging = None
         self._edit_right_press_pos = None  # 右クリック開始位置 (クリックvs.ドラッグ判定用)
         self._edit_right_moved = False     # 右ドラッグ中にマウスが動いたか
         self._edit_handle_point = None     # ハンドル編集中のポイント (swing_idx, point_idx)
         self._edit_dragging_handle = None  # ドラッグ中のハンドル ('in' or 'out', swing_idx, point_idx)
+        self._edit_undo_stack = []         # Undo スナップショットスタック
+        self._edit_redo_stack = []         # Redo スナップショットスタック
+        self._UNDO_MAX = 50
 
         # PanedWindow に左右を追加
         self.edit_paned.add(left, minsize=400, stretch="always")
@@ -1648,9 +2067,46 @@ class GolfBroadcastApp(ctk.CTk):
             w.destroy()
         self._edit_clip_widgets.clear()
 
-        for i, clip in enumerate(self.clip_manager.clips):
+        def _date_key(clip):
+            parent = Path(clip.source_path).parent.name
+            if (len(parent) == 5 and parent[2] == '-') or (len(parent) == 10 and parent[4] == '-' and parent[7] == '-'):
+                return parent
+            return ""
+
+        sorted_clips = sorted(self.clip_manager.clips,
+                              key=lambda c: _date_key(c) or "0000", reverse=True)
+        current_group = None
+        collapsed = False
+        row_idx = 0
+        for clip in sorted_clips:
+            group = _date_key(clip)
+            if group != current_group:
+                current_group = group
+                collapsed = group in self._collapsed_edit_groups
+                arrow = "▶" if collapsed else "▼"
+                label = group if group else "その他"
+                header = ctk.CTkFrame(self.edit_clips_scroll, height=22,
+                                      fg_color="#1a3a1a", cursor="hand2")
+                header.grid(row=row_idx, column=0, sticky="ew", pady=(4, 1))
+                header.grid_columnconfigure(0, weight=1)
+                hdr_btn = ctk.CTkButton(
+                    header, text=f"{arrow} {label}",
+                    font=("", 11, "bold"), text_color="#88CC88",
+                    fg_color="transparent", hover_color="#2a4a2a",
+                    anchor="w",
+                    command=lambda g=group: self._toggle_edit_group(g))
+                hdr_btn.grid(row=0, column=0, sticky="ew", padx=4)
+                dir_path = str(Path(clip.source_path).parent)
+                hdr_btn.bind("<Button-3>",
+                             lambda e, d=dir_path: self._show_folder_menu(e, d))
+                self._edit_clip_widgets.append(header)
+                row_idx += 1
+
+            if collapsed:
+                continue
+
             row = ctk.CTkFrame(self.edit_clips_scroll, height=30)
-            row.grid(row=i, column=0, sticky="ew", pady=1)
+            row.grid(row=row_idx, column=0, sticky="ew", pady=1)
             row.grid_columnconfigure(0, weight=1)
 
             # 選択中のクリップはハイライト
@@ -1675,6 +2131,7 @@ class GolfBroadcastApp(ctk.CTk):
                          font=("", 11)).grid(row=0, column=1, padx=3)
 
             self._edit_clip_widgets.append(row)
+            row_idx += 1
 
     def _edit_select_clip(self, clip_id):
         """編集タブでクリップを選択して軌道編集にロード"""
@@ -1682,6 +2139,8 @@ class GolfBroadcastApp(ctk.CTk):
         if self._edit_clip_id and self._edit_clip_id != clip_id:
             self._edit_autosave_trajectory()
         self._edit_clip_id = clip_id
+        self._edit_undo_stack.clear()
+        self._edit_redo_stack.clear()
         self._load_edit_clip()
         self._refresh_edit_clips_list()
 
@@ -1731,10 +2190,17 @@ class GolfBroadcastApp(ctk.CTk):
             return
 
         print(f"[Edit] クリップ読み込み: {clip.name}")
+        # スライダーデバウンスをキャンセル (古いクリップの更新が残らないように)
+        if self._edit_slider_after is not None:
+            self.after_cancel(self._edit_slider_after)
+            self._edit_slider_after = None
         self._edit_direct_clip = None
         self._edit_cache = FrameCache(clip.source_path, clip.in_frame, clip.get_out_frame())
         self._edit_total = len(self._edit_cache)
         self._edit_frame_no = 0
+        self._edit_zoom = 1.0
+        self._edit_pan_vx = 0.0
+        self._edit_pan_vy = 0.0
 
         # 既存軌道を読み込み
         saved = self.clip_manager.load_trajectory(self._edit_clip_id)
@@ -1742,9 +2208,11 @@ class GolfBroadcastApp(ctk.CTk):
             self._edit_swings = saved
         else:
             self._edit_swings = [self._make_default_trajectory(0)]
+        self._edit_spline_cache.clear()
         self._edit_swing_idx = 0
 
         self.edit_slider.configure(to=max(self._edit_total - 1, 1))
+        self._edit_reset_in_out()
         self._edit_update_color_buttons()
         self._edit_update_display()
 
@@ -1779,51 +2247,109 @@ class GolfBroadcastApp(ctk.CTk):
         if frame is None:
             return
 
-        # 軌道描画 (現在フレームまでアニメーション)
-        cur = self._edit_frame_no
-        for swing in self._edit_swings:
-            if len(swing.points) < 2:
-                # マーカーのみ (点数不足)
-                if swing.points:
-                    draw_markers(frame, [p for p in swing.points if p[2] <= cur],
-                                 hex_to_bgr(swing.color_start_hex),
-                                 hex_to_bgr(swing.color_end_hex), MARKER_RADIUS)
-                continue
-
-            blur = getattr(swing, 'blur', 0)
-            base_a = getattr(swing, 'alpha', 0.85)
-            # 編集画面では end_frame / fade による非表示を無視し常に軌道を表示する
-            eff_alpha = base_a
-
-            handles = getattr(swing, 'handles', [])
-            ts = TimedSpline(swing.points, SPLINE_RESOLUTION,
-                             handles=handles if handles else None)
-            curve_pts = ts.get_curve_at_frame(cur)
-            if curve_pts and len(curve_pts) >= 2:
-                c_start = hex_to_bgr(swing.color_start_hex)
-                c_end = hex_to_bgr(swing.color_end_hex)
-                full_len = len(ts._curve)
-                ratio = len(curve_pts) / max(full_len, 1)
-                c_end_anim = lerp_color_bgr(c_start, c_end, ratio)
-                draw_gradient_trail(frame, curve_pts, c_start,
-                                    c_end_anim, swing.thickness,
-                                    eff_alpha, blur=blur)
-            # マーカー (現在フレーム以前のみ表示)
-            if swing.points:
-                visible_pts = [p for p in swing.points if p[2] <= cur]
-                if visible_pts:
-                    draw_markers(frame, visible_pts,
-                                 hex_to_bgr(swing.color_start_hex),
-                                 hex_to_bgr(swing.color_end_hex), MARKER_RADIUS)
-
+        # --- 先にクロップ＆リサイズ (表示サイズに縮小) ---
         cw = self.edit_canvas.winfo_width()
         ch = self.edit_canvas.winfo_height()
         if cw < 10 or ch < 10:
             cw, ch = 800, 450
 
-        self._edit_photo, self._edit_scale = frame_to_photo(frame, cw, ch)
+        fh, fw = frame.shape[:2]
+        self._edit_scale = min(cw / fw, ch / fh) if fw > 0 and fh > 0 else 1.0
+        eff_scale = self._edit_scale * self._edit_zoom
+
+        if self._edit_zoom == 1.0:
+            self._edit_pan_vx = fw / 2
+            self._edit_pan_vy = fh / 2
+
+        view_w = cw / eff_scale
+        view_h = ch / eff_scale
+        vx0 = self._edit_pan_vx - view_w / 2
+        vy0 = self._edit_pan_vy - view_h / 2
+        vx1 = vx0 + view_w
+        vy1 = vy0 + view_h
+
+        src_x0 = max(0, int(vx0))
+        src_y0 = max(0, int(vy0))
+        src_x1 = min(fw, int(np.ceil(vx1)))
+        src_y1 = min(fh, int(np.ceil(vy1)))
+
+        cropped = frame[src_y0:src_y1, src_x0:src_x1]
+        if cropped.size == 0:
+            cropped = frame
+            src_x0, src_y0 = 0, 0
+
+        disp_w = max(1, int((src_x1 - src_x0) * eff_scale))
+        disp_h = max(1, int((src_y1 - src_y0) * eff_scale))
+        interp = cv2.INTER_AREA if eff_scale < 1.0 else cv2.INTER_LINEAR
+        resized = cv2.resize(cropped, (disp_w, disp_h), interpolation=interp)
+
+        # --- 軌道描画 (リサイズ後の小さい画像上 → 高速) ---
+        cur = self._edit_frame_no
+        for swing in self._edit_swings:
+            if len(swing.points) < 2:
+                if swing.points:
+                    scaled_pts = [
+                        (int((p[0] - src_x0) * eff_scale),
+                         int((p[1] - src_y0) * eff_scale), p[2])
+                        for p in swing.points if p[2] <= cur]
+                    if scaled_pts:
+                        draw_markers(resized, scaled_pts,
+                                     hex_to_bgr(swing.color_start_hex),
+                                     hex_to_bgr(swing.color_end_hex),
+                                     max(1, int(MARKER_RADIUS * eff_scale)))
+                continue
+
+            blur = getattr(swing, 'blur', 0)
+            base_a = getattr(swing, 'alpha', 0.85)
+            eff_alpha = base_a
+
+            handles = getattr(swing, 'handles', [])
+            si = self._edit_swings.index(swing)
+            cache_key = (tuple((p[0], p[1], p[2]) for p in swing.points),
+                         tuple(h if h is None else (h[0], h[1])
+                               for h in handles) if handles else ())
+            cached = self._edit_spline_cache.get(si)
+            if cached and cached[0] == cache_key:
+                ts = cached[1]
+            else:
+                ts = TimedSpline(swing.points, SPLINE_RESOLUTION,
+                                 handles=handles if handles else None)
+                self._edit_spline_cache[si] = (cache_key, ts)
+            curve_pts = ts.get_curve_at_frame(cur)
+            if curve_pts and len(curve_pts) >= 2:
+                # 曲線座標を表示座標に変換
+                scaled_curve = [
+                    (int((p[0] - src_x0) * eff_scale),
+                     int((p[1] - src_y0) * eff_scale))
+                    for p in curve_pts]
+                c_start = hex_to_bgr(swing.color_start_hex)
+                c_end = hex_to_bgr(swing.color_end_hex)
+                full_len = len(ts._curve)
+                ratio = len(curve_pts) / max(full_len, 1)
+                c_end_anim = lerp_color_bgr(c_start, c_end, ratio)
+                scaled_thick = max(1, int(swing.thickness * eff_scale))
+                scaled_blur = int(blur * eff_scale) if blur > 0 else 0
+                draw_gradient_trail(resized, scaled_curve, c_start,
+                                    c_end_anim, scaled_thick,
+                                    eff_alpha, blur=scaled_blur)
+            if swing.points:
+                visible_pts = [
+                    (int((p[0] - src_x0) * eff_scale),
+                     int((p[1] - src_y0) * eff_scale), p[2])
+                    for p in swing.points if p[2] <= cur]
+                if visible_pts:
+                    draw_markers(resized, visible_pts,
+                                 hex_to_bgr(swing.color_start_hex),
+                                 hex_to_bgr(swing.color_end_hex),
+                                 max(1, int(MARKER_RADIUS * eff_scale)))
+
+        img_cx = int(cw / 2 - (self._edit_pan_vx - (src_x0 + src_x1) / 2) * eff_scale)
+        img_cy = int(ch / 2 - (self._edit_pan_vy - (src_y0 + src_y1) / 2) * eff_scale)
+
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        self._edit_photo = ImageTk.PhotoImage(Image.fromarray(rgb))
         self.edit_canvas.delete("all")
-        self.edit_canvas.create_image(cw // 2, ch // 2, anchor="center",
+        self.edit_canvas.create_image(img_cx, img_cy, anchor="center",
                                        image=self._edit_photo)
 
         # ベジェハンドル描画 (キャンバス上にオーバーレイ)
@@ -1859,8 +2385,12 @@ class GolfBroadcastApp(ctk.CTk):
                     cx_out - hr, cy_out - hr, cx_out + hr, cy_out + hr,
                     fill=fill_out, outline="white", width=1)
 
-        self.edit_frame_label.configure(text=f"{self._edit_frame_no} / {self._edit_total - 1}")
+        zoom_txt = f" ({self._edit_zoom:.0f}x)" if self._edit_zoom > 1.0 else ""
+        self.edit_frame_label.configure(
+            text=f"{self._edit_frame_no} / {self._edit_total - 1}{zoom_txt}")
+        self._edit_slider_updating = True
         self.edit_slider.set(self._edit_frame_no)
+        self._edit_slider_updating = False
 
         swing = self._edit_current_swing
         pts = len(swing.points) if swing else 0
@@ -1878,20 +2408,17 @@ class GolfBroadcastApp(ctk.CTk):
             return 0, 0
         fh, fw = frame.shape[:2]
 
-        scale = self._edit_scale
-        disp_w = int(fw * scale)
-        disp_h = int(fh * scale)
-        ox = (cw - disp_w) / 2
-        oy = (ch - disp_h) / 2
-
-        vx = int((cx - ox) / scale)
-        vy = int((cy - oy) / scale)
-        return vx, vy
+        eff_scale = self._edit_scale * self._edit_zoom
+        # キャンバス中心 = パンオフセットされた動画座標の中心
+        vx = (cx - cw / 2) / eff_scale + self._edit_pan_vx
+        vy = (cy - ch / 2) / eff_scale + self._edit_pan_vy
+        return int(vx), int(vy)
 
     def _edit_left_click(self, event):
         swing = self._edit_current_swing
         if not swing:
             return
+        self._edit_push_undo()
         vx, vy = self._edit_canvas_to_video(event.x, event.y)
         swing.points.append((vx, vy, self._edit_frame_no))
         # ハンドルも同期 (新規ポイントは None)
@@ -1904,23 +2431,107 @@ class GolfBroadcastApp(ctk.CTk):
         print(f"  Point: ({vx}, {vy}) @ frame {self._edit_frame_no}")
         self._edit_update_display()
 
-    def _edit_middle_click(self, event):
-        """中クリック: 最寄りの点を削除"""
-        vx, vy = self._edit_canvas_to_video(event.x, event.y)
-        result = self._edit_find_nearest(vx, vy)
-        thresh = POINT_GRAB_RADIUS / max(self._edit_scale, 0.1)
-        if result and result[2] < thresh:
-            si, pi = result[0], result[1]
-            swing = self._edit_swings[si]
-            removed = swing.points.pop(pi)
-            # ハンドルも同期
-            if swing.handles and pi < len(swing.handles):
-                swing.handles.pop(pi)
-            # アクティブハンドルをクリア
-            if self._edit_handle_point == (si, pi):
-                self._edit_handle_point = None
-            print(f"  Point deleted: ({removed[0]}, {removed[1]}) @ frame {removed[2]}")
-            self._edit_update_display()
+    def _edit_middle_press(self, event):
+        """中ボタン押下: パンドラッグ開始"""
+        self._edit_mid_press = (event.x, event.y)
+        self._edit_mid_moved = False
+        self._edit_pan_start_vx = self._edit_pan_vx
+        self._edit_pan_start_vy = self._edit_pan_vy
+        self.edit_canvas.config(cursor="fleur")
+
+    def _edit_middle_drag(self, event):
+        """中ボタンドラッグ: パン"""
+        if self._edit_mid_press is None:
+            return
+        dx = event.x - self._edit_mid_press[0]
+        dy = event.y - self._edit_mid_press[1]
+        if abs(dx) > 3 or abs(dy) > 3:
+            self._edit_mid_moved = True
+        eff_scale = self._edit_scale * self._edit_zoom
+        self._edit_pan_vx = self._edit_pan_start_vx - dx / eff_scale
+        self._edit_pan_vy = self._edit_pan_start_vy - dy / eff_scale
+        self._edit_clamp_pan()
+        self._edit_update_display()
+
+    def _edit_middle_release(self, event):
+        """中ボタンリリース: ドラッグなし→ポイント削除"""
+        self.edit_canvas.config(cursor="")
+        if not self._edit_mid_moved:
+            # クリック: 最寄りの点を削除 (従来動作)
+            vx, vy = self._edit_canvas_to_video(event.x, event.y)
+            result = self._edit_find_nearest(vx, vy)
+            eff = self._edit_scale * self._edit_zoom
+            thresh = POINT_GRAB_RADIUS / max(eff, 0.1)
+            if result and result[2] < thresh:
+                si, pi = result[0], result[1]
+                swing = self._edit_swings[si]
+                self._edit_push_undo()
+                removed = swing.points.pop(pi)
+                if swing.handles and pi < len(swing.handles):
+                    swing.handles.pop(pi)
+                if self._edit_handle_point == (si, pi):
+                    self._edit_handle_point = None
+                print(f"  Point deleted: ({removed[0]}, {removed[1]}) @ frame {removed[2]}")
+                self._edit_update_display()
+        self._edit_mid_press = None
+
+    def _edit_clamp_pan(self):
+        """パン位置をクランプしてフレーム外が見えないようにする"""
+        if not self._edit_cache or self._edit_total == 0:
+            return
+        frame = self._edit_cache[0]
+        if frame is None:
+            return
+        fh, fw = frame.shape[:2]
+        cw = self.edit_canvas.winfo_width()
+        ch = self.edit_canvas.winfo_height()
+        if cw < 10 or ch < 10:
+            cw, ch = 800, 450
+        eff_scale = self._edit_scale * self._edit_zoom
+        view_w = cw / eff_scale
+        view_h = ch / eff_scale
+        # 可視範囲がフレームより大きい場合は中央固定
+        if view_w >= fw:
+            self._edit_pan_vx = fw / 2
+        else:
+            self._edit_pan_vx = max(view_w / 2, min(fw - view_w / 2, self._edit_pan_vx))
+        if view_h >= fh:
+            self._edit_pan_vy = fh / 2
+        else:
+            self._edit_pan_vy = max(view_h / 2, min(fh - view_h / 2, self._edit_pan_vy))
+
+    def _edit_on_wheel(self, event):
+        """マウスホイール: ズーム (カーソル中心)"""
+        if not self._edit_cache or self._edit_total == 0:
+            return
+        # カーソル位置の動画座標 (float精度で計算 — int切り捨てによるズレを防ぐ)
+        cw = self.edit_canvas.winfo_width()
+        ch = self.edit_canvas.winfo_height()
+        eff_scale = self._edit_scale * self._edit_zoom
+        vx_f = (event.x - cw / 2) / eff_scale + self._edit_pan_vx
+        vy_f = (event.y - ch / 2) / eff_scale + self._edit_pan_vy
+
+        # ズーム倍率更新
+        if event.delta > 0:
+            self._edit_zoom = min(self._edit_zoom * 1.25, 20.0)
+        else:
+            self._edit_zoom = max(self._edit_zoom / 1.25, 1.0)
+
+        if self._edit_zoom == 1.0:
+            # フィットに戻す: パンリセット
+            frame = self._edit_cache[0]
+            if frame is not None:
+                fh, fw = frame.shape[:2]
+                self._edit_pan_vx = fw / 2
+                self._edit_pan_vy = fh / 2
+        else:
+            # カーソル位置を固定してズーム (カーソル下の映像がずれない)
+            new_eff = self._edit_scale * self._edit_zoom
+            self._edit_pan_vx = vx_f - (event.x - cw / 2) / new_eff
+            self._edit_pan_vy = vy_f - (event.y - ch / 2) / new_eff
+        self._edit_clamp_pan()
+
+        self._edit_update_display()
 
     def _edit_find_nearest(self, vx, vy):
         best = None
@@ -1937,16 +2548,10 @@ class GolfBroadcastApp(ctk.CTk):
         ch = self.edit_canvas.winfo_height()
         if not self._edit_cache or self._edit_total == 0:
             return 0, 0
-        frame = self._edit_cache[0]
-        if frame is None:
-            return 0, 0
-        fh, fw = frame.shape[:2]
-        scale = self._edit_scale
-        disp_w = int(fw * scale)
-        disp_h = int(fh * scale)
-        ox = (cw - disp_w) / 2
-        oy = (ch - disp_h) / 2
-        return int(vx * scale + ox), int(vy * scale + oy)
+        eff_scale = self._edit_scale * self._edit_zoom
+        cx = (vx - self._edit_pan_vx) * eff_scale + cw / 2
+        cy = (vy - self._edit_pan_vy) * eff_scale + ch / 2
+        return int(cx), int(cy)
 
     def _edit_find_nearest_handle(self, vx, vy):
         """ハンドル編集中のポイントのハンドルに近いか判定
@@ -2026,12 +2631,13 @@ class GolfBroadcastApp(ctk.CTk):
         self._edit_right_press_pos = (event.x, event.y)
         self._edit_right_moved = False
         vx, vy = self._edit_canvas_to_video(event.x, event.y)
-        thresh = POINT_GRAB_RADIUS / max(self._edit_scale, 0.1)
+        thresh = POINT_GRAB_RADIUS / max(self._edit_scale * self._edit_zoom, 0.1)
 
         # ハンドル編集中ならハンドルのドラッグを優先
         handle_result = self._edit_find_nearest_handle(vx, vy)
         if handle_result and handle_result[3] < thresh:
             kind, si, pi = handle_result[0], handle_result[1], handle_result[2]
+            self._edit_push_undo()
             self._edit_dragging_handle = (kind, si, pi)
             self._edit_dragging = None
             self.edit_canvas.config(cursor="crosshair")
@@ -2040,6 +2646,7 @@ class GolfBroadcastApp(ctk.CTk):
         # ポイント移動
         result = self._edit_find_nearest(vx, vy)
         if result and result[2] < thresh:
+            self._edit_push_undo()
             self._edit_dragging = (result[0], result[1])
             self._edit_dragging_handle = None
             self.edit_canvas.config(cursor="fleur")
@@ -2082,11 +2689,12 @@ class GolfBroadcastApp(ctk.CTk):
             # ドラッグなし = クリック → ハンドル表示/非表示トグル
             vx, vy = self._edit_canvas_to_video(event.x, event.y)
             result = self._edit_find_nearest(vx, vy)
-            thresh = POINT_GRAB_RADIUS / max(self._edit_scale, 0.1)
+            thresh = POINT_GRAB_RADIUS / max(self._edit_scale * self._edit_zoom, 0.1)
             if result and result[2] < thresh:
                 si, pi = result[0], result[1]
                 swing = self._edit_swings[si]
                 self._edit_ensure_handles(swing)
+                self._edit_push_undo()
                 if swing.handles[pi] is not None:
                     # ハンドルOFF
                     swing.handles[pi] = None
@@ -2111,6 +2719,95 @@ class GolfBroadcastApp(ctk.CTk):
         self._edit_frame_no = max(0, min(self._edit_frame_no + delta, self._edit_total - 1))
         self._edit_update_display()
 
+    def _edit_set_in(self):
+        """現在フレームを IN 点に設定"""
+        self._edit_in = self._edit_frame_no
+        if self._edit_in > self._edit_out:
+            self._edit_out = self._edit_in
+        self._io_redraw()
+
+    def _edit_set_out(self):
+        """現在フレームを OUT 点に設定"""
+        self._edit_out = self._edit_frame_no
+        if self._edit_out < self._edit_in:
+            self._edit_in = self._edit_out
+        self._io_redraw()
+
+    def _edit_reset_in_out(self):
+        """IN/OUT をデフォルト (全範囲) にリセット"""
+        self._edit_in = 0
+        self._edit_out = max(0, self._edit_total - 1)
+        self._io_redraw()
+
+    # --- IN/OUT マーカー Canvas ---
+    # CTkSliderの内部トラック位置に合わせるパディング
+    _IO_PAD = 8
+
+    def _io_frame_to_x(self, frame):
+        """フレーム番号 → Canvas x座標"""
+        cw = self._io_canvas.winfo_width()
+        pad = self._IO_PAD
+        total = max(self._edit_total - 1, 1)
+        return pad + (cw - 2 * pad) * frame / total
+
+    def _io_x_to_frame(self, x):
+        """Canvas x座標 → フレーム番号"""
+        cw = self._io_canvas.winfo_width()
+        pad = self._IO_PAD
+        total = max(self._edit_total - 1, 1)
+        f = int(round((x - pad) / max(cw - 2 * pad, 1) * total))
+        return max(0, min(f, self._edit_total - 1))
+
+    def _io_redraw(self, event=None):
+        """IN/OUT マーカーを再描画"""
+        c = self._io_canvas
+        c.delete("all")
+        cw = c.winfo_width()
+        if cw < 20 or self._edit_total <= 0:
+            return
+        # バー背景
+        y_bar = 4
+        pad = self._IO_PAD
+        c.create_line(pad, y_bar, cw - pad, y_bar, fill="#555", width=1)
+        # IN-OUT 範囲ハイライト
+        x_in = self._io_frame_to_x(self._edit_in)
+        x_out = self._io_frame_to_x(self._edit_out)
+        c.create_line(x_in, y_bar, x_out, y_bar, fill="#4a9eff", width=3)
+        # IN マーカー ▲
+        c.create_polygon(x_in, y_bar + 2, x_in - 5, y_bar + 12, x_in + 5, y_bar + 12,
+                         fill="#4a9eff", outline="#fff", tags="in_marker")
+        c.create_text(x_in, y_bar + 15, text=f"IN:{self._edit_in}", fill="#aaa",
+                       font=("", 8), anchor="n")
+        # OUT マーカー ▲
+        c.create_polygon(x_out, y_bar + 2, x_out - 5, y_bar + 12, x_out + 5, y_bar + 12,
+                         fill="#ff6a4a", outline="#fff", tags="out_marker")
+        c.create_text(x_out, y_bar + 15, text=f"OUT:{self._edit_out}", fill="#aaa",
+                       font=("", 8), anchor="n")
+
+    def _io_press(self, event):
+        """マーカーのドラッグ開始: 近い方のマーカーを掴む"""
+        x_in = self._io_frame_to_x(self._edit_in)
+        x_out = self._io_frame_to_x(self._edit_out)
+        d_in = abs(event.x - x_in)
+        d_out = abs(event.x - x_out)
+        if d_in <= d_out and d_in < 30:
+            self._io_dragging = "in"
+        elif d_out < 30:
+            self._io_dragging = "out"
+        else:
+            self._io_dragging = None
+
+    def _io_drag(self, event):
+        """マーカーのドラッグ中"""
+        if not self._io_dragging:
+            return
+        frame = self._io_x_to_frame(event.x)
+        if self._io_dragging == "in":
+            self._edit_in = min(frame, self._edit_out)
+        else:
+            self._edit_out = max(frame, self._edit_in)
+        self._io_redraw()
+
     def _on_frame_step_change(self, value):
         """フレーム送りステップ変更"""
         try:
@@ -2124,7 +2821,21 @@ class GolfBroadcastApp(ctk.CTk):
             self.edit_step_seg.set(str(self._frame_step))
 
     def _on_edit_slider(self, value):
+        if self._edit_slider_updating:
+            return
         self._edit_frame_no = int(value)
+        # フレーム番号ラベルを即座に更新 (応答性向上)
+        zoom_txt = f" ({self._edit_zoom:.0f}x)" if self._edit_zoom > 1.0 else ""
+        self.edit_frame_label.configure(
+            text=f"{self._edit_frame_no} / {self._edit_total - 1}{zoom_txt}")
+        # デバウンス: 高速ドラッグ中は最後の値だけ描画 (~30fps上限)
+        if self._edit_slider_after is not None:
+            self.after_cancel(self._edit_slider_after)
+        self._edit_slider_after = self.after(30, self._edit_slider_flush)
+
+    def _edit_slider_flush(self):
+        """デバウンス後に実際の表示更新を実行"""
+        self._edit_slider_after = None
         self._edit_update_display()
 
     def _edit_toggle_play(self):
@@ -2136,7 +2847,7 @@ class GolfBroadcastApp(ctk.CTk):
     def _edit_play_loop(self):
         if not self._edit_playing:
             return
-        if self._edit_frame_no >= self._edit_total - 1:
+        if self._edit_frame_no >= self._edit_out:
             self._edit_playing = False
             self.edit_play_btn.configure(text="▶")
             return
@@ -2243,15 +2954,57 @@ class GolfBroadcastApp(ctk.CTk):
 
     def _edit_clear_swing(self):
         swing = self._edit_current_swing
-        if swing:
+        if swing and swing.points:
+            self._edit_push_undo()
             swing.points.clear()
+            swing.handles.clear()
             self._edit_update_display()
 
+    # ----- Undo / Redo (スナップショット方式) -----
+
+    def _edit_push_undo(self):
+        """現在の軌道状態を undo スタックに保存"""
+        self._edit_undo_stack.append(self._edit_snapshot())
+        if len(self._edit_undo_stack) > self._UNDO_MAX:
+            self._edit_undo_stack.pop(0)
+        self._edit_redo_stack.clear()
+
+    def _edit_snapshot(self):
+        """全スイングの points/handles のディープコピーを返す"""
+        snapshot = []
+        for swing in self._edit_swings:
+            snapshot.append((
+                list(swing.points),
+                [h if h is None else tuple(h) for h in swing.handles],
+            ))
+        return snapshot
+
+    def _edit_restore_snapshot(self, snapshot):
+        """スナップショットから points/handles を復元"""
+        for i, (pts, hds) in enumerate(snapshot):
+            if i < len(self._edit_swings):
+                self._edit_swings[i].points = list(pts)
+                self._edit_swings[i].handles = list(hds)
+
     def _edit_undo(self):
-        swing = self._edit_current_swing
-        if swing and swing.points:
-            swing.points.pop()
-            self._edit_update_display()
+        if not self._edit_undo_stack:
+            return
+        self._edit_redo_stack.append(self._edit_snapshot())
+        snapshot = self._edit_undo_stack.pop()
+        self._edit_restore_snapshot(snapshot)
+        self._edit_handle_point = None
+        self._edit_dragging = None
+        self._edit_update_display()
+
+    def _edit_redo(self):
+        if not self._edit_redo_stack:
+            return
+        self._edit_undo_stack.append(self._edit_snapshot())
+        snapshot = self._edit_redo_stack.pop()
+        self._edit_restore_snapshot(snapshot)
+        self._edit_handle_point = None
+        self._edit_dragging = None
+        self._edit_update_display()
 
     def _edit_delete_trajectory(self):
         """軌道を削除 (メモリ上の全スイング + 保存ファイル)"""
@@ -2332,7 +3085,9 @@ class GolfBroadcastApp(ctk.CTk):
 
         # スナップショットを取得 (バックグラウンド中にユーザーが別クリップを開いても安全)
         cache = self._edit_cache
-        total = self._edit_total
+        edit_in = self._edit_in
+        edit_out = self._edit_out
+        total = edit_out - edit_in + 1
         swings_copy = []
         for s in self._edit_swings:
             swings_copy.append(TrajectoryData(
@@ -2346,23 +3101,22 @@ class GolfBroadcastApp(ctk.CTk):
                 handles=list(s.handles) if s.handles else [],
             ))
 
-        out_path = self.project_dir / "exports" / f"swing_{clip.name}.mp4"
+        out_path = (self.project_dir / "exports"
+                    / datetime.date.today().strftime("%m-%d") / f"swing_{clip.name}.mp4")
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         self.edit_frame_label.configure(text="書き出し中...")
 
         thread = threading.Thread(
             target=self._do_edit_export,
-            args=(clip, swings_copy, out_path, cache, total),
+            args=(clip, swings_copy, out_path, cache, total, edit_in),
             daemon=True
         )
         thread.start()
 
-    def _do_edit_export(self, clip, swings, out_path, cache, total):
-        print(f"[Edit] 動画書き出し中... ({total} frames)")
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(out_path), fourcc, clip.fps,
-                                  (clip.width, clip.height))
+    def _do_edit_export(self, clip, swings, out_path, cache, total, edit_in=0):
+        print(f"[Edit] 動画書き出し中... ({total} frames)", flush=True)
+        t0 = time.time()
 
         # スプライン事前構築
         spline_data = []
@@ -2380,29 +3134,68 @@ class GolfBroadcastApp(ctk.CTk):
                 "swing_ref": swing,
             })
 
-        # 元ファイルから直接読み込み (キャッシュが未完了でも全フレーム書き出し)
         src_path = clip.exported_path if clip.exported_path else clip.source_path
         cap = cv2.VideoCapture(src_path)
         if not cap.isOpened():
-            print(f"[Edit] ソースを開けません: {src_path}")
-            writer.release()
+            print(f"[Edit] ソースを開けません: {src_path}", flush=True)
             self.after(0, lambda: self.edit_frame_label.configure(
                 text="書き出し失敗: ソースを開けません"))
             return
+        cap.set(cv2.CAP_PROP_POS_FRAMES, clip.in_frame + edit_in)
 
-        cap.set(cv2.CAP_PROP_POS_FRAMES, clip.in_frame)
-        written = 0
+        # ====== 2パス方式: パイプI/O完全排除 ======
+        # Phase 1: decode + overlay → YUV420P一時ファイル (SSD直書き)
+        # Phase 2: ffmpeg がファイルからNVENCエンコード (GPU全力)
+        import tempfile, os
+        temp_fd, temp_raw = tempfile.mkstemp(suffix=".raw", prefix="export_")
+        os.close(temp_fd)
+
+        # リードアヘッドスレッド
+        read_queue = queue.Queue(maxsize=12)
+
+        def _reader_thread():
+            try:
+                for _ in range(total):
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        break
+                    read_queue.put(frame)
+            except Exception:
+                pass
+            read_queue.put(None)
+
+        read_thread = threading.Thread(target=_reader_thread, daemon=True)
+        read_thread.start()
+
+        # ライトスレッド: cvtColor + ファイル書き込みをoverlayと並列化
+        write_queue = queue.Queue(maxsize=4)
+        _written_count = [0]
+
+        def _writer_thread():
+            with open(temp_raw, 'wb') as f:
+                while True:
+                    item = write_queue.get()
+                    if item is None:
+                        break
+                    yuv = cv2.cvtColor(item, cv2.COLOR_BGR2YUV_I420)
+                    f.write(yuv.tobytes())
+                    _written_count[0] += 1
+
+        write_thread = threading.Thread(target=_writer_thread, daemon=True)
+        write_thread.start()
+
         for i in range(total):
-            ret, frame = cap.read()
-            if not ret or frame is None:
+            frame = read_queue.get()
+            if frame is None:
                 break
 
+            src_frame = i + edit_in  # 元タイムラインのフレーム番号
             for sd in spline_data:
                 base_a = getattr(sd["swing_ref"], "alpha", 0.85)
-                eff_alpha = _compute_fade_alpha(sd["swing_ref"], i, base_alpha=base_a)
+                eff_alpha = _compute_fade_alpha(sd["swing_ref"], src_frame, base_alpha=base_a)
                 if eff_alpha <= 0.0:
                     continue
-                curve_pts = sd["spline"].get_curve_at_frame(i)
+                curve_pts = sd["spline"].get_curve_at_frame(src_frame)
                 if curve_pts and len(curve_pts) >= 2:
                     full_len = len(sd["spline"]._curve)
                     ratio = len(curve_pts) / max(full_len, 1)
@@ -2411,16 +3204,67 @@ class GolfBroadcastApp(ctk.CTk):
                                         c_end, sd["thickness"],
                                         eff_alpha, blur=sd["blur"])
 
-            writer.write(frame)
-            written += 1
-            if (i + 1) % 100 == 0:
-                pct = int((i + 1) / total * 100)
+            write_queue.put(frame)
+            if (i + 1) % 60 == 0:
+                pct = int((i + 1) / total * 95)
                 self.after(0, lambda p=pct: self.edit_frame_label.configure(
-                    text=f"書き出し中... {p}%"))
+                    text=f"処理中... {p}%"))
 
+        write_queue.put(None)
+        write_thread.join(timeout=30)
+        written = _written_count[0]
+        read_thread.join(timeout=5)
         cap.release()
-        writer.release()
-        print(f"[Edit] 出力: {out_path} ({written}/{total} frames)")
+        t_phase1 = time.time() - t0
+        print(f"[Edit] Phase1完了: {written} frames → {temp_raw} ({t_phase1:.1f}s)", flush=True)
+
+        # Phase 2: ffmpeg でNVENCエンコード (ファイル読み → GPU全力)
+        self.after(0, lambda: self.edit_frame_label.configure(text="エンコード中... 95%"))
+        ffmpeg_bin = find_ffmpeg()
+        if ffmpeg_bin:
+            from ffmpeg_writer import _build_encoder_args
+            enc_args = _build_encoder_args(
+                self.settings["crf"], "fast", hw_encode=True)
+            enc_cmd = [
+                ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "rawvideo", "-s", f"{clip.width}x{clip.height}",
+                "-pix_fmt", "yuv420p", "-r", str(clip.fps),
+                "-i", temp_raw,
+            ] + enc_args + [str(out_path)]
+            t_enc = time.time()
+            result = subprocess.run(
+                enc_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            t_phase2 = time.time() - t_enc
+            if result.returncode != 0:
+                err = result.stderr.decode(errors="replace")[-300:]
+                print(f"[Edit] エンコード失敗: {err}", flush=True)
+            else:
+                print(f"[Edit] Phase2完了: NVENC encode ({t_phase2:.1f}s)", flush=True)
+        else:
+            # ffmpeg なし: cv2 フォールバック (Phase1のrawから再読み込み)
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            w2 = cv2.VideoWriter(str(out_path), fourcc, clip.fps,
+                                  (clip.width, clip.height))
+            frame_bytes = clip.width * clip.height * 3
+            with open(temp_raw, 'rb') as f:
+                while True:
+                    raw = f.read(frame_bytes)
+                    if len(raw) < frame_bytes:
+                        break
+                    fr = np.frombuffer(raw, dtype=np.uint8).reshape(
+                        (clip.height, clip.width, 3))
+                    w2.write(fr)
+            w2.release()
+
+        # 一時ファイル削除
+        try:
+            os.remove(temp_raw)
+        except OSError:
+            pass
+
+        elapsed = time.time() - t0
+        print(f"[Edit] 出力: {out_path} ({written}/{total} frames, {elapsed:.1f}s)", flush=True)
         # 送出リストに自動追加 (GUIスレッドで実行)
         self.after(0, lambda p=out_path: self._add_export_to_playout(str(p)))
 
@@ -2458,6 +3302,7 @@ class GolfBroadcastApp(ctk.CTk):
             ]
             self.playout.add_item(clip, [])
             self.playout.save_playlist(self._playout_json)
+            self._playout_dirty = True
             self._refresh_playout_list()
             self.edit_frame_label.configure(
                 text=f"書き出し完了: {p.name}\n"
@@ -2567,6 +3412,14 @@ class GolfBroadcastApp(ctk.CTk):
         # 右: プレイリスト
         right = ctk.CTkFrame(self.po_paned, width=350)
 
+        self.po_rec_btn = ctk.CTkButton(
+            right, text="⏺ REC", width=250, height=36,
+            font=("", 14, "bold"),
+            fg_color="#8B0000", hover_color="#B22222",
+            command=self._toggle_rec
+        )
+        self.po_rec_btn.pack(padx=10, pady=(8, 2))
+
         pl_header = ctk.CTkFrame(right, fg_color="transparent")
         pl_header.pack(fill="x", padx=5, pady=(10, 0))
         ctk.CTkLabel(pl_header, text="送出リスト", font=("", 16, "bold")).pack(side="left", padx=5)
@@ -2581,6 +3434,7 @@ class GolfBroadcastApp(ctk.CTk):
         self.playout_scroll.pack(fill="both", expand=True, padx=5, pady=5)
         self.playout_scroll.grid_columnconfigure(0, weight=1)
         self._playout_widgets = []
+        self._playout_row_map = {}  # playlist index → row widget
 
         # ShuttlePRO v2 ステータス
         shuttle_frame = ctk.CTkFrame(right)
@@ -2678,14 +3532,57 @@ class GolfBroadcastApp(ctk.CTk):
             pass
 
     def _refresh_playout_list(self):
+        self._playout_dirty = False
         for w in self._playout_widgets:
             w.destroy()
         self._playout_widgets.clear()
 
+        # 日付グループ表示用: ソースパスから日付ディレクトリを取得
+        def _po_date_key(item):
+            parent = Path(item.clip.source_path).parent.name
+            if (len(parent) == 5 and parent[2] == '-') or (len(parent) == 10 and parent[4] == '-' and parent[7] == '-'):
+                return parent
+            return ""
+
+        current_group = None
+        collapsed = False
+        grid_row = 0
+        self._playout_row_map = {}  # playlist index → row widget
         for i, item in enumerate(self.playout.playlist):
+            group = _po_date_key(item)
+            if group != current_group:
+                current_group = group
+                collapsed = group in self._collapsed_playout_groups
+                arrow = "▶" if collapsed else "▼"
+                label = group if group else "その他"
+                header = ctk.CTkFrame(self.playout_scroll, height=22,
+                                      fg_color="#1a1a3a", cursor="hand2")
+                header.grid(row=grid_row, column=0, sticky="ew", pady=(4, 1))
+                header.grid_columnconfigure(0, weight=1)
+                hdr_btn = ctk.CTkButton(
+                    header, text=f"{arrow} {label}",
+                    font=("", 11, "bold"), text_color="#8888CC",
+                    fg_color="transparent", hover_color="#2a2a4a",
+                    anchor="w",
+                    command=lambda g=group: self._toggle_playout_group(g))
+                hdr_btn.grid(row=0, column=0, sticky="ew", padx=4)
+                dir_path = str(Path(item.clip.source_path).parent)
+                hdr_btn.bind("<Button-3>",
+                             lambda e, d=dir_path: self._show_folder_menu(e, d))
+                self._playout_widgets.append(header)
+                grid_row += 1
+
+            if collapsed:
+                continue
+
             row = ctk.CTkFrame(self.playout_scroll, height=35)
-            row.grid(row=i, column=0, sticky="ew", pady=2)
+            row.grid(row=grid_row, column=0, sticky="ew", pady=2)
             row.grid_columnconfigure(1, weight=1)
+
+            # 選択中ハイライト
+            is_selected = (self._playout_selected_idx == i)
+            if is_selected:
+                row.configure(fg_color="#1a3a1a", border_color="#00AA00", border_width=1)
 
             # 選択ボタン (キューアップ)
             ctk.CTkButton(
@@ -2714,6 +3611,8 @@ class GolfBroadcastApp(ctk.CTk):
             ).grid(row=0, column=3, padx=(0, 3))
 
             self._playout_widgets.append(row)
+            self._playout_row_map[i] = row
+            grid_row += 1
 
     def _on_playout_seek(self, value):
         """シークバー操作 (スロットル付き)"""
@@ -2733,7 +3632,7 @@ class GolfBroadcastApp(ctk.CTk):
             return
         frame_offset = getattr(self, '_po_seek_pending', 0)
         self.playout.seek_to(frame_offset)
-        self._playout_show_preview(frame_offset)
+        # GUI更新は on_frame_update → _po_flush_frame で行われる
 
     def _playout_seek_delta(self, delta):
         """送出タブでフレーム送り/戻り (停止中 or 一時停止中)"""
@@ -2744,11 +3643,8 @@ class GolfBroadcastApp(ctk.CTk):
             return
         current = int(self.po_seek_slider.get())
         new_pos = max(0, min(current + delta, total - 1))
-        self._po_slider_updating = True
-        self.po_seek_slider.set(new_pos)
-        self._po_slider_updating = False
         self.playout.seek_to(new_pos)
-        self._playout_show_preview(new_pos)
+        # GUI更新は on_frame_update → _po_flush_frame で行われる
 
     def _playout_show_preview(self, frame_offset=None):
         """送出プレビューを即時更新 (シーク/キュー後)"""
@@ -2785,8 +3681,8 @@ class GolfBroadcastApp(ctk.CTk):
 
     def _playout_highlight_row(self, idx):
         """プレイリストの選択行をハイライト"""
-        for i, w in enumerate(self._playout_widgets):
-            if i == idx:
+        for pi, w in self._playout_row_map.items():
+            if pi == idx:
                 w.configure(fg_color="#1a3a1a", border_color="#00AA00", border_width=1)
             else:
                 w.configure(fg_color=("gray86", "gray17"), border_width=0)
@@ -2933,6 +3829,7 @@ class GolfBroadcastApp(ctk.CTk):
         elif self._playout_selected_idx is not None and self._playout_selected_idx > idx:
             self._playout_selected_idx -= 1
         self.playout.save_playlist(self._playout_json)
+        self._playout_dirty = True
         self._refresh_playout_list()
 
     def _playout_clear(self):
@@ -2951,6 +3848,7 @@ class GolfBroadcastApp(ctk.CTk):
         self.playout.playlist.clear()
         self._playout_selected_idx = None
         self.playout.save_playlist(self._playout_json)
+        self._playout_dirty = True
         self._refresh_playout_list()
 
     def _playout_open_in_edit(self, idx):
@@ -2961,6 +3859,9 @@ class GolfBroadcastApp(ctk.CTk):
         clip = item.clip
 
         print(f"[Edit] 送出クリップ読み込み: {clip.name}")
+        if self._edit_slider_after is not None:
+            self.after_cancel(self._edit_slider_after)
+            self._edit_slider_after = None
         self._edit_clip_id = None
         self._edit_direct_clip = clip
         self._edit_cache = FrameCache(clip.source_path, clip.in_frame, clip.get_out_frame())
@@ -2971,6 +3872,7 @@ class GolfBroadcastApp(ctk.CTk):
         self._edit_swing_idx = 0
 
         self.edit_slider.configure(to=max(self._edit_total - 1, 1))
+        self._edit_reset_in_out()
         self._edit_update_color_buttons()
         self._edit_update_display()
         self._refresh_edit_clips_list()
@@ -3037,8 +3939,12 @@ class GolfBroadcastApp(ctk.CTk):
     # 設定タブ
     # =========================================================================
     def _build_settings_tab(self):
-        tab = self.tab_settings
-        tab.grid_columnconfigure(0, weight=1)
+        outer = self.tab_settings
+        outer.grid_columnconfigure(0, weight=1)
+        outer.grid_rowconfigure(0, weight=1)
+
+        tab = ctk.CTkScrollableFrame(outer)
+        tab.pack(fill="both", expand=True)
 
         ctk.CTkLabel(tab, text="システム設定", font=("", 20, "bold")).pack(pady=15)
 
@@ -3087,6 +3993,43 @@ class GolfBroadcastApp(ctk.CTk):
         self.fps_combo.set(str(self.settings["fps"]))
         self.fps_combo.pack(side="left")
 
+        # CRF (録画品質)
+        crf_row = ctk.CTkFrame(sec3, fg_color="transparent")
+        crf_row.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(crf_row, text="録画品質 (CRF):").pack(side="left", padx=(0, 5))
+        self._crf_value_label = ctk.CTkLabel(crf_row, text=str(self.settings["crf"]),
+                                              width=30)
+        self._crf_value_label.pack(side="right", padx=(5, 0))
+        ctk.CTkLabel(crf_row, text="低品質", font=("", 10),
+                      text_color="#888").pack(side="right", padx=(5, 0))
+        self.crf_slider = ctk.CTkSlider(
+            crf_row, from_=0, to=28, number_of_steps=28, width=200,
+            command=self._on_crf_slider)
+        self.crf_slider.set(self.settings["crf"])
+        self.crf_slider.pack(side="right", padx=(5, 0))
+        ctk.CTkLabel(crf_row, text="高品質", font=("", 10),
+                      text_color="#888").pack(side="right", padx=(5, 0))
+
+        # グローウィングバッファ時間
+        buf_row = ctk.CTkFrame(sec3, fg_color="transparent")
+        buf_row.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(buf_row, text="グローウィング最大時間:").pack(side="left", padx=(0, 5))
+        self.growing_buf_combo = ctk.CTkComboBox(
+            buf_row,
+            values=["30秒", "1分", "2分", "3分", "5分", "10分"],
+            width=100,
+            command=self._on_growing_buf_changed,
+        )
+        # 現在の設定値から表示を復元
+        cur_sec = self.settings["growing_buffer_sec"]
+        buf_labels = {30: "30秒", 60: "1分", 120: "2分", 180: "3分", 300: "5分", 600: "10分"}
+        self.growing_buf_combo.set(buf_labels.get(cur_sec, f"{cur_sec}秒"))
+        self.growing_buf_combo.pack(side="left", padx=(0, 10))
+        self._growing_mem_label = ctk.CTkLabel(buf_row, text="",
+                                                font=("", 10), text_color="#888")
+        self._growing_mem_label.pack(side="left")
+        self._update_growing_mem_label(cur_sec)
+
         # デバイス
         sec4 = ctk.CTkFrame(tab)
         sec4.pack(fill="x", padx=20, pady=5)
@@ -3104,6 +4047,9 @@ class GolfBroadcastApp(ctk.CTk):
         self.output_dev_combo = ctk.CTkComboBox(dev_row, values=device_names, width=250)
         self.output_dev_combo.pack(side="left")
 
+        # キーボードショートカット設定
+        self._build_keyboard_shortcut_settings(tab)
+
         # ShuttlePRO v2 ボタン設定
         self._build_shuttle_settings(tab)
 
@@ -3112,6 +4058,131 @@ class GolfBroadcastApp(ctk.CTk):
                        font=("", 14, "bold"),
                        fg_color="#006400", hover_color="#228B22",
                        command=self._save_settings).pack(pady=20)
+
+    def _build_keyboard_shortcut_settings(self, tab):
+        """キーボードショートカット設定セクション"""
+        sec = ctk.CTkFrame(tab)
+        sec.pack(fill="x", padx=20, pady=10)
+        ctk.CTkLabel(sec, text="キーボードショートカット",
+                      font=("", 14, "bold")).pack(anchor="w", padx=10, pady=(10, 2))
+        ctk.CTkLabel(sec, text="ボタンをクリックしてキーを押すと変更できます",
+                      font=("", 10), text_color="#888").pack(anchor="w", padx=10, pady=(0, 5))
+
+        shortcuts = self.settings.data.get("keyboard_shortcuts",
+                                            dict(DEFAULT_KEYBOARD_SHORTCUTS))
+        self._kb_shortcut_btns = {}  # action_id -> CTkButton
+        self._kb_capture_active = None  # 現在キャプチャ中の action_id
+
+        # タブコンテキストでグループ分け
+        groups = {}
+        for action_id, label, default_key, context in KEYBOARD_ACTIONS:
+            groups.setdefault(context, []).append((action_id, label, default_key))
+
+        content = ctk.CTkFrame(sec, fg_color="transparent")
+        content.pack(fill="x", padx=10, pady=5)
+
+        col_idx = 0
+        for context, actions in groups.items():
+            grp = ctk.CTkFrame(content)
+            grp.pack(side="left", fill="y", padx=5, pady=2, anchor="n")
+            ctk.CTkLabel(grp, text=context, font=("", 11, "bold"),
+                          text_color="#aaa").pack(anchor="w", padx=5, pady=(5, 2))
+
+            for action_id, label, default_key in actions:
+                row = ctk.CTkFrame(grp, fg_color="transparent")
+                row.pack(fill="x", padx=5, pady=1)
+                ctk.CTkLabel(row, text=label, width=130,
+                              anchor="w", font=("", 11)).pack(side="left")
+                current_key = shortcuts.get(action_id, default_key)
+                display = self._keysym_display(current_key)
+                btn = ctk.CTkButton(
+                    row, text=display, width=70, height=24,
+                    font=("", 11), fg_color="#333", hover_color="#555",
+                    command=lambda aid=action_id: self._kb_start_capture(aid))
+                btn.pack(side="left", padx=3)
+                self._kb_shortcut_btns[action_id] = btn
+
+            col_idx += 1
+
+    @staticmethod
+    def _keysym_display(keysym):
+        """keysymを表示用文字列に変換"""
+        if keysym in KEYSYM_DISPLAY:
+            return KEYSYM_DISPLAY[keysym]
+        if keysym.startswith("F") and keysym[1:].isdigit():
+            return keysym  # F1-F12
+        if len(keysym) == 1:
+            return keysym.upper()
+        return keysym
+
+    def _kb_start_capture(self, action_id):
+        """キーキャプチャモードを開始"""
+        # 前回のキャプチャをキャンセル
+        if self._kb_capture_active and self._kb_capture_active in self._kb_shortcut_btns:
+            prev_btn = self._kb_shortcut_btns[self._kb_capture_active]
+            shortcuts = self.settings.data.get("keyboard_shortcuts",
+                                                dict(DEFAULT_KEYBOARD_SHORTCUTS))
+            prev_key = shortcuts.get(self._kb_capture_active, "")
+            prev_btn.configure(text=self._keysym_display(prev_key), fg_color="#333")
+
+        self._kb_capture_active = action_id
+        btn = self._kb_shortcut_btns[action_id]
+        btn.configure(text="...", fg_color="#8B4513")
+        # bind_all で次のキー入力をキャプチャ
+        self._kb_capture_bind_id = self.bind_all("<Key>", self._kb_on_capture, add=False)
+
+    def _kb_on_capture(self, event):
+        """キーキャプチャ: 押されたキーをアクションに割り当て"""
+        import tkinter as tk
+        if not self._kb_capture_active:
+            return
+
+        keysym = event.keysym
+        action_id = self._kb_capture_active
+        self._kb_capture_active = None
+
+        # キャプチャ用バインドを解除して通常キーバインドに戻す
+        self.unbind_all("<Key>")
+        self._bind_global_keys()
+
+        # ショートカットを更新
+        shortcuts = self.settings.data.get("keyboard_shortcuts",
+                                            dict(DEFAULT_KEYBOARD_SHORTCUTS))
+        # 同じタブ内の重複チェック
+        my_context = None
+        for aid, _, _, ctx in KEYBOARD_ACTIONS:
+            if aid == action_id:
+                my_context = ctx
+                break
+        for aid, _, _, ctx in KEYBOARD_ACTIONS:
+            if aid != action_id and shortcuts.get(aid) == keysym and ctx == my_context:
+                # 重複: 古い方をクリア
+                shortcuts[aid] = ""
+                if aid in self._kb_shortcut_btns:
+                    self._kb_shortcut_btns[aid].configure(text="-")
+
+        shortcuts[action_id] = keysym
+        self.settings["keyboard_shortcuts"] = shortcuts
+        self.settings.save()
+
+        # ボタン表示を更新
+        btn = self._kb_shortcut_btns[action_id]
+        btn.configure(text=self._keysym_display(keysym), fg_color="#333")
+
+        # キーマッピングを再構築
+        self._rebuild_key_map()
+
+    def _rebuild_key_map(self):
+        """settings からキーマッピングのルックアップテーブルを再構築"""
+        shortcuts = self.settings.data.get("keyboard_shortcuts",
+                                            dict(DEFAULT_KEYBOARD_SHORTCUTS))
+        # tab_context -> {keysym_lower: action_id}
+        self._key_map = {}
+        for action_id, _, default_key, context in KEYBOARD_ACTIONS:
+            keysym = shortcuts.get(action_id, default_key)
+            if not keysym:
+                continue
+            self._key_map.setdefault(context, {})[keysym.lower()] = action_id
 
     def _build_shuttle_settings(self, tab):
         """ShuttlePRO v2 ボタン設定セクション"""
@@ -3325,6 +4396,34 @@ class GolfBroadcastApp(ctk.CTk):
             self.record_dir_entry.delete(0, "end")
             self.record_dir_entry.insert(0, d)
 
+    def _on_growing_buf_changed(self, choice):
+        buf_map = {"30秒": 30, "1分": 60, "2分": 120, "3分": 180, "5分": 300, "10分": 600}
+        self._update_growing_mem_label(buf_map.get(choice, 60))
+
+    def _update_growing_mem_label(self, sec):
+        """グローウィングバッファの推定メモリ使用量を表示"""
+        try:
+            fps = float(self.fps_combo.get())
+        except (ValueError, AttributeError):
+            fps = self.settings["fps"]
+        try:
+            res = self.resolution_combo.get()
+            w, h = (int(x) for x in res.split("x"))
+        except (ValueError, AttributeError):
+            w, h = self.settings["width"], self.settings["height"]
+        frames = int(sec * fps)
+        # プレビュー: 480×270×3 bytes/frame, フルレスJPEG: 解像度依存 (Q97で約6-8%)
+        preview_bytes = frames * 480 * 270 * 3
+        jpeg_bytes = frames * int(w * h * 3 * 0.07)
+        total_mb = (preview_bytes + jpeg_bytes) / (1024 * 1024)
+        if total_mb >= 1024:
+            self._growing_mem_label.configure(text=f"推定メモリ: 約 {total_mb / 1024:.1f} GB")
+        else:
+            self._growing_mem_label.configure(text=f"推定メモリ: 約 {total_mb:.0f} MB")
+
+    def _on_crf_slider(self, value):
+        self._crf_value_label.configure(text=str(int(value)))
+
     def _save_settings(self):
         self.settings["project_dir"] = self.project_dir_entry.get()
         self.settings["record_dir"] = self.record_dir_entry.get()
@@ -3339,6 +4438,13 @@ class GolfBroadcastApp(ctk.CTk):
             self.settings["fps"] = float(self.fps_combo.get())
         except ValueError:
             pass
+
+        self.settings["crf"] = int(self.crf_slider.get())
+
+        # グローウィングバッファ時間
+        buf_text = self.growing_buf_combo.get()
+        buf_map = {"30秒": 30, "1分": 60, "2分": 120, "3分": 180, "5分": 300, "10分": 600}
+        self.settings["growing_buffer_sec"] = buf_map.get(buf_text, 60)
 
         # キャプチャモード
         self.settings["capture_mode"] = self._get_current_capture_mode().value
@@ -3362,12 +4468,59 @@ class GolfBroadcastApp(ctk.CTk):
             str(k): v for k, v in self._shuttle_pos_map.items()
         }
 
+        # キーボードショートカット (キャプチャ時にも保存されるが、念のため)
+        if hasattr(self, "_kb_shortcut_btns"):
+            shortcuts = self.settings.data.get("keyboard_shortcuts",
+                                                dict(DEFAULT_KEYBOARD_SHORTCUTS))
+            self.settings["keyboard_shortcuts"] = shortcuts
+
+        # プロジェクトフォルダ変更の反映
+        new_project = Path(self.settings["project_dir"])
+        if new_project != self.project_dir:
+            old_rec_default = str(self.project_dir / "recordings")
+            new_project.mkdir(parents=True, exist_ok=True)
+            self.project_dir = new_project
+            self.settings.path = new_project / "settings.json"
+            self.clip_manager = ClipManager(str(new_project))
+            self._exports_dir = new_project / "exports"
+            self._exports_dir.mkdir(parents=True, exist_ok=True)
+            self._playout_json = str(new_project / "playout.json")
+            self.playout.load_playlist(self._playout_json)
+            self.playout.scan_directory(str(self._exports_dir))
+            self.playout.save_playlist(self._playout_json)
+            # record_dir が旧プロジェクトのデフォルトだった場合、新プロジェクトに追従
+            if os.path.normpath(self.settings["record_dir"]) == os.path.normpath(old_rec_default):
+                new_rec = str(new_project / "recordings")
+                self.settings["record_dir"] = new_rec
+                self.record_dir_entry.delete(0, "end")
+                self.record_dir_entry.insert(0, new_rec)
+            print(f"[Settings] プロジェクトフォルダ変更: {new_project}")
+
+            # デフォルト場所にもproject_dirを保存 (次回起動時に新フォルダを見つけるため)
+            default_settings = Path(DEFAULT_PROJECT_DIR) / "settings.json"
+            if default_settings != self.settings.path:
+                try:
+                    default_settings.parent.mkdir(parents=True, exist_ok=True)
+                    import json
+                    default_data = {}
+                    if default_settings.exists():
+                        with open(default_settings, "r", encoding="utf-8") as f:
+                            default_data = json.load(f)
+                    default_data["project_dir"] = str(new_project)
+                    with open(default_settings, "w", encoding="utf-8") as f:
+                        json.dump(default_data, f, indent=2, ensure_ascii=False)
+                except Exception as e:
+                    print(f"[Settings] デフォルト設定の更新エラー: {e}")
+
         self.settings.save()
+        self._rebuild_key_map()
         self.recorder = Recorder(
             self.settings["record_dir"],
             self.settings["width"],
             self.settings["height"],
             self.settings["fps"],
+            crf=self.settings["crf"],
+            growing_buffer_sec=self.settings["growing_buffer_sec"],
         )
         print("[Settings] 設定を保存しました")
 
@@ -3379,9 +4532,13 @@ class GolfBroadcastApp(ctk.CTk):
         self._shuttle_playing_by_shuttle = False
         self._shuttle_reverse_id = None  # after() ID for reverse playback
         self._shuttle_reverse_step = 0   # current reverse step size
+        self._jog_pending_delta = 0      # ジョグ蓄積デルタ
+        self._jog_timer = None           # ジョグスロットルタイマー
 
         def on_jog(delta):
-            self.after(0, lambda d=delta: self._shuttle_jog(d))
+            self._jog_pending_delta += delta
+            if self._jog_timer is None:
+                self._jog_timer = self.after(33, self._flush_jog)  # ~30fps上限
 
         def on_shuttle(position):
             self.after(0, lambda p=position: self._shuttle_ring(p))
@@ -3403,6 +4560,14 @@ class GolfBroadcastApp(ctk.CTk):
                     text="未接続", text_color="#888")
             self.after(2000, check_connection)
         self.after(2000, check_connection)
+
+    def _flush_jog(self):
+        """蓄積されたジョグデルタをまとめて1回で処理"""
+        self._jog_timer = None
+        delta = self._jog_pending_delta
+        self._jog_pending_delta = 0
+        if delta != 0:
+            self._shuttle_jog(delta)
 
     def _shuttle_jog(self, delta):
         """ジョグ: フレームステップ (再生中は一時停止してからステップ)"""
@@ -3569,88 +4734,108 @@ class GolfBroadcastApp(ctk.CTk):
     def _bind_global_keys(self):
         import tkinter as tk
 
+        # キーマッピングを構築
+        if not hasattr(self, "_key_map") or not self._key_map:
+            self._rebuild_key_map()
+
+        # タブ名→コンテキスト名マッピング
+        tab_contexts = {
+            "クリップ": "クリップ",
+            "編集": "編集",
+            "送出": "送出",
+            "収録": "収録",
+        }
+
+        # アクション→実行関数マッピング
+        action_handlers = {
+            "frame_fwd":       lambda: self._dispatch_frame_jump(self._frame_step),
+            "frame_back":      lambda: self._dispatch_frame_jump(-self._frame_step),
+            "frame_fwd_fast":  lambda: self._dispatch_frame_jump(self._frame_step * 5),
+            "frame_back_fast": lambda: self._dispatch_frame_jump(-self._frame_step * 5),
+            "step_1":          lambda: self._on_frame_step_change("1"),
+            "step_2":          lambda: self._on_frame_step_change("2"),
+            "step_5":          lambda: self._on_frame_step_change("5"),
+            "step_10":         lambda: self._on_frame_step_change("10"),
+            "set_in":          lambda: self._set_in_current(),
+            "set_out":         lambda: self._set_out_current(),
+            "edit_play":       lambda: self._edit_toggle_play(),
+            "edit_set_in":     lambda: self._edit_set_in(),
+            "edit_set_out":    lambda: self._edit_set_out(),
+            "zoom_reset":      lambda: self._edit_zoom_reset(),
+            "po_play_pause":   lambda: self._playout_toggle_play(),
+            "po_play":         lambda: self._playout_play_with_btn(),
+            "po_cue_top":      lambda: self._playout_cue_top(),
+            "po_next":         lambda: self._playout_next(),
+            "po_prev":         lambda: self._playout_prev(),
+            "po_speed_1x":     lambda: self._set_playout_speed("1x"),
+            "po_speed_1_2":    lambda: self._set_playout_speed("1/2"),
+            "po_speed_1_4":    lambda: self._set_playout_speed("1/4"),
+            "po_speed_1_8":    lambda: self._set_playout_speed("1/8"),
+            "toggle_rec":      lambda: self._toggle_rec(),
+        }
+
         def on_key(event):
             w = event.widget
             if isinstance(w, (tk.Entry, ctk.CTkEntry)):
                 return
 
-            key = event.keysym
-
+            key = event.keysym.lower()
             current_tab = self.tabview.get()
-
-            # クリップタブ
-            if current_tab == "クリップ":
-                if key.lower() == "d" or key == "Right":
-                    self._clip_jump(self._frame_step)
-                elif key.lower() == "a" or key == "Left":
-                    self._clip_jump(-self._frame_step)
-                elif key.lower() == "w":
-                    self._clip_jump(self._frame_step * 5)
-                elif key.lower() == "s":
-                    self._clip_jump(-self._frame_step * 5)
-                elif key.lower() == "i":
-                    self._set_in_current()
-                elif key.lower() == "o":
-                    self._set_out_current()
+            context = tab_contexts.get(current_tab)
+            if not context:
                 return
 
-            # 編集タブ
-            if current_tab == "編集":
-                if key.lower() == "d" or key == "Right":
-                    self._edit_jump(self._frame_step)
-                elif key.lower() == "a" or key == "Left":
-                    self._edit_jump(-self._frame_step)
-                elif key.lower() == "w":
-                    self._edit_jump(self._frame_step * 5)
-                elif key.lower() == "s":
-                    self._edit_jump(-self._frame_step * 5)
-                elif key == "space":
-                    self._edit_toggle_play()
+            # Ctrl+Z / Ctrl+Shift+Z (編集タブ Undo/Redo)
+            ctrl = event.state & 0x4
+            shift = event.state & 0x1
+            if ctrl and key == "z" and context == "編集":
+                if shift:
+                    self._edit_redo()
+                else:
+                    self._edit_undo()
                 return
 
-            # 送出タブ (プロ用ショートカット)
-            if current_tab == "送出":
-                if key == "space":
-                    self._playout_toggle_play()
-                elif key == "Return" or key == "F5":
-                    self._playout_play()
-                    self.po_play_btn.configure(text="⏸ PAUSE",
-                        fg_color="#B8860B", hover_color="#DAA520")
-                elif key == "Escape":
-                    self._playout_cue_top()
-                elif key == "F8" or key.lower() == "n":
-                    self._playout_next()
-                elif key == "F1" or key.lower() == "p":
-                    self._playout_prev()
-                elif key.lower() == "d" or key == "Right":
-                    self._playout_seek_delta(self._frame_step)
-                elif key.lower() == "a" or key == "Left":
-                    self._playout_seek_delta(-self._frame_step)
-                elif key.lower() == "w":
-                    self._playout_seek_delta(self._frame_step * 5)
-                elif key.lower() == "s":
-                    self._playout_seek_delta(-self._frame_step * 5)
-                elif key == "1":
-                    self.po_speed_seg.set("1x")
-                    self._on_speed_change("1x")
-                elif key == "2":
-                    self.po_speed_seg.set("1/2")
-                    self._on_speed_change("1/2")
-                elif key == "3":
-                    self.po_speed_seg.set("1/4")
-                    self._on_speed_change("1/4")
-                elif key == "4":
-                    self.po_speed_seg.set("1/8")
-                    self._on_speed_change("1/8")
-                return
+            # タブ固有のショートカットを先にチェック
+            tab_map = self._key_map.get(context, {})
+            action = tab_map.get(key)
 
-            # 収録タブ
-            if current_tab == "収録":
-                if key == "F9" or key == "space":
-                    self._toggle_rec()
-                return
+            # 共通ショートカット
+            if not action:
+                common_map = self._key_map.get("共通", {})
+                action = common_map.get(key)
+
+            if action and action in action_handlers:
+                action_handlers[action]()
 
         self.bind_all("<Key>", on_key)
+
+    def _dispatch_frame_jump(self, delta):
+        """現在のタブに応じてフレームジャンプを実行"""
+        current_tab = self.tabview.get()
+        if current_tab == "クリップ":
+            self._clip_jump(delta)
+        elif current_tab == "編集":
+            self._edit_jump(delta)
+        elif current_tab == "送出":
+            self._playout_seek_delta(delta)
+
+    def _edit_zoom_reset(self):
+        """編集タブのズームをリセット"""
+        self._edit_zoom = 1.0
+        self._edit_pan_vx = 0.0
+        self._edit_pan_vy = 0.0
+        self._edit_update_display()
+
+    def _playout_play_with_btn(self):
+        """送出再生 + ボタン表示更新"""
+        self._playout_play()
+        self.po_play_btn.configure(text="⏸ PAUSE",
+            fg_color="#B8860B", hover_color="#DAA520")
+
+    def _set_playout_speed(self, speed):
+        """送出速度を設定 + UI同期"""
+        self.po_speed_seg.set(speed)
+        self._on_speed_change(speed)
 
     # =========================================================================
     # 終了処理
@@ -3673,6 +4858,7 @@ class GolfBroadcastApp(ctk.CTk):
         self.playout._wait_thread()
         self.playout.save_playlist(self._playout_json)
         self.clip_manager.save()
+        self._release_clip_preview_cap()
         self.destroy()
 
 

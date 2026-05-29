@@ -6,6 +6,8 @@ DeckLinkまたはフォールバック入力からの映像をファイルに記
 録画しながらスクラブ/In/Out/クリップ切り出しが可能。
 """
 
+import collections
+import datetime
 import threading
 import time
 from pathlib import Path
@@ -13,26 +15,29 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from ffmpeg_writer import FFmpegWriter, find_ffmpeg, ffmpeg_extract
+
 
 # プレビュー用縮小解像度
 _PREVIEW_W = 480
 _PREVIEW_H = 270
 
-# JPEG圧縮品質 (フルレスバッファ用)
-_JPEG_QUALITY = 85
+# JPEG圧縮品質 (フルレスバッファ用 — 録画後に高品質で再書き出しするため低めでOK)
+_JPEG_QUALITY = 75
 
 
 class Recorder:
     """入力映像のRECORD/STOP制御 + グローウィングバッファ"""
 
-    MAX_BUFFER_FRAMES = 1800  # バッファ上限 (~60秒 @30fps)
-
-    def __init__(self, output_dir: str, width=1920, height=1080, fps=29.97):
+    def __init__(self, output_dir: str, width=1920, height=1080, fps=29.97,
+                 crf=18, growing_buffer_sec=60):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.width = width
         self.height = height
         self.fps = fps
+        self.crf = crf
+        self.max_buffer_frames = int(growing_buffer_sec * max(fps, 1))
 
         self._recording = False
         self._writer = None
@@ -41,9 +46,10 @@ class Recorder:
         self._start_time = None
         self._lock = threading.Lock()
 
-        # グローウィングバッファ
-        self._preview_buffer = []   # 縮小フレーム (numpy, 480x270) - スクラブ用
-        self._fullres_buffer = []   # JPEG bytes - クリップ切り出し用
+        # グローウィングバッファ (リングバッファ, deque で O(1) 先頭削除)
+        self._preview_buffer = collections.deque()   # 縮小フレーム (numpy, 480x270)
+        self._fullres_buffer = collections.deque()   # JPEG bytes - クリップ切り出し用
+        self._buffer_start = 0      # buffer[0] が対応する絶対フレーム番号
         # In/Out (グローウィング中に設定可能)
         self._growing_in = 0
         self._growing_out = -1
@@ -68,7 +74,13 @@ class Recorder:
 
     @property
     def buffered_frame_count(self):
-        return len(self._preview_buffer)
+        """バッファ末尾の絶対フレーム番号+1 (スライダーの to 値に使用)"""
+        return self._buffer_start + len(self._preview_buffer)
+
+    @property
+    def buffer_start(self):
+        """バッファ先頭の絶対フレーム番号 (スライダーの from_ 値に使用)"""
+        return self._buffer_start
 
     @property
     def growing_in(self):
@@ -99,15 +111,23 @@ class Recorder:
                 self.fps = fps
 
             if filename is None:
-                ts = time.strftime("%Y%m%d_%H%M%S")
+                ts = time.strftime("%m%d_%H%M%S")
                 filename = f"rec_{ts}.mp4"
 
-            self._current_path = self.output_dir / filename
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            self._writer = cv2.VideoWriter(
-                str(self._current_path), fourcc, self.fps,
-                (self.width, self.height)
-            )
+            today_dir = self.output_dir / datetime.date.today().strftime("%m-%d")
+            today_dir.mkdir(parents=True, exist_ok=True)
+            self._current_path = today_dir / filename
+            try:
+                self._writer = FFmpegWriter(
+                    str(self._current_path), self.width, self.height, self.fps,
+                    crf=self.crf, preset="ultrafast")
+            except FileNotFoundError:
+                # ffmpeg が無い場合は cv2 にフォールバック
+                print("[Recorder] ffmpeg未検出、cv2.VideoWriter にフォールバック")
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                self._writer = cv2.VideoWriter(
+                    str(self._current_path), fourcc, self.fps,
+                    (self.width, self.height))
 
             if not self._writer.isOpened():
                 print(f"[Recorder] ファイルを開けません: {self._current_path}")
@@ -119,6 +139,7 @@ class Recorder:
             self._start_time = time.time()
             self._preview_buffer.clear()
             self._fullres_buffer.clear()
+            self._buffer_start = 0
             self._growing_in = 0
             self._growing_out = -1
             print(f"[Recorder] REC開始: {self._current_path}")
@@ -138,47 +159,65 @@ class Recorder:
             self._writer.write(frame)
             self._frame_count += 1
 
-            if len(self._preview_buffer) < self.MAX_BUFFER_FRAMES:
-                # プレビュー用縮小フレーム
-                small = cv2.resize(frame, (_PREVIEW_W, _PREVIEW_H))
-                self._preview_buffer.append(small)
-                # フルレスJPEG (クリップ切り出し用)
-                _, jpg = cv2.imencode(
-                    '.jpg', frame,
-                    [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
-                self._fullres_buffer.append(jpg.tobytes())
+            # プレビュー用縮小フレーム
+            small = cv2.resize(frame, (_PREVIEW_W, _PREVIEW_H))
+            self._preview_buffer.append(small)
+            # バッファ用JPEG (プレビュー解像度 — 最終品質は re_export_clip で確保)
+            _, jpg = cv2.imencode(
+                '.jpg', small,
+                [cv2.IMWRITE_JPEG_QUALITY, 90])
+            self._fullres_buffer.append(jpg.tobytes())
+            # リングバッファ: 上限超過時は古いフレームを破棄
+            if len(self._preview_buffer) > self.max_buffer_frames:
+                self._preview_buffer.popleft()
+                self._fullres_buffer.popleft()
+                self._buffer_start += 1
 
     def get_buffered_frame(self, index):
-        """バッファからプレビューフレームを取得 (縮小サイズ)"""
+        """バッファからプレビューフレームを取得 (縮小サイズ)
+
+        index: 絶対フレーム番号 (録画開始からの通し番号)
+        """
         with self._lock:
-            if 0 <= index < len(self._preview_buffer):
-                return self._preview_buffer[index].copy()
+            buf_idx = index - self._buffer_start
+            if 0 <= buf_idx < len(self._preview_buffer):
+                return self._preview_buffer[buf_idx].copy()
             return None
 
     def export_clip(self, in_frame, out_frame, output_path):
         """グローウィングバッファからクリップを切り出してMP4書き出し
 
         録画中でも呼べる。バッファ内のJPEGフレームをデコードして書き出す。
+        in_frame, out_frame: 絶対フレーム番号
         Returns: 書き出し成功時はフレーム数、失敗時は0
         """
         with self._lock:
             buf_len = len(self._fullres_buffer)
             if buf_len == 0:
                 return 0
-            in_f = max(0, in_frame)
-            out_f = min(out_frame, buf_len - 1) if out_frame >= 0 else buf_len - 1
+            buf_end = self._buffer_start + buf_len  # バッファ末尾+1の絶対番号
+            in_f = max(self._buffer_start, in_frame)
+            out_f = min(out_frame, buf_end - 1) if out_frame >= 0 else buf_end - 1
             if in_f > out_f:
                 return 0
-            # バッファ参照をコピー (ロック時間を最小化)
-            frames_to_write = self._fullres_buffer[in_f:out_f + 1]
+            # 絶対→相対インデックスに変換してコピー (deque はスライス不可)
+            rel_in = in_f - self._buffer_start
+            rel_out = out_f - self._buffer_start
+            frames_to_write = [self._fullres_buffer[i]
+                               for i in range(rel_in, rel_out + 1)]
 
         # ロック外でデコード＆書き出し
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(
-            str(output_path), fourcc, self.fps,
-            (self.width, self.height))
+        try:
+            writer = FFmpegWriter(
+                str(output_path), self.width, self.height, self.fps,
+                crf=self.crf, preset="fast")
+        except FileNotFoundError:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(
+                str(output_path), fourcc, self.fps,
+                (self.width, self.height))
         if not writer.isOpened():
             print(f"[Recorder] クリップ書き出し失敗: {output_path}")
             return 0
@@ -213,3 +252,23 @@ class Recorder:
             duration = self._frame_count / max(self.fps, 1)
             print(f"[Recorder] REC停止: {path} ({self._frame_count} frames, {duration:.1f}s)")
             return path
+
+    @staticmethod
+    def re_export_clip(rec_path, in_frame, out_frame, output_path, fps,
+                       crf=18, hw_encode=False):
+        """REC本体から指定範囲を再書き出し (録画停止後に呼ぶ)
+
+        グローウィング切り出しで作られたJPEG経由クリップを
+        REC本体から直接再エンコードして差し替える。
+        Returns: 成功時 True
+        """
+        if not Path(rec_path).exists():
+            print(f"[Recorder] 再書き出し元が見つかりません: {rec_path}")
+            return False
+        ok = ffmpeg_extract(rec_path, output_path, in_frame, out_frame, fps,
+                            crf=crf, preset="medium", hw_encode=hw_encode)
+        if ok:
+            print(f"[Recorder] 高品質再書き出し完了: {Path(output_path).name}")
+        else:
+            print(f"[Recorder] 再書き出し失敗: {Path(output_path).name}")
+        return ok

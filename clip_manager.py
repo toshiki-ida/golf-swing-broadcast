@@ -4,6 +4,7 @@
 録画ファイルのリスト管理、In/Out点設定、トリム保存、軌道データ紐付けを行う。
 """
 
+import datetime
 import json
 import shutil
 import time
@@ -13,6 +14,15 @@ from typing import Optional
 
 import cv2
 import numpy as np
+
+from ffmpeg_writer import FFmpegWriter, ffmpeg_extract
+
+
+def _today_subdir(base_dir: Path) -> Path:
+    """base_dir / MM-DD を返す (なければ作成)"""
+    d = base_dir / datetime.date.today().strftime("%m-%d")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 @dataclass
@@ -89,13 +99,16 @@ class ClipManager:
         self.project_dir = Path(project_dir)
         self.clips_dir = self.project_dir / "clips"
         self.export_dir = self.project_dir / "exports"
+        self.trajectories_dir = self.project_dir / "trajectories"
         self.data_file = self.project_dir / "clips.json"
         self.clips: list[ClipData] = []
 
         self.clips_dir.mkdir(parents=True, exist_ok=True)
         self.export_dir.mkdir(parents=True, exist_ok=True)
+        self.trajectories_dir.mkdir(parents=True, exist_ok=True)
 
         self._load()
+        self._migrate_trajectories()
 
     def _load(self):
         """JSONからクリップリストを読み込み"""
@@ -108,6 +121,28 @@ class ClipManager:
             except Exception as e:
                 print(f"[ClipManager] 読み込みエラー: {e}")
                 self.clips = []
+
+    def _migrate_trajectories(self):
+        """旧パスの軌跡ファイルをtrajectories/ディレクトリに移動"""
+        migrated = 0
+        for clip in self.clips:
+            if not clip.trajectory_path:
+                continue
+            old_path = Path(clip.trajectory_path)
+            new_path = self.trajectories_dir / old_path.name
+            if old_path == new_path:
+                continue
+            if old_path.exists():
+                shutil.move(str(old_path), str(new_path))
+                clip.trajectory_path = str(new_path)
+                migrated += 1
+            elif new_path.exists():
+                # 既に移動済み — パスだけ更新
+                clip.trajectory_path = str(new_path)
+                migrated += 1
+        if migrated:
+            self.save()
+            print(f"[ClipManager] {migrated} 件の軌跡ファイルを trajectories/ に移行")
 
     def save(self):
         """JSONにクリップリストを保存"""
@@ -168,8 +203,9 @@ class ClipManager:
             clip.out_frame = min(out_frame, clip.total_frames - 1)
             self.save()
 
-    def export_trimmed(self, clip_id: str) -> Optional[str]:
-        """In/Out点でトリムした動画を書き出し"""
+    def export_trimmed(self, clip_id: str, crf: int = 18,
+                       hw_encode: bool = False) -> Optional[str]:
+        """In/Out点でトリムした動画を書き出し (ffmpeg優先)"""
         clip = self.get_clip(clip_id)
         if not clip:
             return None
@@ -179,29 +215,33 @@ class ClipManager:
             print(f"[ClipManager] ソースが見つかりません: {source}")
             return None
 
-        cap = cv2.VideoCapture(str(source))
-        if not cap.isOpened():
-            return None
-
         in_f = clip.in_frame
         out_f = clip.get_out_frame()
 
         out_name = f"{clip.name}_trim_{in_f}_{out_f}.mp4"
-        out_path = self.clips_dir / out_name
+        out_path = _today_subdir(self.clips_dir) / out_name
 
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(out_path), fourcc, clip.fps,
-                                  (clip.width, clip.height))
-
-        cap.set(cv2.CAP_PROP_POS_FRAMES, in_f)
-        for i in range(in_f, out_f + 1):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            writer.write(frame)
-
-        writer.release()
-        cap.release()
+        # ffmpeg で高品質抽出を試行
+        ok = ffmpeg_extract(str(source), str(out_path),
+                            in_f, out_f, clip.fps,
+                            crf=crf, preset="medium", hw_encode=hw_encode)
+        if not ok:
+            # フォールバック: cv2.VideoWriter
+            print("[ClipManager] ffmpeg失敗、cv2にフォールバック")
+            cap = cv2.VideoCapture(str(source))
+            if not cap.isOpened():
+                return None
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(out_path), fourcc, clip.fps,
+                                      (clip.width, clip.height))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, in_f)
+            for i in range(in_f, out_f + 1):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                writer.write(frame)
+            writer.release()
+            cap.release()
 
         clip.exported_path = str(out_path.resolve())
         self.save()
@@ -216,7 +256,7 @@ class ClipManager:
         if not clip:
             return
 
-        traj_path = self.project_dir / f"{clip.id}_trajectory.json"
+        traj_path = self.trajectories_dir / f"{clip.id}_trajectory.json"
         data = []
         for swing in swings:
             data.append({

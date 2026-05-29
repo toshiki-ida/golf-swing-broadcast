@@ -125,8 +125,10 @@ class NormalFrameProcessor(IFrameProcessor):
     通常モード: bobデインターレース。
     1入力フレーム → 2出力フレーム (59.94fps)。
 
-    各フィールドを独立にデインターレースして2枚のプログレッシブフレームを生成する。
-    先行フィールド → 後行フィールドの時系列順で emit する。
+    元フィールドラインをそのまま保持し、欠けたラインのみ
+    cv2.addWeighted (C++実装) で高速補間する。
+    numpy uint16 一時配列の大量確保を回避しつつ、
+    元フィールドのシャープさを維持する。
     """
 
     def process(
@@ -138,23 +140,20 @@ class NormalFrameProcessor(IFrameProcessor):
     ) -> None:
         h, w = bgr.shape[:2]
         if h >= 720:
-            # 上フィールド: 偶数ラインそのまま、奇数ラインを補間
+            # 上フィールド bob: 偶数ラインそのまま、奇数ラインを補間
             top_out = np.empty_like(bgr)
             top_out[0::2] = bgr[0::2]
-            top_out[1:-1:2] = (
-                (bgr[0:-2:2].astype(np.uint16) + bgr[2::2].astype(np.uint16)) >> 1
-            ).astype(np.uint8)
+            top_out[1:-1:2] = cv2.addWeighted(
+                bgr[0:-2:2], 0.5, bgr[2::2], 0.5, 0)
             top_out[-1] = bgr[-2]
 
-            # 下フィールド: 奇数ラインそのまま、偶数ラインを補間
+            # 下フィールド bob: 奇数ラインそのまま、偶数ラインを補間
             bot_out = np.empty_like(bgr)
             bot_out[1::2] = bgr[1::2]
             bot_out[0] = bgr[1]
-            bot_out[2::2] = (
-                (bgr[1:-2:2].astype(np.uint16) + bgr[3::2].astype(np.uint16)) >> 1
-            ).astype(np.uint8)
+            bot_out[2::2] = cv2.addWeighted(
+                bgr[1:-2:2], 0.5, bgr[3::2], 0.5, 0)
 
-            # 先行フィールドから時系列順に emit
             if upper_field_first:
                 emit(top_out)
                 emit(bot_out)
