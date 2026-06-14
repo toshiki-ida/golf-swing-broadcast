@@ -55,10 +55,13 @@ class PlayoutEngine:
         self._fcache = {}             # {abs_frame_no: raw_frame} ジョグ用キャッシュ
         self._fcache_idx = -1         # キャッシュが有効なクリップインデックス
 
+        self._send_lock = threading.Lock()   # DeckLink send_frame の競合防止
+
         # コールバック
         self.on_frame_update = None     # (frame, frame_no, total) 呼ばれる
         self.on_clip_changed = None     # (index, clip) 呼ばれる
         self.on_playback_ended = None   # () 呼ばれる
+        self.on_cue_ready = None        # (index, clip) cue完了通知 (バックグラウンドスレッドから)
 
     @property
     def is_playing(self):
@@ -113,7 +116,11 @@ class PlayoutEngine:
     # ----- 公開API -----
 
     def cue(self, index: int):
-        """指定インデックスのクリップをキュー (停止してからキュー)"""
+        """指定インデックスのクリップをキュー (停止してからキュー)
+
+        VideoCapture のオープン・シーク・プレビュー取得をバックグラウンドで実行し
+        GUIスレッドをブロックしない。完了時に on_cue_ready を呼ぶ。
+        """
         if not (0 <= index < len(self.playlist)):
             return
         log.debug(f"cue({index})")
@@ -121,8 +128,27 @@ class PlayoutEngine:
         self._paused = False
         self._wait_thread()
         self.current_index = index
+        # _current_frame_no を in_frame に即セット (play() の末尾チェックに必要)
+        self._current_frame_no = self.playlist[index].clip.in_frame
+        gen = self._gen
+        # バックグラウンドで cap オープン + プレビュー取得 (GUIをブロックしない)
+        threading.Thread(target=self._cue_bg, args=(index, gen), daemon=True).start()
+
+    def _cue_bg(self, index, gen):
+        """バックグラウンドでVideoCapture開く + プレビューフレーム取得"""
+        if self._gen != gen:
+            log.debug(f"_cue_bg({index}): gen mismatch, abort")
+            return
         self._open_cap(index)
+        if self._gen != gen:
+            return
         self._read_preview_at_current()
+        if self._gen == gen and self.on_cue_ready:
+            try:
+                clip = self.playlist[index].clip if 0 <= index < len(self.playlist) else None
+                self.on_cue_ready(index, clip)
+            except Exception as e:
+                log.error(f"_cue_bg: on_cue_ready error: {e}")
 
     def get_cued_total_frames(self):
         """キュー中クリップの総フレーム数"""
@@ -293,14 +319,16 @@ class PlayoutEngine:
             adjusted = self._current_frame_no - item.clip.in_frame
             render_trajectory_on_frame(frame, item.swings, adjusted)
         # DeckLink出力 (一時停止中/フレーム送り時もモニター出力)
+        # _send_lock で再生スレッドとの send_frame 競合を防止
         if self.output_device:
-            # cue/seek/フレームステップは不連続: 再インターレースバッファをクリア
-            if hasattr(self.output_device, 'clear_interlace_buffer'):
-                self.output_device.clear_interlace_buffer()
-            clip = item.clip
-            spd = max(self.speed, 0.01)
-            tu = max(round(60000.0 / max(clip.fps, 1) / spd), 1001)
-            self.output_device.send_frame(frame, frame_duration_tu=tu)
+            with self._send_lock:
+                # cue/seek/フレームステップは不連続: 再インターレースバッファをクリア
+                if hasattr(self.output_device, 'clear_interlace_buffer'):
+                    self.output_device.clear_interlace_buffer()
+                clip = item.clip
+                spd = max(self.speed, 0.01)
+                tu = max(round(60000.0 / max(clip.fps, 1) / spd), 1001)
+                self.output_device.send_frame(frame, frame_duration_tu=tu)
         with self._lock:
             self._preview_frame = frame
         if self.on_frame_update:
@@ -425,12 +453,13 @@ class PlayoutEngine:
 
                 # DeckLinkスケジュールリセット (「過去」にフレームが送られる問題を解消)
                 if self.output_device and hasattr(self.output_device, 'reset_schedule'):
-                    self.output_device.reset_schedule()
+                    with self._send_lock:
+                        self.output_device.reset_schedule()
 
                 frames_sent = 0
                 was_paused = False
                 gui_last_update = 0.0
-                GUI_INTERVAL = 1.0 / 15  # GUIプレビューは最大15fps (SDI出力は別)
+                GUI_INTERVAL = 1.0 / 30  # GUIプレビューは最大30fps (SDI出力は別)
                 t_origin = time.perf_counter()  # 絶対時間基準 (キュー充填後)
 
                 while self._playing and self._gen == gen:
@@ -452,7 +481,8 @@ class PlayoutEngine:
                         while frame_q.qsize() < PRE_SCHEDULE and self._playing and self._gen == gen:
                             time.sleep(0.005)
                         if self.output_device and hasattr(self.output_device, 'reset_schedule'):
-                            self.output_device.reset_schedule()
+                            with self._send_lock:
+                                self.output_device.reset_schedule()
                         was_paused = False
                         frames_sent = 0
                         t_origin = time.perf_counter()
@@ -477,9 +507,10 @@ class PlayoutEngine:
                     spd = max(self.speed, 0.01)
                     tu = max(round(60000.0 / max(clip.fps, 1) / spd), 1001)
 
-                    # DeckLink出力
+                    # DeckLink出力 (_send_lock でcue側との競合を防止)
                     if self.output_device:
-                        self.output_device.send_frame(frame, frame_duration_tu=tu)
+                        with self._send_lock:
+                            self.output_device.send_frame(frame, frame_duration_tu=tu)
                     t_sent = time.perf_counter()
 
                     # プレビュー保存

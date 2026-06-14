@@ -248,18 +248,20 @@ class ClipManager:
         print(f"[ClipManager] トリム出力: {out_path}")
         return str(out_path)
 
-    def save_trajectory(self, clip_id: str, swings: list):
+    def save_trajectory(self, clip_id: str, swings: list,
+                        edit_in: int = 0, edit_out: int = -1):
         """軌道データをJSON保存
         swings: [TrajectoryData, ...]
+        edit_in/edit_out: 編集タブのIN/OUT点
         """
         clip = self.get_clip(clip_id)
         if not clip:
             return
 
         traj_path = self.trajectories_dir / f"{clip.id}_trajectory.json"
-        data = []
+        swing_data = []
         for swing in swings:
-            data.append({
+            swing_data.append({
                 "points": swing.points,
                 "color_start_hex": swing.color_start_hex,
                 "color_end_hex": swing.color_end_hex,
@@ -270,6 +272,11 @@ class ClipManager:
                 "alpha": getattr(swing, "alpha", 0.85),
                 "handles": getattr(swing, "handles", []),
             })
+        data = {
+            "swings": swing_data,
+            "edit_in": edit_in,
+            "edit_out": edit_out,
+        }
 
         with open(traj_path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -278,25 +285,35 @@ class ClipManager:
         clip.has_trajectory = True
         self.save()
 
-    def load_trajectory(self, clip_id: str) -> list:
-        """軌道データを読み込み"""
+    def load_trajectory(self, clip_id: str) -> tuple:
+        """軌道データを読み込み
+
+        Returns: (swings, edit_in, edit_out)
+            swings: [TrajectoryData, ...]
+            edit_in: IN点 (0ベース)
+            edit_out: OUT点 (-1=最終フレーム)
+        """
         clip = self.get_clip(clip_id)
         if not clip or not clip.trajectory_path:
-            return []
+            return [], 0, -1
 
         traj_path = Path(clip.trajectory_path)
         if not traj_path.exists():
-            return []
+            return [], 0, -1
 
         try:
             with open(traj_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            # dict形式 (旧補間モード) と list形式の両方に対応
+            # dict形式 と list形式の両方に対応
             if isinstance(data, dict):
                 swing_list = data.get("swings", [])
+                edit_in = data.get("edit_in", 0)
+                edit_out = data.get("edit_out", -1)
             else:
                 swing_list = data
+                edit_in = 0
+                edit_out = -1
 
             swings = []
             for d in swing_list:
@@ -314,7 +331,7 @@ class ClipManager:
                     handles=handles,
                 )
                 swings.append(td)
-            return swings
+            return swings, edit_in, edit_out
         except Exception as e:
             print(f"[ClipManager] 軌道読み込みエラー: {e}")
-            return []
+            return [], 0, -1

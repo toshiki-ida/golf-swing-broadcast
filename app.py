@@ -54,7 +54,7 @@ from field_processor import CaptureMode, CAPTURE_MODE_LABELS, CAPTURE_MODE_EFFEC
 from recorder import Recorder
 from clip_manager import ClipManager, ClipData, TrajectoryData
 from trajectory import (
-    TimedSpline, hex_to_bgr, lerp_color_bgr,
+    TimedSpline, hex_to_bgr, lerp_color_bgr, remap_color_ratio,
     draw_gradient_trail, draw_markers, render_trajectory_on_frame,
 )
 from playout import PlayoutEngine
@@ -136,7 +136,7 @@ KEYSYM_DISPLAY = {
 # 設定
 # =============================================================================
 DEFAULT_PROJECT_DIR = str(Path.home() / "GolfSwingBroadcast")
-SPLINE_RESOLUTION = 300
+SPLINE_RESOLUTION = 600
 MARKER_RADIUS = 6
 POINT_GRAB_RADIUS = 20
 
@@ -229,6 +229,8 @@ class FrameCache:
         ret, f = cap.read()
         if ret:
             self._frames_jpg.append(self._encode(f))
+            # 初回フレームをLRUに先行格納 → 最初の表示でJPEGデコード不要
+            self._lru_cache[0] = f
         cap.release()
 
     @staticmethod
@@ -412,6 +414,16 @@ class GolfBroadcastApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
+        # フォント設定: モダンで読みやすいフォント
+        import tkinter.font as tkfont
+        default_font = "Meiryo UI"
+        ctk.ThemeManager.theme["CTkFont"] = {"family": default_font, "size": 13, "weight": "normal"}
+        for font_name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkFixedFont"):
+            try:
+                tkfont.nametofont(font_name).configure(family=default_font, size=10)
+            except Exception:
+                pass
+
         # プロジェクト
         # 1) デフォルトor引数のディレクトリで設定を読み込む
         init_dir = Path(project_dir or DEFAULT_PROJECT_DIR)
@@ -460,6 +472,8 @@ class GolfBroadcastApp(ctk.CTk):
         self.playout.load_playlist(self._playout_json)
         self.playout.scan_directory(str(self._exports_dir))
         self.playout.save_playlist(self._playout_json)
+        # cue完了コールバック: バックグラウンドスレッドから呼ばれる → after() でGUIスレッドに転送
+        self.playout.on_cue_ready = self._on_playout_cue_ready
 
         # 録画書き込みキュー
         # DeckLink COMコールバックスレッドを録画I/Oから分離し、カクツキを防止する。
@@ -1908,6 +1922,15 @@ class GolfBroadcastApp(ctk.CTk):
         )
         self.edit_color_end_btn.pack(side="left", padx=5)
 
+        # グラデーション位置バー
+        self._grad_canvas = Canvas(color_sec, height=36, bg="#2b2b2b", highlightthickness=0)
+        self._grad_canvas.pack(fill="x", padx=8, pady=(4, 8))
+        self._grad_canvas.bind("<Configure>", lambda e: self._grad_redraw())
+        self._grad_canvas.bind("<Button-1>", self._grad_press)
+        self._grad_canvas.bind("<B1-Motion>", self._grad_drag)
+        self._grad_canvas.bind("<ButtonRelease-1>", self._grad_release)
+        self._grad_dragging = None
+
         # 太さ
         thick_sec = ctk.CTkFrame(edit_scroll)
         thick_sec.pack(fill="x", padx=10, pady=5)
@@ -1999,6 +2022,8 @@ class GolfBroadcastApp(ctk.CTk):
         self._edit_right_moved = False     # 右ドラッグ中にマウスが動いたか
         self._edit_handle_point = None     # ハンドル編集中のポイント (swing_idx, point_idx)
         self._edit_dragging_handle = None  # ドラッグ中のハンドル ('in' or 'out', swing_idx, point_idx)
+        self._edit_drag_throttle_id = None   # ドラッグ中の表示更新スロットル
+        self._edit_drag_pending = False      # スロットル待ち中フラグ
         self._edit_undo_stack = []         # Undo スナップショットスタック
         self._edit_redo_stack = []         # Redo スナップショットスタック
         self._UNDO_MAX = 50
@@ -2173,14 +2198,15 @@ class GolfBroadcastApp(ctk.CTk):
         """現在のスイング設定を次回のデフォルトとして保存"""
         if not swing:
             return
-        self.settings["trajectory_style"] = {
+        style = self.settings["trajectory_style"]
+        style.update({
             "color_start_hex": swing.color_start_hex,
             "color_end_hex": swing.color_end_hex,
             "thickness": swing.thickness,
             "blur": getattr(swing, "blur", 0),
             "fade_frames": getattr(swing, "fade_frames", 0),
             "alpha": getattr(swing, "alpha", 0.85),
-        }
+        })
         self.settings.save()
 
     def _load_edit_clip(self):
@@ -2190,6 +2216,9 @@ class GolfBroadcastApp(ctk.CTk):
             return
 
         print(f"[Edit] クリップ読み込み: {clip.name}")
+        # Canvasをリセット (画像アイテム再利用のため)
+        self.edit_canvas.delete("all")
+        self._edit_canvas_img_id = None
         # スライダーデバウンスをキャンセル (古いクリップの更新が残らないように)
         if self._edit_slider_after is not None:
             self.after_cancel(self._edit_slider_after)
@@ -2203,16 +2232,20 @@ class GolfBroadcastApp(ctk.CTk):
         self._edit_pan_vy = 0.0
 
         # 既存軌道を読み込み
-        saved = self.clip_manager.load_trajectory(self._edit_clip_id)
-        if saved:
-            self._edit_swings = saved
+        swings, saved_in, saved_out = self.clip_manager.load_trajectory(self._edit_clip_id)
+        if swings:
+            self._edit_swings = swings
         else:
             self._edit_swings = [self._make_default_trajectory(0)]
         self._edit_spline_cache.clear()
         self._edit_swing_idx = 0
 
         self.edit_slider.configure(to=max(self._edit_total - 1, 1))
-        self._edit_reset_in_out()
+        # 保存済みIN/OUT点があれば復元、なければデフォルト
+        last = max(0, self._edit_total - 1)
+        self._edit_in = max(0, min(saved_in, last))
+        self._edit_out = min(saved_out, last) if saved_out >= 0 else last
+        self._io_redraw()
         self._edit_update_color_buttons()
         self._edit_update_display()
 
@@ -2238,6 +2271,7 @@ class GolfBroadcastApp(ctk.CTk):
             self.edit_alpha_slider.set(int(alpha * 100))
             self.edit_alpha_label.configure(text=f"{int(alpha * 100)}%")
             self._edit_update_end_frame_label()
+            self._grad_redraw()
 
     def _edit_update_display(self):
         if not self._edit_cache or self._edit_total == 0:
@@ -2285,6 +2319,9 @@ class GolfBroadcastApp(ctk.CTk):
 
         # --- 軌道描画 (リサイズ後の小さい画像上 → 高速) ---
         cur = self._edit_frame_no
+        _style = self.settings["trajectory_style"]
+        _g_cps = _style.get("color_pos_start", 0.0)
+        _g_cpe = _style.get("color_pos_end", 1.0)
         for swing in self._edit_swings:
             if len(swing.points) < 2:
                 if swing.points:
@@ -2326,12 +2363,15 @@ class GolfBroadcastApp(ctk.CTk):
                 c_end = hex_to_bgr(swing.color_end_hex)
                 full_len = len(ts._curve)
                 ratio = len(curve_pts) / max(full_len, 1)
-                c_end_anim = lerp_color_bgr(c_start, c_end, ratio)
+                # グラデーション位置を可視カーブ基準にリマップ
+                vis_cps = _g_cps / ratio if ratio > 0 else 0.0
+                vis_cpe = _g_cpe / ratio if ratio > 0 else 1.0
                 scaled_thick = max(1, int(swing.thickness * eff_scale))
                 scaled_blur = int(blur * eff_scale) if blur > 0 else 0
                 draw_gradient_trail(resized, scaled_curve, c_start,
-                                    c_end_anim, scaled_thick,
-                                    eff_alpha, blur=scaled_blur)
+                                    c_end, scaled_thick,
+                                    eff_alpha, blur=scaled_blur,
+                                    color_pos_start=vis_cps, color_pos_end=vis_cpe)
             if swing.points:
                 visible_pts = [
                     (int((p[0] - src_x0) * eff_scale),
@@ -2341,16 +2381,24 @@ class GolfBroadcastApp(ctk.CTk):
                     draw_markers(resized, visible_pts,
                                  hex_to_bgr(swing.color_start_hex),
                                  hex_to_bgr(swing.color_end_hex),
-                                 max(1, int(MARKER_RADIUS * eff_scale)))
+                                 max(1, int(MARKER_RADIUS * eff_scale)),
+                                 color_pos_start=_g_cps, color_pos_end=_g_cpe)
 
         img_cx = int(cw / 2 - (self._edit_pan_vx - (src_x0 + src_x1) / 2) * eff_scale)
         img_cy = int(ch / 2 - (self._edit_pan_vy - (src_y0 + src_y1) / 2) * eff_scale)
 
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         self._edit_photo = ImageTk.PhotoImage(Image.fromarray(rgb))
-        self.edit_canvas.delete("all")
-        self.edit_canvas.create_image(img_cx, img_cy, anchor="center",
-                                       image=self._edit_photo)
+        # Canvas画像アイテムを再利用 (delete+createより高速)
+        if getattr(self, '_edit_canvas_img_id', None):
+            self.edit_canvas.itemconfig(self._edit_canvas_img_id,
+                                         image=self._edit_photo)
+            self.edit_canvas.coords(self._edit_canvas_img_id, img_cx, img_cy)
+        else:
+            self._edit_canvas_img_id = self.edit_canvas.create_image(
+                img_cx, img_cy, anchor="center", image=self._edit_photo)
+        # ハンドルオーバーレイだけ再描画
+        self.edit_canvas.delete("handles")
 
         # ベジェハンドル描画 (キャンバス上にオーバーレイ)
         for si, swing in enumerate(self._edit_swings):
@@ -2370,9 +2418,11 @@ class GolfBroadcastApp(ctk.CTk):
                 cx_out, cy_out = self._edit_video_to_canvas(hx_out, hy_out)
                 # ハンドル線
                 self.edit_canvas.create_line(
-                    pcx, pcy, cx_in, cy_in, fill="#00BFFF", width=1, dash=(4, 2))
+                    pcx, pcy, cx_in, cy_in, fill="#00BFFF", width=1,
+                    dash=(4, 2), tags="handles")
                 self.edit_canvas.create_line(
-                    pcx, pcy, cx_out, cy_out, fill="#FF6347", width=1, dash=(4, 2))
+                    pcx, pcy, cx_out, cy_out, fill="#FF6347", width=1,
+                    dash=(4, 2), tags="handles")
                 # ハンドル点 (□)
                 hr = 4
                 active = self._edit_handle_point == (si, pi)
@@ -2380,10 +2430,10 @@ class GolfBroadcastApp(ctk.CTk):
                 fill_out = "#FF6347" if active else "#7f3123"
                 self.edit_canvas.create_rectangle(
                     cx_in - hr, cy_in - hr, cx_in + hr, cy_in + hr,
-                    fill=fill_in, outline="white", width=1)
+                    fill=fill_in, outline="white", width=1, tags="handles")
                 self.edit_canvas.create_rectangle(
                     cx_out - hr, cy_out - hr, cx_out + hr, cy_out + hr,
-                    fill=fill_out, outline="white", width=1)
+                    fill=fill_out, outline="white", width=1, tags="handles")
 
         zoom_txt = f" ({self._edit_zoom:.0f}x)" if self._edit_zoom > 1.0 else ""
         self.edit_frame_label.configure(
@@ -2439,6 +2489,27 @@ class GolfBroadcastApp(ctk.CTk):
         self._edit_pan_start_vy = self._edit_pan_vy
         self.edit_canvas.config(cursor="fleur")
 
+    def _edit_throttled_update(self):
+        """スロットル付き表示更新 — ドラッグ中は最大30fpsに制限"""
+        if self._edit_drag_pending:
+            return  # 既にスケジュール済み
+        self._edit_drag_pending = True
+        def _do():
+            self._edit_drag_pending = False
+            self._edit_drag_throttle_id = None
+            self._edit_update_display()
+        self._edit_drag_throttle_id = self.after(33, _do)  # ~30fps
+
+    def _edit_cancel_throttle(self):
+        """スロットルキャンセル (リリース時に即時更新するため)"""
+        if self._edit_drag_throttle_id is not None:
+            try:
+                self.after_cancel(self._edit_drag_throttle_id)
+            except Exception:
+                pass
+            self._edit_drag_throttle_id = None
+        self._edit_drag_pending = False
+
     def _edit_middle_drag(self, event):
         """中ボタンドラッグ: パン"""
         if self._edit_mid_press is None:
@@ -2451,10 +2522,11 @@ class GolfBroadcastApp(ctk.CTk):
         self._edit_pan_vx = self._edit_pan_start_vx - dx / eff_scale
         self._edit_pan_vy = self._edit_pan_start_vy - dy / eff_scale
         self._edit_clamp_pan()
-        self._edit_update_display()
+        self._edit_throttled_update()
 
     def _edit_middle_release(self, event):
         """中ボタンリリース: ドラッグなし→ポイント削除"""
+        self._edit_cancel_throttle()
         self.edit_canvas.config(cursor="")
         if not self._edit_mid_moved:
             # クリック: 最寄りの点を削除 (従来動作)
@@ -2602,7 +2674,8 @@ class GolfBroadcastApp(ctk.CTk):
             if hasattr(ts, '_build_u_pts') else self._calc_u_pts(pts))
         tx, ty = tangents[pi]
 
-        # セグメント長比でスケール (ベジェ制御点 = 接線 * seg_frac/3)
+        # セグメント長比でスケール (ベジェ制御点 = 接線 * seg_frac/1.5)
+        # /3.0 が標準だが /1.5 に伸ばすことでカーブを強調
         u_pts = self._calc_u_pts(pts)
         # piの前後セグメントの平均seg_fracを使用
         if pi == 0:
@@ -2611,7 +2684,7 @@ class GolfBroadcastApp(ctk.CTk):
             seg_frac = u_pts[-1] - u_pts[-2]
         else:
             seg_frac = (u_pts[pi + 1] - u_pts[pi - 1]) * 0.5
-        scale = seg_frac / 3.0
+        scale = seg_frac / 1.5
         hx, hy = tx * scale, ty * scale
         # in-handle = 逆方向, out-handle = 正方向
         swing.handles[pi] = (int(-hx), int(-hy), int(hx), int(hy))
@@ -2669,7 +2742,7 @@ class GolfBroadcastApp(ctk.CTk):
                 swing.handles[pi] = (int(-dx), int(-dy), int(dx), int(dy))
             else:
                 swing.handles[pi] = (int(dx), int(dy), int(-dx), int(-dy))
-            self._edit_update_display()
+            self._edit_throttled_update()
             return
 
         # ポイント移動 (従来動作)
@@ -2679,9 +2752,10 @@ class GolfBroadcastApp(ctk.CTk):
         vx, vy = self._edit_canvas_to_video(event.x, event.y)
         old = self._edit_swings[si].points[pi]
         self._edit_swings[si].points[pi] = (vx, vy, old[2])
-        self._edit_update_display()
+        self._edit_throttled_update()
 
     def _edit_right_release(self, event):
+        self._edit_cancel_throttle()
         was_dragging_handle = self._edit_dragging_handle is not None
         self._edit_dragging_handle = None
 
@@ -2867,6 +2941,7 @@ class GolfBroadcastApp(ctk.CTk):
         if color[1]:
             swing.color_start_hex = color[1]
             self._edit_update_color_buttons()
+            self._grad_redraw()
             self._edit_update_display()
             self._save_trajectory_style(swing)
 
@@ -2878,8 +2953,109 @@ class GolfBroadcastApp(ctk.CTk):
         if color[1]:
             swing.color_end_hex = color[1]
             self._edit_update_color_buttons()
+            self._grad_redraw()
             self._edit_update_display()
             self._save_trajectory_style(swing)
+
+    # -----------------------------------------------------------------
+    # グラデーション位置バー
+    # -----------------------------------------------------------------
+    _GRAD_PAD = 8
+
+    def _grad_pos_to_x(self, pos):
+        cw = self._grad_canvas.winfo_width()
+        return self._GRAD_PAD + (cw - 2 * self._GRAD_PAD) * pos
+
+    def _grad_x_to_pos(self, x):
+        cw = self._grad_canvas.winfo_width()
+        usable = max(cw - 2 * self._GRAD_PAD, 1)
+        return max(0.0, min(1.0, (x - self._GRAD_PAD) / usable))
+
+    def _grad_redraw(self):
+        c = self._grad_canvas
+        c.delete("all")
+        cw = c.winfo_width()
+        if cw < 20:
+            return
+        swing = self._edit_current_swing
+        if not swing:
+            return
+
+        pad = self._GRAD_PAD
+        y_bar = 8
+        bar_h = 6
+        _style = self.settings["trajectory_style"]
+        ps = _style.get("color_pos_start", 0.0)
+        pe = _style.get("color_pos_end", 1.0)
+        cs_hex = swing.color_start_hex
+        ce_hex = swing.color_end_hex
+
+        # グラデーションバーを描画 (20区間に分割)
+        n_seg = 20
+        for i in range(n_seg):
+            r0 = i / n_seg
+            r1 = (i + 1) / n_seg
+            cr = remap_color_ratio((r0 + r1) / 2, ps, pe)
+            # hex色をlerp
+            cs_rgb = tuple(int(cs_hex.lstrip('#')[j:j+2], 16) for j in (0, 2, 4))
+            ce_rgb = tuple(int(ce_hex.lstrip('#')[j:j+2], 16) for j in (0, 2, 4))
+            mr = tuple(int(cs_rgb[k] + (ce_rgb[k] - cs_rgb[k]) * cr) for k in range(3))
+            seg_color = f"#{mr[0]:02x}{mr[1]:02x}{mr[2]:02x}"
+            x0 = pad + (cw - 2 * pad) * r0
+            x1 = pad + (cw - 2 * pad) * r1
+            c.create_rectangle(x0, y_bar - bar_h // 2, x1, y_bar + bar_h // 2,
+                               fill=seg_color, outline="")
+
+        # 三角マーカー: 開始位置
+        xs = self._grad_pos_to_x(ps)
+        c.create_polygon(xs, y_bar + bar_h // 2 + 2,
+                         xs - 5, y_bar + bar_h // 2 + 12,
+                         xs + 5, y_bar + bar_h // 2 + 12,
+                         fill=cs_hex, outline="#fff", tags="grad_start")
+        # 三角マーカー: 終了位置
+        xe = self._grad_pos_to_x(pe)
+        c.create_polygon(xe, y_bar + bar_h // 2 + 2,
+                         xe - 5, y_bar + bar_h // 2 + 12,
+                         xe + 5, y_bar + bar_h // 2 + 12,
+                         fill=ce_hex, outline="#fff", tags="grad_end")
+
+    def _grad_press(self, event):
+        swing = self._edit_current_swing
+        if not swing:
+            return
+        _style = self.settings["trajectory_style"]
+        ps = _style.get("color_pos_start", 0.0)
+        pe = _style.get("color_pos_end", 1.0)
+        xs = self._grad_pos_to_x(ps)
+        xe = self._grad_pos_to_x(pe)
+        d_s = abs(event.x - xs)
+        d_e = abs(event.x - xe)
+        if d_s <= d_e and d_s < 30:
+            self._grad_dragging = "start"
+        elif d_e < 30:
+            self._grad_dragging = "end"
+        else:
+            self._grad_dragging = None
+
+    def _grad_drag(self, event):
+        if not self._grad_dragging:
+            return
+        swing = self._edit_current_swing
+        if not swing:
+            return
+        pos = self._grad_x_to_pos(event.x)
+        style = self.settings["trajectory_style"]
+        if self._grad_dragging == "start":
+            style["color_pos_start"] = min(pos, style.get("color_pos_end", 1.0) - 0.01)
+        else:
+            style["color_pos_end"] = max(pos, style.get("color_pos_start", 0.0) + 0.01)
+        self._grad_redraw()
+        self._edit_update_display()
+
+    def _grad_release(self, event):
+        if self._grad_dragging:
+            self._grad_dragging = None
+            self.settings.save()
 
     def _edit_on_thickness(self, value):
         swing = self._edit_current_swing
@@ -3051,7 +3227,9 @@ class GolfBroadcastApp(ctk.CTk):
     def _edit_save_trajectory(self):
         if not self._edit_clip_id:
             return
-        self.clip_manager.save_trajectory(self._edit_clip_id, self._edit_swings)
+        self.clip_manager.save_trajectory(
+            self._edit_clip_id, self._edit_swings,
+            edit_in=self._edit_in, edit_out=self._edit_out)
         self._refresh_clips_list()
         print("[Edit] 軌道を保存しました")
 
@@ -3063,7 +3241,9 @@ class GolfBroadcastApp(ctk.CTk):
         if not has_any:
             return
         try:
-            self.clip_manager.save_trajectory(self._edit_clip_id, self._edit_swings)
+            self.clip_manager.save_trajectory(
+                self._edit_clip_id, self._edit_swings,
+                edit_in=self._edit_in, edit_out=self._edit_out)
         except Exception as e:
             print(f"[Edit] 自動保存エラー: {e}")
 
@@ -3119,6 +3299,9 @@ class GolfBroadcastApp(ctk.CTk):
         t0 = time.time()
 
         # スプライン事前構築
+        _style = self.settings["trajectory_style"]
+        _g_cps = _style.get("color_pos_start", 0.0)
+        _g_cpe = _style.get("color_pos_end", 1.0)
         spline_data = []
         for swing in swings:
             if len(swing.points) < 2:
@@ -3199,10 +3382,13 @@ class GolfBroadcastApp(ctk.CTk):
                 if curve_pts and len(curve_pts) >= 2:
                     full_len = len(sd["spline"]._curve)
                     ratio = len(curve_pts) / max(full_len, 1)
-                    c_end = lerp_color_bgr(sd["color_start"], sd["color_end"], ratio)
+                    vis_cps = _g_cps / ratio if ratio > 0 else 0.0
+                    vis_cpe = _g_cpe / ratio if ratio > 0 else 1.0
                     draw_gradient_trail(frame, curve_pts, sd["color_start"],
-                                        c_end, sd["thickness"],
-                                        eff_alpha, blur=sd["blur"])
+                                        sd["color_end"], sd["thickness"],
+                                        eff_alpha, blur=sd["blur"],
+                                        color_pos_start=vis_cps,
+                                        color_pos_end=vis_cpe)
 
             write_queue.put(frame)
             if (i + 1) % 60 == 0:
@@ -3339,6 +3525,7 @@ class GolfBroadcastApp(ctk.CTk):
         self._po_pending_frame = None   # 最新フレーム (スレッドから書き込み)
         self._po_gui_scheduled = False  # after() 登録済みフラグ
         self._po_canvas_size = (800, 450)  # キャンバスサイズキャッシュ
+        self._po_canvas_img_id = None   # Canvas画像アイテムID (再利用)
 
         # シークバー + フレーム表示
         seek_frame_w = ctk.CTkFrame(left, fg_color="transparent")
@@ -3493,6 +3680,9 @@ class GolfBroadcastApp(ctk.CTk):
 
     def _playout_redraw_after_resize(self):
         self._playout_canvas_resize_after = None
+        # リサイズでアイテムを再作成 (coords だけでは画像サイズが合わない)
+        self._po_canvas_img_id = None
+        self.playout_canvas.delete("all")
         # 再生中は次フレームで自動更新されるので停止中のみ再描画
         try:
             if not self.playout._playing:
@@ -3655,29 +3845,34 @@ class GolfBroadcastApp(ctk.CTk):
         ch = self.playout_canvas.winfo_height()
         if cw > 10 and ch > 10:
             self._playout_photo, _ = frame_to_photo(pf, cw, ch)
-            self.playout_canvas.delete("all")
-            self.playout_canvas.create_image(
-                cw // 2, ch // 2, anchor="center", image=self._playout_photo)
+            if self._po_canvas_img_id:
+                self.playout_canvas.itemconfig(
+                    self._po_canvas_img_id, image=self._playout_photo)
+                self.playout_canvas.coords(
+                    self._po_canvas_img_id, cw // 2, ch // 2)
+            else:
+                self._po_canvas_img_id = self.playout_canvas.create_image(
+                    cw // 2, ch // 2, anchor="center",
+                    image=self._playout_photo)
         if frame_offset is not None:
             total = self.playout.get_cued_total_frames()
             self.po_frame_label.configure(text=f"{frame_offset} / {total - 1}")
 
     def _playout_select(self, idx):
         self._playout_selected_idx = idx
-        self.playout.cue(idx)  # cue() が内部で停止+キューを安全に行う
-        # シークバー更新
-        total = self.playout.get_cued_total_frames()
+        # cue() はバックグラウンドで実行 — GUIをブロックしない
+        # スライダー範囲はメタデータから即時設定可能
+        total = self.playout.playlist[idx].clip.get_duration_frames()
         self._po_slider_updating = True
         self.po_seek_slider.configure(to=max(total - 1, 1))
         self.po_seek_slider.set(0)
         self._po_slider_updating = False
-        self.po_status.configure(text="⏹ CUED", text_color="#FFFF00")
+        self.po_status.configure(text="⏳ CUEING...", text_color="#AAAAFF")
         self.po_play_btn.configure(text="▶ PLAY", fg_color="#006400",
                                     hover_color="#228B22")
-        # ハイライト更新
         self._playout_highlight_row(idx)
-        # キュー時のプレビュー即表示
-        self._playout_show_preview(0)
+        # プレビュー・スライダー確定・"CUED" ステータスは on_cue_ready で更新される
+        self.playout.cue(idx)
 
     def _playout_highlight_row(self, idx):
         """プレイリストの選択行をハイライト"""
@@ -3758,16 +3953,15 @@ class GolfBroadcastApp(ctk.CTk):
             self.playout.stop()
         idx = self.playout.current_index
         if 0 <= idx < len(self.playout.playlist):
-            self.playout.cue(idx)
+            total = self.playout.playlist[idx].clip.get_duration_frames()
             self._po_slider_updating = True
-            total = self.playout.get_cued_total_frames()
             self.po_seek_slider.configure(to=max(total - 1, 1))
             self.po_seek_slider.set(0)
-            self.po_frame_label.configure(text=f"0 / {total - 1}")
             self._po_slider_updating = False
-            self.po_status.configure(text="⏹ CUED", text_color="#FFFF00")
+            self.po_status.configure(text="⏳ CUEING...", text_color="#AAAAFF")
             self.po_play_btn.configure(text="▶ PLAY", fg_color="#006400",
                                         hover_color="#228B22")
+            self.playout.cue(idx)  # バックグラウンド実行; 完了は on_cue_ready へ
 
     def _playout_next(self):
         """次のクリップ (停止→cue→再生)"""
@@ -3776,16 +3970,16 @@ class GolfBroadcastApp(ctk.CTk):
             self.playout.stop()
         if self.playout.current_index < len(self.playout.playlist) - 1:
             idx = self.playout.current_index + 1
-            self.playout.cue(idx)  # 安全にcue
             self._playout_selected_idx = idx
-            total = self.playout.get_cued_total_frames()
+            total = self.playout.playlist[idx].clip.get_duration_frames()
             self._po_slider_updating = True
             self.po_seek_slider.configure(to=max(total - 1, 1))
             self.po_seek_slider.set(0)
-            self.po_frame_label.configure(text=f"0 / {total - 1}")
             self._po_slider_updating = False
             self._playout_highlight_row(idx)
+            self.playout.cue(idx)  # バックグラウンド実行
             if was_playing:
+                # _current_frame_no は cue() で即セットされているので play() は動作する
                 self._playout_play()
 
     def _playout_prev(self):
@@ -3795,15 +3989,14 @@ class GolfBroadcastApp(ctk.CTk):
             self.playout.stop()
         if self.playout.current_index > 0:
             idx = self.playout.current_index - 1
-            self.playout.cue(idx)  # 安全にcue
             self._playout_selected_idx = idx
-            total = self.playout.get_cued_total_frames()
+            total = self.playout.playlist[idx].clip.get_duration_frames()
             self._po_slider_updating = True
             self.po_seek_slider.configure(to=max(total - 1, 1))
             self.po_seek_slider.set(0)
-            self.po_frame_label.configure(text=f"0 / {total - 1}")
             self._po_slider_updating = False
             self._playout_highlight_row(idx)
+            self.playout.cue(idx)  # バックグラウンド実行
             if was_playing:
                 self._playout_play()
 
@@ -3878,6 +4071,24 @@ class GolfBroadcastApp(ctk.CTk):
         self._refresh_edit_clips_list()
         self.tabview.set("編集")
 
+    def _on_playout_cue_ready(self, index, clip):
+        """cue完了通知 — バックグラウンドスレッドから呼ばれる"""
+        self.after(0, lambda: self._playout_on_cue_done(index))
+
+    def _playout_on_cue_done(self, index):
+        """cue完了後のGUI更新 (GUIスレッドで実行)"""
+        # 世代チェック: 別の cue が走り始めていたら無視
+        if self.playout.current_index != index:
+            return
+        total = self.playout.get_cued_total_frames()
+        self._po_slider_updating = True
+        self.po_seek_slider.configure(to=max(total - 1, 1))
+        self.po_seek_slider.set(0)
+        self.po_frame_label.configure(text=f"0 / {total - 1}")
+        self._po_slider_updating = False
+        self.po_status.configure(text="⏹ CUED", text_color="#FFFF00")
+        self._playout_show_preview(0)
+
     def _on_playout_frame(self, frame, frame_no, total):
         """送出プレビュー更新 — 再生スレッドから呼ばれる
 
@@ -3901,9 +4112,15 @@ class GolfBroadcastApp(ctk.CTk):
         ch = self.playout_canvas.winfo_height()
         if cw > 10 and ch > 10:
             self._playout_photo, _ = frame_to_photo(frame, cw, ch)
-            self.playout_canvas.delete("all")
-            self.playout_canvas.create_image(
-                cw // 2, ch // 2, anchor="center", image=self._playout_photo)
+            if self._po_canvas_img_id:
+                self.playout_canvas.itemconfig(
+                    self._po_canvas_img_id, image=self._playout_photo)
+                self.playout_canvas.coords(
+                    self._po_canvas_img_id, cw // 2, ch // 2)
+            else:
+                self._po_canvas_img_id = self.playout_canvas.create_image(
+                    cw // 2, ch // 2, anchor="center",
+                    image=self._playout_photo)
         self.po_status.configure(
             text=f"▶ {frame_no}/{total}", text_color="#00FF00")
         # シークバー更新
