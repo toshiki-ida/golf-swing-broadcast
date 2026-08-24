@@ -352,6 +352,9 @@ class AppSettings:
                 "alpha": 0.85,
             },
             "keyboard_shortcuts": dict(DEFAULT_KEYBOARD_SHORTCUTS),
+            "slowmo_auto": False,   # クリップ切り出し後に自動でスロー化
+            "slowmo_factor": 2,     # 何倍スローにするか
+            "autotrace_auto": False,  # クリップ切り出し後に自動で軌道生成
         }
         self._load()
 
@@ -1020,6 +1023,46 @@ class GolfBroadcastApp(ctk.CTk):
         )
         self.clip_extract_btn.pack(padx=10, pady=(5, 0))
         self.clip_extract_btn.pack_forget()  # 初期非表示
+
+        # スローモーション (フレーム補間)
+        slow_frame = ctk.CTkFrame(right, fg_color="transparent")
+        slow_frame.pack(fill="x", padx=10, pady=(8, 5))
+        self.slowmo_auto_var = ctk.BooleanVar(
+            value=bool(self.settings.data.get("slowmo_auto", False)))
+        ctk.CTkSwitch(
+            slow_frame, text="切り出し後に自動スロー化",
+            variable=self.slowmo_auto_var,
+            command=self._on_slowmo_auto_toggle,
+        ).pack(side="left")
+        self.slowmo_btn = ctk.CTkButton(
+            slow_frame, text="2倍スロー化", width=120, height=32,
+            fg_color="#2E4057", hover_color="#3D5A80",
+            command=self._make_slowmo_selected,
+        )
+        self.slowmo_btn.pack(side="right")
+        self.slowmo_status = ctk.CTkLabel(right, text="", font=("", 11),
+                                          text_color="#AAAAAA")
+        self.slowmo_status.pack(padx=10)
+
+        # クラブヘッド軌道の自動生成
+        trace_frame = ctk.CTkFrame(right, fg_color="transparent")
+        trace_frame.pack(fill="x", padx=10, pady=(4, 5))
+        self.autotrace_auto_var = ctk.BooleanVar(
+            value=bool(self.settings.data.get("autotrace_auto", False)))
+        ctk.CTkSwitch(
+            trace_frame, text="切り出し後に自動で軌道生成",
+            variable=self.autotrace_auto_var,
+            command=self._on_autotrace_auto_toggle,
+        ).pack(side="left")
+        self.autotrace_btn = ctk.CTkButton(
+            trace_frame, text="軌道を自動生成", width=120, height=32,
+            fg_color="#3A5F3A", hover_color="#4E7A4E",
+            command=self._autotrace_selected,
+        )
+        self.autotrace_btn.pack(side="right")
+        self.autotrace_status = ctk.CTkLabel(right, text="", font=("", 11),
+                                             text_color="#AAAAAA")
+        self.autotrace_status.pack(padx=10, pady=(0, 5))
 
         # PanedWindow に左右を追加 (最小幅を指定)
         self.clips_paned.add(list_frame, minsize=200, stretch="never")
@@ -1717,10 +1760,384 @@ class GolfBroadcastApp(ctk.CTk):
             # 新しいクリップを選択
             self._select_clip(clip.id)
             print(f"[Capture] グローウィングクリップ追加: {clip.name}")
+            # 自動処理 (設定がONのときだけ、裏で走らせる)
+            # 両方ONなら動画は1本にする。スロー化してから、その動画に
+            # 軌道を付ける。フレーム数が倍になるぶんヘッドの移動量が
+            # 半分になり、ダウンスイングの検出精度も上がる。
+            want_slow = self.settings.data.get("slowmo_auto", False)
+            want_trace = self.settings.data.get("autotrace_auto", False)
+            if want_slow and want_trace:
+                self._start_auto_pipeline(clip.id)
+            elif want_slow:
+                self._start_slowmo(clip.id)
+            elif want_trace:
+                self._start_autotrace(clip.id)
         except Exception as e:
             print(f"[Capture] クリップ追加エラー: {e}")
         finally:
             self.clip_extract_btn.configure(text="クリップ切り出し", state="normal")
+
+    # ------------------------------------------------ スローモーション
+    def _on_slowmo_auto_toggle(self):
+        """自動スロー化のON/OFFを保存"""
+        self.settings["slowmo_auto"] = bool(self.slowmo_auto_var.get())
+        self.settings.save()
+
+    def _make_slowmo_selected(self):
+        """選択中のクリップを手動でスロー化"""
+        if not self._selected_clip_id or self._selected_clip_id == "__growing__":
+            self.slowmo_status.configure(text="クリップを選択してください")
+            return
+        self._start_slowmo(self._selected_clip_id)
+
+    def _start_slowmo(self, clip_id, then_autotrace=False):
+        """フレーム補間でスロー化する (別スレッド)
+
+        元クリップは残し、別ファイル (_slowXx) として書き出してから
+        クリップリストに追加する。GPUがあれば RIFE、無ければ ffmpeg の
+        minterpolate に自動で落ちる。
+        """
+        if getattr(self, "_slowmo_running", False):
+            self.slowmo_status.configure(text="スロー化を実行中です")
+            return
+        clip = self.clip_manager.get_clip(clip_id)
+        if not clip:
+            return
+        src = clip.exported_path or clip.source_path
+        if not src or not Path(src).exists():
+            self.slowmo_status.configure(text="元ファイルが見つかりません")
+            return
+        factor = int(self.settings.data.get("slowmo_factor", 2))
+        dst = Path(src).with_name(f"{Path(src).stem}_slow{factor}x.mp4")
+
+        self._slowmo_running = True
+        self.slowmo_btn.configure(state="disabled", text="スロー化中...")
+
+        def report(ratio, msg):
+            self.after(0, lambda: self.slowmo_status.configure(
+                text=f"{msg} {ratio * 100:.0f}%"))
+
+        def work():
+            err = None
+            try:
+                try:
+                    from rife_slowmo import make_slowmo_rife
+                    info = make_slowmo_rife(src, str(dst), factor=factor,
+                                            crf=self.settings["crf"],
+                                            progress=report)
+                    tag = "RIFE"
+                except Exception as e:
+                    print(f"[Slowmo] RIFE 不可 ({e}) → ffmpeg にフォールバック")
+                    from slowmo import make_slowmo
+                    info = make_slowmo(src, str(dst), factor=factor,
+                                       crf=self.settings["crf"],
+                                       progress=report)
+                    tag = "ffmpeg"
+                print(f"[Slowmo] {tag} {info['seconds']:.1f}s -> {dst.name}")
+                self.after(0, lambda: self._finish_slowmo(
+                    str(dst), info["seconds"], tag, None, then_autotrace,
+                    factor, clip_id))
+            except Exception as e:
+                err = str(e)
+                print(f"[Slowmo] 失敗: {e}")
+                self.after(0, lambda: self._finish_slowmo(None, 0, None, err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_slowmo(self, path, seconds, tag, err=None,
+                       then_autotrace=False, factor=2, clip_id=None):
+        """スロー化完了。成功したらクリップとして登録する
+
+        then_autotrace が True なら、続けてそのスロー動画に軌道を付ける
+        (動画を2本作らないため)。
+        """
+        self._slowmo_running = False
+        self.slowmo_btn.configure(state="normal", text="2倍スロー化")
+        if err or not path:
+            self.slowmo_status.configure(text=f"失敗: {err or '不明'}")
+            return
+        try:
+            clip = self._replace_clip_with(clip_id, path)
+            self._clips_tab_dirty = self._edit_tab_dirty = True
+            self._refresh_clips_list(scan=False)
+            if self.tabview.get() == "編集":
+                self._refresh_edit_clips_list()
+                self._edit_tab_dirty = False
+            self._select_clip(clip.id)
+            self.slowmo_status.configure(
+                text=f"完了 ({tag} {seconds:.0f}秒): {clip.name}")
+            if then_autotrace:
+                self._start_autotrace(clip.id, time_scale=factor)
+        except Exception as e:
+            self.slowmo_status.configure(text=f"登録に失敗: {e}")
+
+    def _replace_clip_with(self, clip_id, new_path):
+        """クリップの中身を差し替える (リストに2つ並ばないようにする)
+
+        元ファイルはスキャン対象外の originals/ に退避して残す。
+        消してしまうと戻せないし、置いたままだとフォルダスキャンで
+        別クリップとして再登録されてしまう。
+        """
+        clip = self.clip_manager.get_clip(clip_id)
+        if clip is None:
+            return self.clip_manager.add_clip(new_path)
+
+        keep = self.project_dir / "originals"
+        keep.mkdir(parents=True, exist_ok=True)
+        for attr in ("source_path", "exported_path"):
+            old_p = getattr(clip, attr, "")
+            if old_p and Path(old_p).exists() and Path(old_p) != Path(new_path):
+                try:
+                    dest = keep / Path(old_p).name
+                    if dest.exists():
+                        dest = keep / f"{Path(old_p).stem}_{int(time.time())}.mp4"
+                    shutil.move(old_p, dest)
+                except Exception as e:
+                    print(f"[Slowmo] 元ファイルの退避に失敗: {e}")
+
+        cap = cv2.VideoCapture(str(new_path))
+        fps = cap.get(cv2.CAP_PROP_FPS) or clip.fps
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or clip.width
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or clip.height
+        cap.release()
+
+        clip.source_path = str(new_path)
+        clip.exported_path = ""
+        clip.name = Path(new_path).stem
+        clip.fps = fps
+        clip.total_frames = total
+        clip.width, clip.height = w, h
+        clip.duration_sec = total / fps if fps else 0.0
+        clip.in_frame = 0
+        clip.out_frame = -1
+        self.clip_manager.save()
+        return clip
+
+    # ------------------------------------------------ 自動処理 (並行)
+    def _start_auto_pipeline(self, clip_id):
+        """スロー化と軌道生成を同時に走らせる
+
+        軌道はスロー化前の素材で作れるので、待つ必要がない。しかも元素材
+        なら解析するフレーム数が半分で済む。出来た軌道はフレーム番号を
+        factor 倍すればスロー素材にそのまま載る (画の大きさは変わらない)。
+
+        元ファイルの退避は両方終わってから行う。先に動かすと、解析中の
+        軌道生成がファイルを見失う。
+        """
+        if getattr(self, "_pipeline_running", False):
+            self.slowmo_status.configure(text="実行中です")
+            return
+        clip = self.clip_manager.get_clip(clip_id)
+        if not clip:
+            return
+        src = clip.exported_path or clip.source_path
+        if not src or not Path(src).exists():
+            self.slowmo_status.configure(text="元ファイルが見つかりません")
+            return
+        factor = int(self.settings.data.get("slowmo_factor", 2))
+        dst = Path(src).with_name(f"{Path(src).stem}_slow{factor}x.mp4")
+        if clip.exported_path:
+            lo, hi = 0, -1
+        else:
+            lo, hi = clip.in_frame, clip.get_out_frame()
+            if hi - lo + 1 < 12:
+                lo, hi = 0, -1
+
+        self._pipeline_running = True
+        self.slowmo_btn.configure(state="disabled", text="処理中...")
+        self.autotrace_btn.configure(state="disabled", text="処理中...")
+        out = {}
+
+        def slow_job():
+            try:
+                try:
+                    from rife_slowmo import make_slowmo_rife
+                    out["slow"] = make_slowmo_rife(
+                        src, str(dst), factor=factor, crf=self.settings["crf"],
+                        progress=lambda r, m: self.after(
+                            0, lambda: self.slowmo_status.configure(
+                                text=f"{m} {r * 100:.0f}%")))
+                    out["tag"] = "RIFE"
+                except Exception as e:
+                    print(f"[Slowmo] RIFE 不可 ({e}) → ffmpeg")
+                    from slowmo import make_slowmo
+                    out["slow"] = make_slowmo(
+                        src, str(dst), factor=factor, crf=self.settings["crf"])
+                    out["tag"] = "ffmpeg"
+            except Exception as e:
+                out["slow_err"] = str(e)
+
+        def trace_job():
+            try:
+                from autotrace import autotrace as run_trace
+                out["trace"] = run_trace(
+                    src, lo, hi,
+                    progress=lambda r, m: self.after(
+                        0, lambda: self.autotrace_status.configure(
+                            text=f"{m} {r * 100:.0f}%")))
+            except Exception as e:
+                out["trace_err"] = str(e)
+
+        def coordinator():
+            ts = [threading.Thread(target=slow_job, daemon=True),
+                  threading.Thread(target=trace_job, daemon=True)]
+            t0 = time.time()
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            out["seconds"] = time.time() - t0
+            self.after(0, lambda: self._finish_auto_pipeline(
+                clip_id, str(dst), factor, out))
+
+        threading.Thread(target=coordinator, daemon=True).start()
+
+    def _finish_auto_pipeline(self, clip_id, dst, factor, out):
+        """両方の完了後に、クリップ差し替えと軌道の載せ替えを行う"""
+        self._pipeline_running = False
+        self.slowmo_btn.configure(state="normal", text="2倍スロー化")
+        self.autotrace_btn.configure(state="normal", text="軌道を自動生成")
+
+        if out.get("slow_err") or "slow" not in out:
+            self.slowmo_status.configure(
+                text=f"スロー化失敗: {out.get('slow_err', '不明')}")
+            return
+        try:
+            clip = self._replace_clip_with(clip_id, dst)
+        except Exception as e:
+            self.slowmo_status.configure(text=f"差し替えに失敗: {e}")
+            return
+        self.slowmo_status.configure(
+            text=f"完了 ({out.get('tag')} {out['seconds']:.0f}秒): {clip.name}")
+
+        res = out.get("trace")
+        if out.get("trace_err") or res is None:
+            self.autotrace_status.configure(
+                text=f"軌道失敗: {out.get('trace_err', '検出できず')}")
+        else:
+            try:
+                swing = self._make_default_trajectory(0)
+                # 元素材のフレーム番号をスロー素材に合わせる
+                swing.points = [(x, y, f * factor)
+                                for x, y, f in res.confident_points()]
+                self.clip_manager.save_trajectory(clip_id, [swing])
+                weak = [(a * factor, b * factor) for a, b in res.weak_ranges()]
+                msg = f"確定 {len(swing.points)}点"
+                if weak:
+                    msg += " / 要手直し F" + " ".join(f"{a}-{b}"
+                                                    for a, b in weak[:3])
+                    self.autotrace_status.configure(text_color="#E0B040")
+                self.autotrace_status.configure(text=msg)
+            except Exception as e:
+                self.autotrace_status.configure(text=f"軌道の保存に失敗: {e}")
+
+        self._clips_tab_dirty = self._edit_tab_dirty = True
+        self._refresh_clips_list(scan=False)
+        if self.tabview.get() == "編集":
+            self._refresh_edit_clips_list()
+            self._edit_tab_dirty = False
+        self._select_clip(clip_id)
+
+    # ------------------------------------------------ 軌道の自動生成
+    def _on_autotrace_auto_toggle(self):
+        """自動軌道生成のON/OFFを保存"""
+        self.settings["autotrace_auto"] = bool(self.autotrace_auto_var.get())
+        self.settings.save()
+
+    def _autotrace_selected(self):
+        """選択中のクリップの軌道を手動で自動生成"""
+        if not self._selected_clip_id or self._selected_clip_id == "__growing__":
+            self.autotrace_status.configure(text="クリップを選択してください")
+            return
+        self._start_autotrace(self._selected_clip_id)
+
+    def _start_autotrace(self, clip_id, time_scale=1.0):
+        """クラブヘッド軌道を自動検出して軌道データとして保存する (別スレッド)
+
+        既に軌道が保存されているクリップは上書きしない (手で直したものを
+        消さないため)。生成結果は下書きなので、編集タブでそのまま直せる。
+        """
+        if getattr(self, "_autotrace_running", False):
+            self.autotrace_status.configure(text="軌道生成を実行中です")
+            return
+        clip = self.clip_manager.get_clip(clip_id)
+        if not clip:
+            return
+        src = clip.exported_path or clip.source_path
+        if not src or not Path(src).exists():
+            self.autotrace_status.configure(text="元ファイルが見つかりません")
+            return
+        # In/Out を切ってあればその範囲だけ解析する。全体に掛けると
+        # 倍以上遅いうえ、アドレス前の場面まで含むとボール検出が
+        # 別の白い物に引っ張られてインパクトを取り違える。
+        if clip.exported_path:
+            lo, hi = 0, -1          # 書き出し済みは既にトリム済み
+        else:
+            lo, hi = clip.in_frame, clip.get_out_frame()
+            if hi - lo + 1 < 12:
+                lo, hi = 0, -1
+        existing, _, _ = self.clip_manager.load_trajectory(clip_id)
+        if existing and any(len(sw.points) >= 2 for sw in existing):
+            self.autotrace_status.configure(text="既存の軌道があるので中止しました")
+            return
+
+        self._autotrace_running = True
+        self.autotrace_btn.configure(state="disabled", text="生成中...")
+
+        def report(ratio, msg):
+            self.after(0, lambda: self.autotrace_status.configure(
+                text=f"{msg} {ratio * 100:.0f}%"))
+
+        def work():
+            try:
+                from autotrace import autotrace as run_trace
+                t0 = time.time()
+                res = run_trace(src, lo, hi, progress=report,
+                                time_scale=time_scale)
+                el = time.time() - t0
+                self.after(0, lambda: self._finish_autotrace(clip_id, res, el))
+            except Exception as e:
+                print(f"[Autotrace] 失敗: {e}")
+                self.after(0, lambda: self._finish_autotrace(
+                    clip_id, None, 0, str(e)))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finish_autotrace(self, clip_id, res, seconds, err=None):
+        """軌道生成完了。TrajectoryData として保存する"""
+        self._autotrace_running = False
+        self.autotrace_btn.configure(state="normal", text="軌道を自動生成")
+        if err or res is None or len(res.points) < 2:
+            self.autotrace_status.configure(text=f"失敗: {err or '検出できず'}")
+            return
+        try:
+            swing = self._make_default_trajectory(0)
+            # 推定で埋めた区間まで点を置くと、誤った位置が確定値として
+            # 残ってしまう。自動で置くのは実際に検出できた点だけにして、
+            # 間はスプラインに任せる。足りない所はオペレーターが足す。
+            swing.points = res.confident_points()
+            weak = res.weak_ranges()
+            self.clip_manager.save_trajectory(clip_id, [swing])
+            # 編集タブで開いているクリップなら即反映
+            if getattr(self, "_edit_clip_id", None) == clip_id:
+                self._edit_swings = [swing]
+                self._edit_spline_cache.clear()
+                self._edit_swing_idx = 0
+                self._edit_update_display()
+            self._clips_tab_dirty = self._edit_tab_dirty = True
+            self._refresh_clips_list(scan=False)
+            msg = f"完了 ({seconds:.0f}秒): 確定 {len(swing.points)}点"
+            if weak:
+                rng = " ".join(f"{a}-{b}" for a, b in weak[:3])
+                msg += f" / 要手直し F{rng}"
+                self.autotrace_status.configure(text_color="#E0B040")
+            else:
+                self.autotrace_status.configure(text_color="#AAAAAA")
+            self.autotrace_status.configure(text=msg)
+            self._autotrace_weak = weak
+        except Exception as e:
+            self.autotrace_status.configure(text=f"保存に失敗: {e}")
 
     def _delete_clip_files(self, clip_id):
         """クリップに紐づく実ファイル (source, exported, trajectory) を削除

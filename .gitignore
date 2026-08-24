@@ -8,3 +8,10 @@ build/
 !GolfSwingBroadcast.spec
 .env
 *.exe
+
+# 学習済みモデル・ビルド生成物 (数百MB。初回に自動DL / trtexec で生成する)
+models/
+*.pt
+*.onnx
+*.engine
+originals/
