@@ -75,6 +75,18 @@ def find_ffmpeg() -> str | None:
             _ffmpeg_path = p
             return p
 
+    # 5. imageio_ffmpeg 同梱バイナリ (名前が ffmpeg-win-x86_64-*.exe なので
+    #    上の名前検索には引っかからない)。配布フォルダには依存で必ず入るため、
+    #    ffmpeg.exe の同梱に失敗しても最後の砦になる。
+    try:
+        import imageio_ffmpeg
+        p = imageio_ffmpeg.get_ffmpeg_exe()
+        if p and Path(p).exists():
+            _ffmpeg_path = p
+            return p
+    except Exception:
+        pass
+
     _ffmpeg_path = ""  # 見つからなかった (空文字でキャッシュ)
     return None
 
