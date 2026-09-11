@@ -352,9 +352,12 @@ class AppSettings:
                 "alpha": 0.85,
             },
             "keyboard_shortcuts": dict(DEFAULT_KEYBOARD_SHORTCUTS),
-            "slowmo_auto": False,   # クリップ切り出し後に自動でスロー化
+            "slowmo_auto": False,   # クリップ確定後に自動でスロー化
             "slowmo_factor": 2,     # 何倍スローにするか
-            "autotrace_auto": False,  # クリップ切り出し後に自動で軌道生成
+            "autotrace_auto": False,  # クリップ確定後に自動で軌道生成
+            "auto_load_to_edit": True,  # 出来たクリップを編集タブへ自動で読み込む
+            "input_device_name": "",    # DeckLink入力デバイス名 (復元用)
+            "output_device_name": "",   # DeckLink出力デバイス名 (復元用)
         }
         self._load()
 
@@ -366,6 +369,34 @@ class AppSettings:
                 self.data.update(saved)
             except Exception:
                 pass
+        self._fix_paths()
+
+    @staticmethod
+    def _usable(p):
+        try:
+            Path(p).mkdir(parents=True, exist_ok=True)
+            return True
+        except Exception:
+            return False
+
+    def _fix_paths(self):
+        """作れないパスを、この PC で使える場所に戻す
+
+        別PCで作られた settings.json には、そのPCのユーザー名を含むパスが
+        入っている。配布物にそれが紛れ込むと、起動時の mkdir が
+        PermissionError や FileNotFoundError で落ちてアプリが上がらない。
+        基準は settings.json 自身の置き場所 (= このPCのプロジェクト)。
+        """
+        here = self.path.parent
+        for key, default in (("project_dir", here),
+                             ("record_dir", here / "recordings")):
+            val = self.data.get(key)
+            if val and self._usable(val):
+                continue
+            if val:
+                print(f"[Settings] {key} が使えないので既定値に戻す: {val}")
+            self.data[key] = str(default)
+            self._usable(default)
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -444,11 +475,27 @@ class GolfBroadcastApp(ctk.CTk):
                 if new_settings_path.exists():
                     self.settings = AppSettings(self.project_dir)
                 else:
+                    # 移動先にまだ settings.json が無い場合は、ここまでに読んだ
+                    # 内容をそのまま持ち込む (書き出しは下の save() で行う)
                     self.settings.path = new_settings_path
             else:
                 self.project_dir = init_dir
         else:
             self.project_dir = init_dir
+
+        # --project で一時的に別フォルダを開いた時に既定のポインタまで
+        # 書き換えると、次回以降そちらに引きずられる
+        self._project_from_cli = project_dir is not None
+
+        # 設定ファイルを起動時点で必ず実体化しておく。
+        # プロジェクトフォルダ側に settings.json が無いまま運用すると、
+        # 終了するたびに既定値へ戻ってしまう。
+        try:
+            self.settings.save()
+            if not self._project_from_cli:
+                self._write_project_pointer(self.project_dir)
+        except Exception as e:
+            print(f"[Settings] 起動時の保存に失敗: {e}")
 
         self.clip_manager = ClipManager(str(self.project_dir))
 
@@ -499,6 +546,9 @@ class GolfBroadcastApp(ctk.CTk):
 
         # グローウィング再書き出しキュー: [(rec_path, in_f, out_f, clip_path, fps), ...]
         self._growing_reexport_queue = []
+
+        # 自動処理の完了後に編集タブへ流し込むクリップID (なければ None)
+        self._pending_edit_load = None
 
         # ダーティフラグ: タブ切替時の無駄なスキャンを抑制
         self._clips_tab_dirty = True   # クリップタブ再構築が必要
@@ -861,6 +911,9 @@ class GolfBroadcastApp(ctk.CTk):
             self._start_growing_reexport()
         elif path and frames == 0:
             print(f"[Capture] 0フレーム録画のためスキップ: {path}")
+        # 録画中エントリは消えるので、選択状態も戻す
+        if self._selected_clip_id == "__growing__":
+            self._clear_clip_selection()
         self._clips_tab_dirty = self._edit_tab_dirty = True
         self._refresh_clips_list(scan=False)
 
@@ -907,6 +960,9 @@ class GolfBroadcastApp(ctk.CTk):
                 self._refresh_edit_clips_list()
                 self._edit_tab_dirty = False
             print(f"[Capture] クリップ追加: {path}")
+            # 録画が終わった素材を、設定に従って自動処理 → 編集タブへ流す。
+            # タブ自体は切り替えない (収録画面を見たまま次のスイングに入れる)。
+            self._start_auto_process(clip.id)
         except Exception as e:
             if retries > 0:
                 print(f"[Capture] クリップ追加リトライ ({retries}回残り): {e}")
@@ -1014,7 +1070,7 @@ class GolfBroadcastApp(ctk.CTk):
         self.growing_refresh_btn.pack(padx=10, pady=(2, 0))
         self.growing_refresh_btn.pack_forget()  # 初期非表示
 
-        # グローウィングクリップ切り出しボタン
+        # クリップ切り出しボタン (常時表示。クリップ未選択のときは無効)
         self.clip_extract_btn = ctk.CTkButton(
             right, text="クリップ切り出し", width=250, height=40,
             font=("", 14, "bold"),
@@ -1022,47 +1078,16 @@ class GolfBroadcastApp(ctk.CTk):
             command=self._extract_growing_clip,
         )
         self.clip_extract_btn.pack(padx=10, pady=(5, 0))
-        self.clip_extract_btn.pack_forget()  # 初期非表示
+        self.clip_extract_btn.configure(state="disabled")
 
-        # スローモーション (フレーム補間)
-        slow_frame = ctk.CTkFrame(right, fg_color="transparent")
-        slow_frame.pack(fill="x", padx=10, pady=(8, 5))
-        self.slowmo_auto_var = ctk.BooleanVar(
-            value=bool(self.settings.data.get("slowmo_auto", False)))
-        ctk.CTkSwitch(
-            slow_frame, text="切り出し後に自動スロー化",
-            variable=self.slowmo_auto_var,
-            command=self._on_slowmo_auto_toggle,
-        ).pack(side="left")
-        self.slowmo_btn = ctk.CTkButton(
-            slow_frame, text="2倍スロー化", width=120, height=32,
-            fg_color="#2E4057", hover_color="#3D5A80",
-            command=self._make_slowmo_selected,
-        )
-        self.slowmo_btn.pack(side="right")
-        self.slowmo_status = ctk.CTkLabel(right, text="", font=("", 11),
-                                          text_color="#AAAAAA")
-        self.slowmo_status.pack(padx=10)
-
-        # クラブヘッド軌道の自動生成
-        trace_frame = ctk.CTkFrame(right, fg_color="transparent")
-        trace_frame.pack(fill="x", padx=10, pady=(4, 5))
-        self.autotrace_auto_var = ctk.BooleanVar(
-            value=bool(self.settings.data.get("autotrace_auto", False)))
-        ctk.CTkSwitch(
-            trace_frame, text="切り出し後に自動で軌道生成",
-            variable=self.autotrace_auto_var,
-            command=self._on_autotrace_auto_toggle,
-        ).pack(side="left")
-        self.autotrace_btn = ctk.CTkButton(
-            trace_frame, text="軌道を自動生成", width=120, height=32,
-            fg_color="#3A5F3A", hover_color="#4E7A4E",
-            command=self._autotrace_selected,
-        )
-        self.autotrace_btn.pack(side="right")
-        self.autotrace_status = ctk.CTkLabel(right, text="", font=("", 11),
-                                             text_color="#AAAAAA")
-        self.autotrace_status.pack(padx=10, pady=(0, 5))
+        # 自動処理 (スロー化 / 軌道生成) の進捗表示。
+        # ON/OFF は設定タブで切り替える。
+        self.slowmo_status_label = ctk.CTkLabel(right, text="", font=("", 11),
+                                                text_color="#AAAAAA")
+        self.slowmo_status_label.pack(padx=10, pady=(6, 0))
+        self.autotrace_status_label = ctk.CTkLabel(right, text="", font=("", 11),
+                                                   text_color="#AAAAAA")
+        self.autotrace_status_label.pack(padx=10, pady=(0, 5))
 
         # PanedWindow に左右を追加 (最小幅を指定)
         self.clips_paned.add(list_frame, minsize=200, stretch="never")
@@ -1374,10 +1399,9 @@ class GolfBroadcastApp(ctk.CTk):
         self.clip_slider.set(clip.in_frame)
         self._show_clip_preview(clip, clip.in_frame)
 
-        # グローウィング更新ボタンを非表示、切り出しボタンを表示
+        # グローウィング更新ボタンを非表示、切り出しボタンを有効化
         self.growing_refresh_btn.pack_forget()
         self.clip_extract_btn.configure(text="クリップ切り出し", state="normal")
-        self.clip_extract_btn.pack(padx=10, pady=(5, 0))
 
     def _release_clip_preview_cap(self):
         cap = getattr(self, '_clip_preview_cap', None)
@@ -1440,9 +1464,10 @@ class GolfBroadcastApp(ctk.CTk):
         if buf_cnt > 0:
             self._show_growing_preview(buf_cnt - 1)
 
-        # グローウィング用ボタン表示
-        self.growing_refresh_btn.pack(padx=10, pady=(2, 0))
-        self.clip_extract_btn.pack(padx=10, pady=(5, 0))
+        # グローウィング用ボタン表示 (切り出しボタンの上に差し込む)
+        self.growing_refresh_btn.pack(padx=10, pady=(2, 0),
+                                      before=self.clip_extract_btn)
+        self.clip_extract_btn.configure(text="クリップ切り出し", state="normal")
 
     def _refresh_growing(self):
         """グローウィングのスライダー最大値を更新し、最新フレームに追従再開"""
@@ -1759,37 +1784,81 @@ class GolfBroadcastApp(ctk.CTk):
                 self._edit_tab_dirty = False
             # 新しいクリップを選択
             self._select_clip(clip.id)
-            print(f"[Capture] グローウィングクリップ追加: {clip.name}")
-            # 自動処理 (設定がONのときだけ、裏で走らせる)
-            # 両方ONなら動画は1本にする。スロー化してから、その動画に
-            # 軌道を付ける。フレーム数が倍になるぶんヘッドの移動量が
-            # 半分になり、ダウンスイングの検出精度も上がる。
-            want_slow = self.settings.data.get("slowmo_auto", False)
-            want_trace = self.settings.data.get("autotrace_auto", False)
-            if want_slow and want_trace:
-                self._start_auto_pipeline(clip.id)
-            elif want_slow:
-                self._start_slowmo(clip.id)
-            elif want_trace:
-                self._start_autotrace(clip.id)
+            print(f"[Capture] クリップ追加: {clip.name}")
+            self._start_auto_process(clip.id)
         except Exception as e:
             print(f"[Capture] クリップ追加エラー: {e}")
         finally:
             self.clip_extract_btn.configure(text="クリップ切り出し", state="normal")
 
-    # ------------------------------------------------ スローモーション
-    def _on_slowmo_auto_toggle(self):
-        """自動スロー化のON/OFFを保存"""
-        self.settings["slowmo_auto"] = bool(self.slowmo_auto_var.get())
-        self.settings.save()
+    # ------------------------------------------------ 自動処理の入口
+    def _slowmo_status(self, **kw):
+        """スロー化の状況表示 (クリップタブと編集タブの両方に出す)"""
+        for lbl in (getattr(self, "slowmo_status_label", None),
+                    getattr(self, "edit_slowmo_status_label", None)):
+            if lbl is not None:
+                lbl.configure(**kw)
 
-    def _make_slowmo_selected(self):
-        """選択中のクリップを手動でスロー化"""
-        if not self._selected_clip_id or self._selected_clip_id == "__growing__":
-            self.slowmo_status.configure(text="クリップを選択してください")
+    def _autotrace_status(self, **kw):
+        """軌道生成の状況表示 (クリップタブと編集タブの両方に出す)"""
+        for lbl in (getattr(self, "autotrace_status_label", None),
+                    getattr(self, "edit_autotrace_status_label", None)):
+            if lbl is not None:
+                lbl.configure(**kw)
+
+    def _start_auto_process(self, clip_id):
+        """出来上がったクリップに対する自動処理をまとめて起動する
+
+        設定タブの ON/OFF に従う。両方ONなら動画は1本にする。スロー化して
+        から、その動画に軌道を付ける。フレーム数が倍になるぶんヘッドの
+        移動量が半分になり、ダウンスイングの検出精度も上がる。
+
+        編集タブへの読み込みは、自動処理が動くならその完了後に行う。
+        スロー化はクリップの実ファイルを差し替えるので、先に読み込むと
+        編集タブが古いファイルを掴んだままになる。
+        """
+        want_slow = bool(self.settings.data.get("slowmo_auto", False))
+        want_trace = bool(self.settings.data.get("autotrace_auto", False))
+        want_edit = bool(self.settings.data.get("auto_load_to_edit", True))
+
+        if not (want_slow or want_trace):
+            if want_edit:
+                self._edit_load_clip_quiet(clip_id)
             return
-        self._start_slowmo(self._selected_clip_id)
 
+        self._pending_edit_load = clip_id if want_edit else None
+        if want_slow and want_trace:
+            self._start_auto_pipeline(clip_id)
+        elif want_slow:
+            self._start_slowmo(clip_id)
+        else:
+            self._start_autotrace(clip_id)
+
+    def _consume_pending_edit_load(self, clip_id):
+        """自動処理の完了時に、素材を編集タブへ流し込む (画面は切り替えない)"""
+        if getattr(self, "_pending_edit_load", None) != clip_id:
+            return
+        self._pending_edit_load = None
+        self._edit_load_clip_quiet(clip_id)
+
+    def _edit_load_clip_quiet(self, clip_id):
+        """編集タブに素材だけ読み込む (タブは切り替えない)"""
+        if not self.clip_manager.get_clip(clip_id):
+            return
+        try:
+            if self._edit_clip_id and self._edit_clip_id != clip_id:
+                self._edit_autosave_trajectory()
+            self._edit_clip_id = clip_id
+            self._edit_undo_stack.clear()
+            self._edit_redo_stack.clear()
+            self._load_edit_clip()
+            self._refresh_edit_clips_list()
+            self._edit_tab_dirty = False
+            print(f"[Edit] 素材を編集タブへ読み込み: {clip_id}")
+        except Exception as e:
+            print(f"[Edit] 素材の読み込みに失敗: {e}")
+
+    # ------------------------------------------------ スローモーション
     def _start_slowmo(self, clip_id, then_autotrace=False):
         """フレーム補間でスロー化する (別スレッド)
 
@@ -1798,23 +1867,26 @@ class GolfBroadcastApp(ctk.CTk):
         minterpolate に自動で落ちる。
         """
         if getattr(self, "_slowmo_running", False):
-            self.slowmo_status.configure(text="スロー化を実行中です")
+            self._slowmo_status(text="スロー化を実行中です")
+            self._consume_pending_edit_load(clip_id)
             return
         clip = self.clip_manager.get_clip(clip_id)
         if not clip:
+            self._consume_pending_edit_load(clip_id)
             return
         src = clip.exported_path or clip.source_path
         if not src or not Path(src).exists():
-            self.slowmo_status.configure(text="元ファイルが見つかりません")
+            self._slowmo_status(text="元ファイルが見つかりません")
+            self._consume_pending_edit_load(clip_id)
             return
         factor = int(self.settings.data.get("slowmo_factor", 2))
         dst = Path(src).with_name(f"{Path(src).stem}_slow{factor}x.mp4")
 
         self._slowmo_running = True
-        self.slowmo_btn.configure(state="disabled", text="スロー化中...")
+        self._slowmo_status(text="スロー化中...", text_color="#AAAAAA")
 
         def report(ratio, msg):
-            self.after(0, lambda: self.slowmo_status.configure(
+            self.after(0, lambda: self._slowmo_status(
                 text=f"{msg} {ratio * 100:.0f}%"))
 
         def work():
@@ -1852,9 +1924,9 @@ class GolfBroadcastApp(ctk.CTk):
         (動画を2本作らないため)。
         """
         self._slowmo_running = False
-        self.slowmo_btn.configure(state="normal", text="2倍スロー化")
         if err or not path:
-            self.slowmo_status.configure(text=f"失敗: {err or '不明'}")
+            self._slowmo_status(text=f"失敗: {err or '不明'}")
+            self._consume_pending_edit_load(clip_id)
             return
         try:
             clip = self._replace_clip_with(clip_id, path)
@@ -1864,12 +1936,15 @@ class GolfBroadcastApp(ctk.CTk):
                 self._refresh_edit_clips_list()
                 self._edit_tab_dirty = False
             self._select_clip(clip.id)
-            self.slowmo_status.configure(
+            self._slowmo_status(
                 text=f"完了 ({tag} {seconds:.0f}秒): {clip.name}")
             if then_autotrace:
                 self._start_autotrace(clip.id, time_scale=factor)
+            else:
+                self._consume_pending_edit_load(clip.id)
         except Exception as e:
-            self.slowmo_status.configure(text=f"登録に失敗: {e}")
+            self._slowmo_status(text=f"登録に失敗: {e}")
+            self._consume_pending_edit_load(clip_id)
 
     def _replace_clip_with(self, clip_id, new_path):
         """クリップの中身を差し替える (リストに2つ並ばないようにする)
@@ -1926,14 +2001,17 @@ class GolfBroadcastApp(ctk.CTk):
         軌道生成がファイルを見失う。
         """
         if getattr(self, "_pipeline_running", False):
-            self.slowmo_status.configure(text="実行中です")
+            self._slowmo_status(text="実行中です")
+            self._consume_pending_edit_load(clip_id)
             return
         clip = self.clip_manager.get_clip(clip_id)
         if not clip:
+            self._consume_pending_edit_load(clip_id)
             return
         src = clip.exported_path or clip.source_path
         if not src or not Path(src).exists():
-            self.slowmo_status.configure(text="元ファイルが見つかりません")
+            self._slowmo_status(text="元ファイルが見つかりません")
+            self._consume_pending_edit_load(clip_id)
             return
         factor = int(self.settings.data.get("slowmo_factor", 2))
         dst = Path(src).with_name(f"{Path(src).stem}_slow{factor}x.mp4")
@@ -1945,8 +2023,8 @@ class GolfBroadcastApp(ctk.CTk):
                 lo, hi = 0, -1
 
         self._pipeline_running = True
-        self.slowmo_btn.configure(state="disabled", text="処理中...")
-        self.autotrace_btn.configure(state="disabled", text="処理中...")
+        self._slowmo_status(text="スロー化中...", text_color="#AAAAAA")
+        self._autotrace_status(text="軌道生成中...", text_color="#AAAAAA")
         out = {}
 
         def slow_job():
@@ -1956,7 +2034,7 @@ class GolfBroadcastApp(ctk.CTk):
                     out["slow"] = make_slowmo_rife(
                         src, str(dst), factor=factor, crf=self.settings["crf"],
                         progress=lambda r, m: self.after(
-                            0, lambda: self.slowmo_status.configure(
+                            0, lambda: self._slowmo_status(
                                 text=f"{m} {r * 100:.0f}%")))
                     out["tag"] = "RIFE"
                 except Exception as e:
@@ -1974,7 +2052,7 @@ class GolfBroadcastApp(ctk.CTk):
                 out["trace"] = run_trace(
                     src, lo, hi,
                     progress=lambda r, m: self.after(
-                        0, lambda: self.autotrace_status.configure(
+                        0, lambda: self._autotrace_status(
                             text=f"{m} {r * 100:.0f}%")))
             except Exception as e:
                 out["trace_err"] = str(e)
@@ -1996,24 +2074,24 @@ class GolfBroadcastApp(ctk.CTk):
     def _finish_auto_pipeline(self, clip_id, dst, factor, out):
         """両方の完了後に、クリップ差し替えと軌道の載せ替えを行う"""
         self._pipeline_running = False
-        self.slowmo_btn.configure(state="normal", text="2倍スロー化")
-        self.autotrace_btn.configure(state="normal", text="軌道を自動生成")
 
         if out.get("slow_err") or "slow" not in out:
-            self.slowmo_status.configure(
+            self._slowmo_status(
                 text=f"スロー化失敗: {out.get('slow_err', '不明')}")
+            self._consume_pending_edit_load(clip_id)
             return
         try:
             clip = self._replace_clip_with(clip_id, dst)
         except Exception as e:
-            self.slowmo_status.configure(text=f"差し替えに失敗: {e}")
+            self._slowmo_status(text=f"差し替えに失敗: {e}")
+            self._consume_pending_edit_load(clip_id)
             return
-        self.slowmo_status.configure(
+        self._slowmo_status(
             text=f"完了 ({out.get('tag')} {out['seconds']:.0f}秒): {clip.name}")
 
         res = out.get("trace")
         if out.get("trace_err") or res is None:
-            self.autotrace_status.configure(
+            self._autotrace_status(
                 text=f"軌道失敗: {out.get('trace_err', '検出できず')}")
         else:
             try:
@@ -2027,10 +2105,10 @@ class GolfBroadcastApp(ctk.CTk):
                 if weak:
                     msg += " / 要手直し F" + " ".join(f"{a}-{b}"
                                                     for a, b in weak[:3])
-                    self.autotrace_status.configure(text_color="#E0B040")
-                self.autotrace_status.configure(text=msg)
+                    self._autotrace_status(text_color="#E0B040")
+                self._autotrace_status(text=msg)
             except Exception as e:
-                self.autotrace_status.configure(text=f"軌道の保存に失敗: {e}")
+                self._autotrace_status(text=f"軌道の保存に失敗: {e}")
 
         self._clips_tab_dirty = self._edit_tab_dirty = True
         self._refresh_clips_list(scan=False)
@@ -2038,20 +2116,9 @@ class GolfBroadcastApp(ctk.CTk):
             self._refresh_edit_clips_list()
             self._edit_tab_dirty = False
         self._select_clip(clip_id)
+        self._consume_pending_edit_load(clip_id)
 
     # ------------------------------------------------ 軌道の自動生成
-    def _on_autotrace_auto_toggle(self):
-        """自動軌道生成のON/OFFを保存"""
-        self.settings["autotrace_auto"] = bool(self.autotrace_auto_var.get())
-        self.settings.save()
-
-    def _autotrace_selected(self):
-        """選択中のクリップの軌道を手動で自動生成"""
-        if not self._selected_clip_id or self._selected_clip_id == "__growing__":
-            self.autotrace_status.configure(text="クリップを選択してください")
-            return
-        self._start_autotrace(self._selected_clip_id)
-
     def _start_autotrace(self, clip_id, time_scale=1.0):
         """クラブヘッド軌道を自動検出して軌道データとして保存する (別スレッド)
 
@@ -2059,14 +2126,17 @@ class GolfBroadcastApp(ctk.CTk):
         消さないため)。生成結果は下書きなので、編集タブでそのまま直せる。
         """
         if getattr(self, "_autotrace_running", False):
-            self.autotrace_status.configure(text="軌道生成を実行中です")
+            self._autotrace_status(text="軌道生成を実行中です")
+            self._consume_pending_edit_load(clip_id)
             return
         clip = self.clip_manager.get_clip(clip_id)
         if not clip:
+            self._consume_pending_edit_load(clip_id)
             return
         src = clip.exported_path or clip.source_path
         if not src or not Path(src).exists():
-            self.autotrace_status.configure(text="元ファイルが見つかりません")
+            self._autotrace_status(text="元ファイルが見つかりません")
+            self._consume_pending_edit_load(clip_id)
             return
         # In/Out を切ってあればその範囲だけ解析する。全体に掛けると
         # 倍以上遅いうえ、アドレス前の場面まで含むとボール検出が
@@ -2079,14 +2149,15 @@ class GolfBroadcastApp(ctk.CTk):
                 lo, hi = 0, -1
         existing, _, _ = self.clip_manager.load_trajectory(clip_id)
         if existing and any(len(sw.points) >= 2 for sw in existing):
-            self.autotrace_status.configure(text="既存の軌道があるので中止しました")
+            self._autotrace_status(text="既存の軌道があるので中止しました")
+            self._consume_pending_edit_load(clip_id)
             return
 
         self._autotrace_running = True
-        self.autotrace_btn.configure(state="disabled", text="生成中...")
+        self._autotrace_status(text="軌道生成中...", text_color="#AAAAAA")
 
         def report(ratio, msg):
-            self.after(0, lambda: self.autotrace_status.configure(
+            self.after(0, lambda: self._autotrace_status(
                 text=f"{msg} {ratio * 100:.0f}%"))
 
         def work():
@@ -2098,18 +2169,22 @@ class GolfBroadcastApp(ctk.CTk):
                 el = time.time() - t0
                 self.after(0, lambda: self._finish_autotrace(clip_id, res, el))
             except Exception as e:
-                print(f"[Autotrace] 失敗: {e}")
+                # except を抜けると e は消えるので、先に文字列にしておく。
+                # そうしないと lambda 内で NameError になり、完了処理が
+                # 走らないまま「生成中...」で止まってしまう。
+                msg = str(e)
+                print(f"[Autotrace] 失敗: {msg}")
                 self.after(0, lambda: self._finish_autotrace(
-                    clip_id, None, 0, str(e)))
+                    clip_id, None, 0, msg))
 
         threading.Thread(target=work, daemon=True).start()
 
     def _finish_autotrace(self, clip_id, res, seconds, err=None):
         """軌道生成完了。TrajectoryData として保存する"""
         self._autotrace_running = False
-        self.autotrace_btn.configure(state="normal", text="軌道を自動生成")
         if err or res is None or len(res.points) < 2:
-            self.autotrace_status.configure(text=f"失敗: {err or '検出できず'}")
+            self._autotrace_status(text=f"失敗: {err or '検出できず'}")
+            self._consume_pending_edit_load(clip_id)
             return
         try:
             swing = self._make_default_trajectory(0)
@@ -2131,13 +2206,15 @@ class GolfBroadcastApp(ctk.CTk):
             if weak:
                 rng = " ".join(f"{a}-{b}" for a, b in weak[:3])
                 msg += f" / 要手直し F{rng}"
-                self.autotrace_status.configure(text_color="#E0B040")
+                self._autotrace_status(text_color="#E0B040")
             else:
-                self.autotrace_status.configure(text_color="#AAAAAA")
-            self.autotrace_status.configure(text=msg)
+                self._autotrace_status(text_color="#AAAAAA")
+            self._autotrace_status(text=msg)
             self._autotrace_weak = weak
         except Exception as e:
-            self.autotrace_status.configure(text=f"保存に失敗: {e}")
+            self._autotrace_status(text=f"保存に失敗: {e}")
+        finally:
+            self._consume_pending_edit_load(clip_id)
 
     def _delete_clip_files(self, clip_id):
         """クリップに紐づく実ファイル (source, exported, trajectory) を削除
@@ -2163,11 +2240,18 @@ class GolfBroadcastApp(ctk.CTk):
                     except Exception as e:
                         print(f"[Clips] ファイル削除エラー: {fp.name}: {e}")
 
+    def _clear_clip_selection(self):
+        """クリップ未選択の状態に戻す (切り出しボタンを無効化)"""
+        self._selected_clip_id = None
+        self.growing_refresh_btn.pack_forget()
+        self.clip_extract_btn.configure(text="クリップ切り出し", state="disabled")
+        self.clip_info_label.configure(text="クリップを選択してください")
+
     def _delete_selected_clip(self):
         if self._selected_clip_id:
             self._delete_clip_files(self._selected_clip_id)
             self.clip_manager.remove_clip(self._selected_clip_id)
-            self._selected_clip_id = None
+            self._clear_clip_selection()
             self._clips_tab_dirty = self._edit_tab_dirty = True
             self._refresh_clips_list()
 
@@ -2176,7 +2260,7 @@ class GolfBroadcastApp(ctk.CTk):
         self._delete_clip_files(clip_id)
         self.clip_manager.remove_clip(clip_id)
         if self._selected_clip_id == clip_id:
-            self._selected_clip_id = None
+            self._clear_clip_selection()
         self._clips_tab_dirty = self._edit_tab_dirty = True
         self._refresh_clips_list()
 
@@ -2287,6 +2371,15 @@ class GolfBroadcastApp(ctk.CTk):
             command=self._toggle_rec
         )
         self.edit_rec_btn.pack(padx=10, pady=(8, 2))
+
+        # 自動処理の進捗 (クリップタブと同じ内容をここにも出す)
+        self.edit_slowmo_status_label = ctk.CTkLabel(
+            right, text="", font=("", 11), text_color="#AAAAAA")
+        self.edit_slowmo_status_label.pack(padx=10)
+        self.edit_autotrace_status_label = ctk.CTkLabel(
+            right, text="", font=("", 11), text_color="#AAAAAA")
+        self.edit_autotrace_status_label.pack(padx=10)
+
         ctk.CTkLabel(right, text="クリップ", font=("", 14, "bold")).pack(pady=(4, 2))
         self.edit_clips_scroll = ctk.CTkScrollableFrame(right, height=160)
         self.edit_clips_scroll.pack(fill="x", padx=5, pady=(0, 5))
@@ -3846,18 +3939,24 @@ class GolfBroadcastApp(ctk.CTk):
                 print(f"[Edit] Phase2完了: NVENC encode ({t_phase2:.1f}s)", flush=True)
         else:
             # ffmpeg なし: cv2 フォールバック (Phase1のrawから再読み込み)
+            # Phase1 が書いたのは I420 (1.5 byte/px)。ここを BGR24 (3 byte/px)
+            # として読むと 1フレームに2フレーム分のY/U/Vが詰まり、
+            # 白黒で分割されたような映像になる。必ず I420 のまま読む。
+            print("[Edit] ffmpeg が見つかりません。cv2 フォールバックで書き出します "
+                  "(画質・速度が落ちます)", flush=True)
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             w2 = cv2.VideoWriter(str(out_path), fourcc, clip.fps,
                                   (clip.width, clip.height))
-            frame_bytes = clip.width * clip.height * 3
+            yuv_h = clip.height * 3 // 2
+            frame_bytes = clip.width * yuv_h
             with open(temp_raw, 'rb') as f:
                 while True:
                     raw = f.read(frame_bytes)
                     if len(raw) < frame_bytes:
                         break
-                    fr = np.frombuffer(raw, dtype=np.uint8).reshape(
-                        (clip.height, clip.width, 3))
-                    w2.write(fr)
+                    yuv = np.frombuffer(raw, dtype=np.uint8).reshape(
+                        (yuv_h, clip.width))
+                    w2.write(cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR_I420))
             w2.release()
 
         # 一時ファイル削除
@@ -4593,6 +4692,10 @@ class GolfBroadcastApp(ctk.CTk):
         self.project_dir_entry.pack(side="left", padx=(0, 5))
         ctk.CTkButton(dir_row, text="変更", width=80,
                        command=self._change_project_dir).pack(side="left")
+        self.project_dir_status = ctk.CTkLabel(
+            sec1, text=f"現在: {self.project_dir}", font=("", 11),
+            text_color="#888")
+        self.project_dir_status.pack(anchor="w", padx=10, pady=(0, 5))
 
         # 録画フォルダ
         sec2 = ctk.CTkFrame(tab)
@@ -4605,6 +4708,44 @@ class GolfBroadcastApp(ctk.CTk):
         self.record_dir_entry.pack(side="left", padx=(0, 5))
         ctk.CTkButton(rec_row, text="変更", width=80,
                        command=self._change_record_dir).pack(side="left")
+        self.record_dir_status = ctk.CTkLabel(
+            sec2, text=f"現在: {self.settings['record_dir']}", font=("", 11),
+            text_color="#888")
+        self.record_dir_status.pack(anchor="w", padx=10, pady=(0, 5))
+
+        # 収録後の自動処理
+        sec_auto = ctk.CTkFrame(tab)
+        sec_auto.pack(fill="x", padx=20, pady=5)
+        ctk.CTkLabel(sec_auto, text="収録後の自動処理",
+                      font=("", 14, "bold")).pack(anchor="w", padx=10, pady=(10, 2))
+        ctk.CTkLabel(sec_auto,
+                      text="RECを止めた時と、クリップを切り出した時に実行されます",
+                      font=("", 10), text_color="#888").pack(anchor="w", padx=10,
+                                                              pady=(0, 5))
+
+        self.slowmo_auto_var = ctk.BooleanVar(
+            value=bool(self.settings.data.get("slowmo_auto", False)))
+        ctk.CTkSwitch(
+            sec_auto, text="自動で2倍スロー化する",
+            variable=self.slowmo_auto_var,
+            command=self._on_auto_process_toggle,
+        ).pack(anchor="w", padx=15, pady=3)
+
+        self.autotrace_auto_var = ctk.BooleanVar(
+            value=bool(self.settings.data.get("autotrace_auto", False)))
+        ctk.CTkSwitch(
+            sec_auto, text="自動で軌道を作画する",
+            variable=self.autotrace_auto_var,
+            command=self._on_auto_process_toggle,
+        ).pack(anchor="w", padx=15, pady=3)
+
+        self.auto_load_edit_var = ctk.BooleanVar(
+            value=bool(self.settings.data.get("auto_load_to_edit", True)))
+        ctk.CTkSwitch(
+            sec_auto, text="出来た素材を編集タブへ読み込む (画面は切り替えない)",
+            variable=self.auto_load_edit_var,
+            command=self._on_auto_process_toggle,
+        ).pack(anchor="w", padx=15, pady=(3, 10))
 
         # 解像度・FPS
         sec3 = ctk.CTkFrame(tab)
@@ -4675,11 +4816,26 @@ class GolfBroadcastApp(ctk.CTk):
         dev_row = ctk.CTkFrame(sec4, fg_color="transparent")
         dev_row.pack(fill="x", padx=10, pady=5)
         ctk.CTkLabel(dev_row, text="入力:").pack(side="left", padx=(0, 5))
-        self.input_dev_combo = ctk.CTkComboBox(dev_row, values=device_names, width=250)
+        self.input_dev_combo = ctk.CTkComboBox(
+            dev_row, values=device_names, width=250,
+            command=lambda _v: self._on_device_combo_changed())
         self.input_dev_combo.pack(side="left", padx=(0, 20))
         ctk.CTkLabel(dev_row, text="出力:").pack(side="left", padx=(0, 5))
-        self.output_dev_combo = ctk.CTkComboBox(dev_row, values=device_names, width=250)
+        self.output_dev_combo = ctk.CTkComboBox(
+            dev_row, values=device_names, width=250,
+            command=lambda _v: self._on_device_combo_changed())
         self.output_dev_combo.pack(side="left")
+
+        # 保存済みの選択を復元。デバイスの並びは挿し替えで変わるので、
+        # 名前が残っていれば名前を優先し、無ければ番号で戻す。
+        self._restore_device_combo(self.input_dev_combo, device_names,
+                                   "input_device_name", "input_device")
+        self._restore_device_combo(self.output_dev_combo, device_names,
+                                   "output_device_name", "output_device")
+
+        self.device_status = ctk.CTkLabel(sec4, text="", font=("", 11),
+                                           text_color="#888")
+        self.device_status.pack(anchor="w", padx=10, pady=(0, 5))
 
         # キーボードショートカット設定
         self._build_keyboard_shortcut_settings(tab)
@@ -5018,17 +5174,46 @@ class GolfBroadcastApp(ctk.CTk):
             ind.configure(text_color="#00FF00")
             self.after(800, lambda: ind.configure(text_color="#333"))
 
+    def _restore_device_combo(self, combo, device_names, name_key, index_key):
+        """保存済みのデバイス選択をコンボボックスに戻す"""
+        saved_name = self.settings.data.get(name_key, "")
+        if saved_name and saved_name in device_names:
+            combo.set(saved_name)
+            return
+        idx = self.settings.data.get(index_key, 0)
+        if isinstance(idx, int) and 0 <= idx < len(device_names):
+            combo.set(device_names[idx])
+        elif device_names:
+            combo.set(device_names[0])
+
+    def _on_auto_process_toggle(self):
+        """収録後の自動処理スイッチ: 押した時点で保存する"""
+        self.settings["slowmo_auto"] = bool(self.slowmo_auto_var.get())
+        self.settings["autotrace_auto"] = bool(self.autotrace_auto_var.get())
+        self.settings["auto_load_to_edit"] = bool(self.auto_load_edit_var.get())
+        self.settings.save()
+
     def _change_project_dir(self):
         d = filedialog.askdirectory(title="プロジェクトフォルダを選択")
-        if d:
-            self.project_dir_entry.delete(0, "end")
-            self.project_dir_entry.insert(0, d)
+        if not d:
+            return
+        self.project_dir_entry.delete(0, "end")
+        self.project_dir_entry.insert(0, d)
+        # 選んだ時点で反映する (「変更」だけ押して効かない、を無くす)
+        self._save_settings()
 
     def _change_record_dir(self):
         d = filedialog.askdirectory(title="録画保存フォルダを選択")
-        if d:
-            self.record_dir_entry.delete(0, "end")
-            self.record_dir_entry.insert(0, d)
+        if not d:
+            return
+        if self.recorder.is_recording:
+            self.record_dir_status.configure(
+                text="録画中は変更できません。RECを止めてからやり直してください",
+                text_color="#E0B040")
+            return
+        self.record_dir_entry.delete(0, "end")
+        self.record_dir_entry.insert(0, d)
+        self._save_settings()
 
     def _on_growing_buf_changed(self, choice):
         buf_map = {"30秒": 30, "1分": 60, "2分": 120, "3分": 180, "5分": 300, "10分": 600}
@@ -5058,15 +5243,47 @@ class GolfBroadcastApp(ctk.CTk):
     def _on_crf_slider(self, value):
         self._crf_value_label.configure(text=str(int(value)))
 
-    def _save_settings(self):
-        self.settings["project_dir"] = self.project_dir_entry.get()
-        self.settings["record_dir"] = self.record_dir_entry.get()
+    def _on_device_combo_changed(self):
+        """DeckLink デバイス選択: 押した時点で保存する"""
+        self._collect_ui_settings()
+        self.settings.save()
+        self.device_status.configure(
+            text="「入力開始」を押すと切り替わります", text_color="#888")
+
+    def _collect_ui_settings(self):
+        """設定タブ・収録タブのウィジェットの値を settings に取り込む
+
+        フォルダ (project_dir / record_dir) はここでは触らない。
+        あちらは実体の作成やリストの作り直しが伴うので _save_settings 側で扱う。
+        終了時にもこれを呼ぶので、保存ボタンを押し忘れても設定が消えない。
+        """
+        if not hasattr(self, "slowmo_auto_var"):
+            return   # 設定タブ構築前
+
+        # 収録後の自動処理
+        self.settings["slowmo_auto"] = bool(self.slowmo_auto_var.get())
+        self.settings["autotrace_auto"] = bool(self.autotrace_auto_var.get())
+        self.settings["auto_load_to_edit"] = bool(self.auto_load_edit_var.get())
+
+        # DeckLink デバイス選択 (名前と番号の両方を残す)
+        in_name = self.input_dev_combo.get()
+        out_name = self.output_dev_combo.get()
+        names = list(self.input_dev_combo.cget("values") or [])
+        self.settings["input_device_name"] = in_name
+        self.settings["output_device_name"] = out_name
+        if in_name in names:
+            self.settings["input_device"] = names.index(in_name)
+        if out_name in names:
+            self.settings["output_device"] = names.index(out_name)
 
         res = self.resolution_combo.get()
         if "x" in res:
             w, h = res.split("x")
-            self.settings["width"] = int(w)
-            self.settings["height"] = int(h)
+            try:
+                self.settings["width"] = int(w)
+                self.settings["height"] = int(h)
+            except ValueError:
+                pass
 
         try:
             self.settings["fps"] = float(self.fps_combo.get())
@@ -5108,55 +5325,126 @@ class GolfBroadcastApp(ctk.CTk):
                                                 dict(DEFAULT_KEYBOARD_SHORTCUTS))
             self.settings["keyboard_shortcuts"] = shortcuts
 
+    def _save_settings(self):
+        old_project = self.project_dir
+        old_record = os.path.normpath(self.settings["record_dir"])
+        proj_err = rec_err = False
+
+        self.settings["project_dir"] = self.project_dir_entry.get().strip()
+        self.settings["record_dir"] = self.record_dir_entry.get().strip()
+        self._collect_ui_settings()
+
         # プロジェクトフォルダ変更の反映
         new_project = Path(self.settings["project_dir"])
-        if new_project != self.project_dir:
-            old_rec_default = str(self.project_dir / "recordings")
-            new_project.mkdir(parents=True, exist_ok=True)
-            self.project_dir = new_project
-            self.settings.path = new_project / "settings.json"
-            self.clip_manager = ClipManager(str(new_project))
-            self._exports_dir = new_project / "exports"
-            self._exports_dir.mkdir(parents=True, exist_ok=True)
-            self._playout_json = str(new_project / "playout.json")
-            self.playout.load_playlist(self._playout_json)
-            self.playout.scan_directory(str(self._exports_dir))
-            self.playout.save_playlist(self._playout_json)
-            # record_dir が旧プロジェクトのデフォルトだった場合、新プロジェクトに追従
-            if os.path.normpath(self.settings["record_dir"]) == os.path.normpath(old_rec_default):
-                new_rec = str(new_project / "recordings")
-                self.settings["record_dir"] = new_rec
-                self.record_dir_entry.delete(0, "end")
-                self.record_dir_entry.insert(0, new_rec)
-            print(f"[Settings] プロジェクトフォルダ変更: {new_project}")
+        project_changed = new_project != old_project
+        if project_changed:
+            old_rec_default = str(old_project / "recordings")
+            try:
+                new_project.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                # 作れないパスを掴むとクリップ一覧ごと壊れるので、元に戻す
+                print(f"[Settings] プロジェクトフォルダを作れません: {e}")
+                self.settings["project_dir"] = str(old_project)
+                self.project_dir_entry.delete(0, "end")
+                self.project_dir_entry.insert(0, str(old_project))
+                self.project_dir_status.configure(
+                    text=f"変更できません: {e}", text_color="#E0704B")
+                project_changed = False
+                proj_err = True
+            else:
+                # 編集中の軌道は、旧プロジェクトの ClipManager が生きている
+                # うちに書き戻しておく
+                self._edit_autosave_trajectory()
+                self.project_dir = new_project
+                self.settings.path = new_project / "settings.json"
+                self.clip_manager = ClipManager(str(new_project))
+                self._exports_dir = new_project / "exports"
+                self._exports_dir.mkdir(parents=True, exist_ok=True)
+                self._playout_json = str(new_project / "playout.json")
+                self.playout.load_playlist(self._playout_json)
+                self.playout.scan_directory(str(self._exports_dir))
+                self.playout.save_playlist(self._playout_json)
+                # record_dir が旧プロジェクトのデフォルトだった場合、新プロジェクトに追従
+                if os.path.normpath(self.settings["record_dir"]) == os.path.normpath(old_rec_default):
+                    new_rec = str(new_project / "recordings")
+                    self.settings["record_dir"] = new_rec
+                    self.record_dir_entry.delete(0, "end")
+                    self.record_dir_entry.insert(0, new_rec)
+                print(f"[Settings] プロジェクトフォルダ変更: {new_project}")
 
-            # デフォルト場所にもproject_dirを保存 (次回起動時に新フォルダを見つけるため)
-            default_settings = Path(DEFAULT_PROJECT_DIR) / "settings.json"
-            if default_settings != self.settings.path:
-                try:
-                    default_settings.parent.mkdir(parents=True, exist_ok=True)
-                    import json
-                    default_data = {}
-                    if default_settings.exists():
-                        with open(default_settings, "r", encoding="utf-8") as f:
-                            default_data = json.load(f)
-                    default_data["project_dir"] = str(new_project)
-                    with open(default_settings, "w", encoding="utf-8") as f:
-                        json.dump(default_data, f, indent=2, ensure_ascii=False)
-                except Exception as e:
-                    print(f"[Settings] デフォルト設定の更新エラー: {e}")
+                # デフォルト場所にもproject_dirを保存 (次回起動時に新フォルダを見つけるため)
+                self._write_project_pointer(new_project)
+
+        # 録画フォルダの実体を用意する
+        record_changed = os.path.normpath(self.settings["record_dir"]) != old_record
+        try:
+            Path(self.settings["record_dir"]).mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            print(f"[Settings] 録画フォルダを作れません: {e}")
+            self.settings["record_dir"] = str(self.project_dir / "recordings")
+            self.record_dir_entry.delete(0, "end")
+            self.record_dir_entry.insert(0, self.settings["record_dir"])
+            self.record_dir_status.configure(
+                text=f"変更できません: {e}", text_color="#E0704B")
+            record_changed = True
+            rec_err = True
 
         self.settings.save()
         self._rebuild_key_map()
-        self.recorder = Recorder(
-            self.settings["record_dir"],
-            self.settings["width"],
-            self.settings["height"],
-            self.settings["fps"],
-            crf=self.settings["crf"],
-            growing_buffer_sec=self.settings["growing_buffer_sec"],
-        )
+
+        # 録画中に Recorder を差し替えると録画が途切れるので、そのときは触らない
+        if self.recorder.is_recording:
+            print("[Settings] 録画中のため Recorder の再構築は見送りました")
+        else:
+            self.recorder = Recorder(
+                self.settings["record_dir"],
+                self.settings["width"],
+                self.settings["height"],
+                self.settings["fps"],
+                crf=self.settings["crf"],
+                growing_buffer_sec=self.settings["growing_buffer_sec"],
+            )
+
+        # フォルダが変わったら一覧を作り直す (変更が画面に出ないのを防ぐ)
+        if project_changed or record_changed:
+            self._clear_clip_selection()
+            self._edit_clip_id = None
+            self._clips_tab_dirty = self._edit_tab_dirty = True
+            self._playout_dirty = True
+            self._refresh_clips_list(scan=True)
+            self._refresh_edit_clips_list()
+            self._refresh_playout_list()
+            self._edit_tab_dirty = self._playout_dirty = False
+
+        # エラー表示は消さない (原因が分からないまま終わらせない)
+        if not proj_err:
+            self.project_dir_status.configure(
+                text=f"現在: {self.project_dir}", text_color="#888")
+        if not rec_err:
+            self.record_dir_status.configure(
+                text=f"現在: {self.settings['record_dir']}", text_color="#888")
         print("[Settings] 設定を保存しました")
+
+    @staticmethod
+    def _write_project_pointer(project_dir):
+        """既定フォルダの settings.json に project_dir だけ書き残す
+
+        次回起動時にこのファイルを見て、実際のプロジェクトを探しに行く。
+        """
+        default_settings = Path(DEFAULT_PROJECT_DIR) / "settings.json"
+        if default_settings == Path(project_dir) / "settings.json":
+            return
+        try:
+            default_settings.parent.mkdir(parents=True, exist_ok=True)
+            default_data = {}
+            if default_settings.exists():
+                with open(default_settings, "r", encoding="utf-8") as f:
+                    default_data = json.load(f)
+            default_data["project_dir"] = str(project_dir)
+            with open(default_settings, "w", encoding="utf-8") as f:
+                json.dump(default_data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"[Settings] デフォルト設定の更新エラー: {e}")
 
     # =========================================================================
     # ShuttlePRO v2
@@ -5476,6 +5764,15 @@ class GolfBroadcastApp(ctk.CTk):
     # =========================================================================
     def _on_close(self):
         print("[App] 終了処理...")
+        # 設定は終了時にも書き戻す。これが無いと、保存ボタンを押していない
+        # 変更 (デバイス選択・画質など) が起動のたびに消える。
+        try:
+            self._collect_ui_settings()
+            self.settings.save()
+            if not getattr(self, "_project_from_cli", False):
+                self._write_project_pointer(self.project_dir)
+        except Exception as e:
+            print(f"[Settings] 終了時の保存に失敗: {e}")
         self.shuttle.stop()
         if self.recorder.is_recording:
             self.recorder.stop_recording()
