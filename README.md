@@ -99,6 +99,38 @@ GolfSwingBroadcast/
 | `N` / `P` | NEXT / PREV |
 | `1`〜`4` | 速度切替 |
 
+## AI 機能 (試作: クラブヘッド軌道の自動生成 / 縦型動画)
+
+編集タブの「AI (試作)」に 2 つのボタンがある。
+
+| ボタン | 内容 |
+|------|------|
+| ヘッド軌道を自動生成 | `ai/club_tracker.py` でクラブヘッドを追跡し、制御点を手描きと同じ軌道 (Swing) として保存。既存の点編集・ベジェ・Undo でそのまま手直しできる |
+| 縦型動画 (SNS) 書き出し | 保存済みの軌道を主役に 1080x1920/30fps の動画を `exports/sns/` に書き出す (`ai/sns_render.py`) |
+
+骨格線とサマリーカードは `settings.json` の `"ai": {"sns": {"skeleton": true, "summary": true}}` で ON/OFF (既定 ON)。
+設定キーの一覧は `ai/config.py`。モデルとフォントは `python setup_assets.py` で取得する。
+
+### 実収録素材での評価 (tests/real/)
+
+実収録の 1080i59.94 素材が届いたら、次の手順で追跡精度を記録する。
+
+```bash
+# 1. 素材を置く (git 管理外)。1080i 素材はファイル名に "_i" を入れるとフィールド単位で処理される
+cp D:/素材/rec_0611_130128.mp4 tests/real/rec_0611_130128_i.mp4
+
+# 2. 主要フレームでクラブヘッドをクリックして正解ラベルを付ける (1 本 2〜3 分)
+python tools/label_club.py tests/real/rec_0611_130128_i.mp4 --frames 100,130,160,175,185,200
+
+# 3. 一括評価。結果は tests/real/results/<日時>_<tag>_<commit>.md に残る (上書きしない)
+python tools/eval_club.py --all --tag before     # 調整前の数値を必ず先に記録する
+#    ... ai/club_tracker.py を調整 ...
+python tools/eval_club.py --all --tag after      # 調整後は別ファイルとして残す
+```
+
+確認動画は `build/club_eval/real/<素材名>/club_tracker_overlay.mp4`。
+評価の詳細と autotrace との比較は `docs/CLUB_TRACKING_EVAL.md`。
+
 ## ビルド
 
 GitHub Actionsで `main` ブランチへのプッシュ時に自動ビルド。
