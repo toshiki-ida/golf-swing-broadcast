@@ -123,7 +123,26 @@ REC 停止 / クリップ切り出し
 | spec | `collect_all('mediapipe')`、`models/` `assets/` `config/` の datas、`ai.*` hiddenimports、excludes に matplotlib |
 | GitHub Actions | 現状は spec を使わず onefile で ffmpeg も未同梱。`setup_assets.py` → `pyinstaller GolfSwingBroadcast.spec` → zip に変更する(Phase 0 の実測後に別途) |
 
-Phase 0 の実測結果は `feature/build-mediapipe` ブランチのコミットメッセージと本書の末尾に追記する。
+### 8.1 Phase 0 実測結果 (2026-10-14, `feature/build-mediapipe` d618099)
+
+環境: Windows 11 / Python 3.11.9 / PyInstaller 6.22 / onedir / ffmpeg 未同梱(`C:\ffmpeg\bin` 不在のため両ビルドとも)。
+
+| 項目 | main の spec | mediapipe 同梱 spec | 差 |
+|---|---|---|---|
+| 配布フォルダ | 319 MB | 467 MB | +148 MB |
+| 内訳(増分) | - | mediapipe 61 / モデル 30 / matplotlib 15 / cv2 contrib 差分 +26 / フォント 10 | |
+| 起動(cold, ウィンドウ出現まで) | 2.5 s | 3.0 s | +0.5 s |
+| 起動(warm) | 1.2 s | 1.3 s | +0.1 s |
+
+- **mediapipe 1.1.0** は numpy 2.4 / opencv-contrib-python 5.0 と共存し、jax を要求しない。
+- **tasks API 互換**: `PoseLandmarker`(VIDEO モード)を venv と frozen exe の両方で実行し、swingcut(0.10.21)の
+  `pose.json` と比較。検出率 100%、座標差は正規化座標で平均 0.0016 / 最大 0.0101(720p で 1〜2 px)。移植は無修正で可。
+- **matplotlib は除外できない**: `mediapipe.tasks.python.vision.__init__` が `drawing_utils` 経由で無条件に import する。
+  除外した frozen ビルドは `ModuleNotFoundError: matplotlib` で落ちることを確認。15 MB は受け入れる。
+- **requirements.txt の日本語コメント**は pip が cp932 で読んで落ちるため、先頭に `# -*- coding: utf-8 -*-` を置いた。
+- app.py は mediapipe を import しないため、起動時間の差は DLL/ファイル数の増加分のみ。
+  Phase 1 でも mediapipe の import はワーカー内で遅延させる(import 自体に約 0.8〜1.7 s)。
+- GitHub Actions は未変更。CI を spec ベース(onedir + zip)に切り替えるのは別コミット。
 
 ## 9. フェーズ
 
