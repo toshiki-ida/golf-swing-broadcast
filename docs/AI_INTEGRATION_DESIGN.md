@@ -154,13 +154,13 @@ REC 停止 / クリップ切り出し
 | クラブヘッド追跡 (骨格基点、torch 不使用) | `ai/club_tracker.py` (評価: `docs/CLUB_TRACKING_EVAL.md`) |
 | 編集タブの「ヘッド軌道を自動生成」「縦型動画 (SNS) 書き出し」 | `ai/edit_hook.py`。app.py の変更は `_build_edit_tab` の 5 行のみ |
 | 自動生成した軌道は手描きと同じ `trajectories/{clip_id}_trajectory.json` に保存 | 既存の点編集・ベジェ・Undo・書き出しがそのまま使える |
-| 縦型動画 (軌道主役、骨格線 / サマリーは設定で ON/OFF) | `ai/sns_render.py`。局面はまず軌道から推定 (`derive_phases`) |
+| 縦型動画 (軌道主役、骨格線 / サマリーは設定で ON/OFF) | `ai/sns_render.py`。局面は軌道由来 (`derive_phases`) と骨格由来を統合 (差 2f 以内なら軌道、以上なら警告して骨格) |
+| swingcut 由来の解析: 手首/ボール ROI の局面、撮影方向の自動判定 (肩幅/胴長)、DTL/正面の指標、rules.yaml コメント | `ai/swing_analyzer.py`、`config/rules.yaml` (正面用ルール追加) |
 | 設定の既定値 (`settings.json["ai"]`) | `ai/config.py` (設定タブ UI は未実装。JSON を直接編集) |
 | 解析結果の置き場 `analysis/{clip_id}/club_track.json` | `ai/store.py` |
 | 実収録素材の一括評価 (`tools/eval_club.py --all`) | 結果は `tests/real/results/` に蓄積 |
 
-未実装: swingcut 由来の局面/指標 (`swing_analyzer`)、フィードバックコメント、ジョブキュー、AI/SNS タブ。
-sns_render の `phases` / `extra_lines` 引数は、将来 `swing_analyzer` の結果を差し込むための口。
+未実装: ジョブキュー、AI/SNS タブ、設定タブの UI、打球音 (Phase 2)。
 
 ## 9. フェーズ
 

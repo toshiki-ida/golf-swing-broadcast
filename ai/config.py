@@ -12,8 +12,8 @@ AI_DEFAULTS = {
     #   auto: fps が 29.97 (29.9〜29.99) なら HFR 2x 録画とみなす (ベースの録画 fps は 59.94 か 29.97 の 2 択)。
     #         30.00 など他の値は実時間 1 倍の素材として扱う。
     "source_kind": "auto",
-    # dtl / face_on  (face_on では骨格指標を出さない)
-    "camera_angle": "dtl",
+    # auto / dtl / face_on。auto はアドレス時の肩幅/胴長の比から推定 (斜めで判定不能なら指標を省く)
+    "camera_angle": "auto",
     # 縦型 (SNS) 書き出し
     "sns": {
         "skeleton": True,       # スロー区間に骨格線を描く (club_track.json に骨格があるときのみ)

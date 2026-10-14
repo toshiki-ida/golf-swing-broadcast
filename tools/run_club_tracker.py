@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from ai.club_tracker import track_club, CONF_OK, R_MIN_RATIO, R_MAX_RATIO  # noqa: E402
+from ai.store import save_club_track  # noqa: E402
 from clip_manager import TrajectoryData  # noqa: E402
 from trajectory import render_trajectory_on_frame  # noqa: E402
 
@@ -62,6 +63,8 @@ pred = {
 }
 (out_dir / "club_tracker.pred.json").write_text(json.dumps(pred, ensure_ascii=False, indent=1),
                                                 encoding="utf-8")
+# 編集タブと同じ形式 (in_frame 基準の相対フレーム + 骨格) も残す → ai.sns_render の --traj に渡せる
+save_club_track(out_dir, res, in_f, str(video))
 
 # --- 確認動画 (インターレース指定時はフィールド展開した 2 倍フレームで書く)
 cap = cv2.VideoCapture(str(video))

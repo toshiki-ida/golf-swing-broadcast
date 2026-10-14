@@ -50,7 +50,8 @@ pyinstaller GolfSwingBroadcast.spec --noconfirm        # → dist/GolfSwingBroad
 | `trajectory.py` | 軌道描画。`TimedSpline`(Catmull-Rom / ベジェ、フレーム同期)、`draw_gradient_trail`、`render_trajectory_on_frame` |
 | `playout.py` | `PlayoutEngine`: プレイリスト、cue/play/pause/seek、先読みリーダースレッド、DeckLink スケジュール出力、playout.json 永続化、exports/ スキャン |
 | `shuttle_pro.py` | ShuttlePRO v2 HID ドライバ(hidapi)。レポート形式自動検出、ジョグ/シャトル/ボタンをコールバック通知 |
-| `ai/` | AI 試作。`club_tracker.py` (骨格基点のクラブヘッド追跡)、`sns_render.py` (縦型動画)、`edit_hook.py` (編集タブの 2 ボタン。app.py からの唯一の入口)、`config.py` (settings.json の "ai" 既定値)、`store.py` (`analysis/{clip_id}/`) |
+| `ai/` | AI 試作。`club_tracker.py` (骨格基点のクラブヘッド追跡)、`swing_analyzer.py` (swingcut 由来の局面・指標・撮影方向判定・rules.yaml コメント)、`sns_render.py` (縦型動画、軌道由来と骨格由来の局面を統合)、`edit_hook.py` (編集タブの 2 ボタン。app.py からの唯一の入口)、`config.py` (settings.json の "ai" 既定値)、`store.py` (`analysis/{clip_id}/`) |
+| `config/rules.yaml` | フィードバックコメントのルール (DTL は swingcut と同じ、`angle: face_on` が正面用)。exe では exe 同階層の config/ を読む |
 | `tools/` | `label_club.py` (正解ラベル)、`eval_club.py` (誤差評価、`--all` で tests/real を一括)、`run_club_tracker.py` / `run_autotrace.py` (予測 JSON + 確認動画) |
 | `docs/AI_INTEGRATION_DESIGN.md` / `docs/CLUB_TRACKING_EVAL.md` | AI 統合設計と、autotrace (YOLO) vs club_tracker の比較評価 |
 | `docs/HFR_double_speed_recording.md` | HFR 2x の設計メモ。**「通常モードは 2 枚中 1 枚を間引いて 29.97fps 録画」と書かれているが現行コードは `recording_frame_divisor=1`、通常モードは 59.94fps 全フレーム録画**。コードが正 |

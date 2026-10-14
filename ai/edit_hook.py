@@ -173,7 +173,7 @@ class EditTools:
             rep = render_sns(
                 clip.source_path, out_path, in_frame=clip.in_frame, out_frame=clip.get_out_frame(),
                 swings=swings, landmarks=landmarks, realtime_factor=factor, options=cfg["sns"],
-                dense_points=dense,
+                dense_points=dense, camera_angle=cfg.get("camera_angle", "auto"),
                 progress=lambda r, m: self._set_status(f"{m} {r * 100:.0f}%"))
             self._set_status(f"完了: {out_path.name} ({rep['frames']}f, {rep['seconds']:.0f}秒)"
                              f"\n{out_dir}", "#88CC88")

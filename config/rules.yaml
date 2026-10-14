@@ -1,0 +1,132 @@
+# SwingCut フィードバックルール(LLM不使用・ルールベース)
+# 閾値(value)とコメント文(comment)はこのファイルを編集して調整する。
+#
+# 利用可能な指標(metric):
+#   spine_angle_address / spine_angle_top / spine_angle_impact : 前傾角(度)
+#   spine_angle_loss  : アドレス→インパクトの前傾角減少量(度・正=起き上がり)
+#   hip_forward_pct   : 腰のボール方向移動量(身長比%・正=ボール側)
+#   head_up_pct       : 頭の上方向移動量(身長比%・正=上)   ※逆は head_down_pct
+#   head_forward_pct  : 頭のボール方向移動量(身長比%・正=ボール側) ※逆は head_back_pct
+#   tempo_ratio       : バックスイング時間 ÷ ダウンスイング時間
+#
+# 書式:
+#   op: ">=" ">" "<=" "<" "between"(between は value: [min, max])
+#   all: に並べた条件はすべて成立で発火(AND)
+#   comment 中の {指標名} は値に置換される(Python format 書式が使える)
+#   priority の小さい順に最大 max_comments 件を採用
+
+max_comments: 3
+
+rules:
+  - id: early_extension
+    priority: 1
+    # 前傾角の起き上がりは2D投影の誤差が出やすいため、前傾角の変化だけで
+    # 判定せず、腰のボール方向への移動量と頭の上下動を併せてAND判定する
+    all:
+      - { metric: spine_angle_loss, op: ">=", value: 6 }
+      - { metric: hip_forward_pct,  op: ">=", value: 3 }
+      - { metric: head_up_pct,      op: ">=", value: 0.5 }
+    comment: "インパクトで上体が起き上がり気味。腰がボール側に{hip_forward_pct:.1f}%出ています"
+
+  - id: posture_kept
+    priority: 2
+    all:
+      - { metric: spine_angle_loss, op: "<", value: 4 }
+      - { metric: hip_forward_pct,  op: "<", value: 3 }
+    comment: "前傾角のキープが良好です(変化は{spine_angle_loss:.1f}度)"
+
+  - id: head_drop
+    priority: 3
+    all:
+      - { metric: head_down_pct, op: ">=", value: 3 }
+    comment: "頭が{head_down_pct:.1f}%沈み込んでいます。ミート率の低下に注意"
+
+  - id: head_pull_back
+    priority: 3
+    all:
+      - { metric: head_back_pct, op: ">=", value: 2 }
+    comment: "頭がボールから遠ざかる方向に{head_back_pct:.1f}%動いています(伸び上がりの兆候)"
+
+  - id: tempo_ideal
+    priority: 4
+    all:
+      - { metric: tempo_ratio, op: "between", value: [2.5, 3.5] }
+    comment: "テンポ{tempo_ratio:.2f}:1は理想的(目安は3:1)"
+
+  - id: tempo_slow
+    priority: 4
+    all:
+      - { metric: tempo_ratio, op: ">", value: 3.5 }
+    comment: "バックスイングがゆったりめ(テンポ{tempo_ratio:.2f}:1、目安は3:1)"
+
+  - id: tempo_quick
+    priority: 4
+    all:
+      - { metric: tempo_ratio, op: "<", value: 2.5 }
+    comment: "切り返しが早め(テンポ{tempo_ratio:.2f}:1、目安は3:1)"
+
+# ---------------------------------------------------------------------------
+# 正面 (フェースオン) 用ルール。angle: face_on を付ける (省略時は dtl 扱い)。
+# 利用可能な指標:
+#   head_sway_top_pct       : トップで頭がターゲットと逆側 (後ろ) に流れた量 (身長比%・正=後ろ)
+#   head_target_impact_pct  : インパクトで頭がターゲット側に動いた量 (身長比%・正=ターゲット側)
+#   hip_shift_pct           : アドレス→インパクトの腰のターゲット側移動量 (身長比%)
+#   axis_tilt_impact_deg    : インパクト時の軸 (肩中点-腰中点) の傾き (度・正=ターゲットと逆側に傾く)
+#   tempo_ratio             : バックスイング時間 ÷ ダウンスイング時間
+
+  - id: sway
+    angle: face_on
+    priority: 1
+    all:
+      - { metric: head_sway_top_pct, op: ">=", value: 4 }
+    comment: "トップで頭がターゲットと逆側に{head_sway_top_pct:.1f}%流れています(スウェー)"
+
+  - id: head_stable
+    angle: face_on
+    priority: 2
+    all:
+      - { metric: head_sway_top_pct, op: "between", value: [-2, 2.5] }
+      - { metric: head_target_impact_pct, op: "between", value: [-2.5, 2.5] }
+    comment: "頭の左右の動きが小さく安定しています"
+
+  - id: weight_shift_lack
+    angle: face_on
+    priority: 2
+    all:
+      - { metric: hip_shift_pct, op: "<", value: 2 }
+    comment: "インパクトで腰のターゲット側への移動が{hip_shift_pct:.1f}%と少なめ(体重移動の不足)"
+
+  - id: weight_shift_good
+    angle: face_on
+    priority: 3
+    all:
+      - { metric: hip_shift_pct, op: "between", value: [3, 10] }
+    comment: "腰がターゲット側に{hip_shift_pct:.1f}%移動。体重移動は良好です"
+
+  - id: axis_back_too_much
+    angle: face_on
+    priority: 2
+    all:
+      - { metric: axis_tilt_impact_deg, op: ">=", value: 14 }
+    comment: "インパクトで軸が後ろに{axis_tilt_impact_deg:.1f}°傾きすぎ(すくい打ちの傾向)"
+
+  - id: axis_forward
+    angle: face_on
+    priority: 2
+    all:
+      - { metric: axis_tilt_impact_deg, op: "<", value: -3 }
+    comment: "インパクトで軸がターゲット側に倒れています(突っ込み)"
+
+  - id: head_forward_impact
+    angle: face_on
+    priority: 3
+    all:
+      - { metric: head_target_impact_pct, op: ">=", value: 4 }
+    comment: "インパクトで頭がターゲット側に{head_target_impact_pct:.1f}%動いています"
+
+  - id: tempo_ideal_face
+    angle: face_on
+    priority: 4
+    all:
+      - { metric: tempo_ratio, op: "between", value: [2.5, 3.5] }
+    comment: "テンポ{tempo_ratio:.2f}:1は理想的(目安は3:1)"
