@@ -1,6 +1,6 @@
 {
   "sample_30fps.mp4": {
-    "video": "C:/Users/yoshi/Desktop/swingcut/output/sample/sample_30fps.mp4",
+    "video": "tests/real/sample_30fps.mp4",
     "width": 720,
     "height": 1280,
     "fps": 30.0,
@@ -36,11 +36,12 @@
         "y": 523,
         "phase": "follow"
       }
-    }
+    },
+    "source": "swingcut の input/sample.mov を 30fps に正規化したもの (リポジトリには含めない)"
   },
   "IMG_1095_1080p.mp4": {
-    "video": "C:/Users/yoshi/Desktop/golf-swing-broadcast/build/club_eval/src/IMG_1095_1080p.mp4",
-    "source": "C:/Users/yoshi/Documents/swingcut/IMG_1095/IMG_1095_30fps.mp4 (2160x3840) を 1080x1920 に縮小",
+    "video": "tests/real/IMG_1095_1080p.mp4",
+    "source": "iPhone 撮影 IMG_1095 (2160x3840/30p) を 1080x1920 に縮小したもの (リポジトリには含めない)",
     "width": 1080,
     "height": 1920,
     "fps": 30.0,
