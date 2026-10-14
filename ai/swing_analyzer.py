@@ -319,9 +319,12 @@ def compute_metrics(tracks, phases, W, H, real_fps, angle, target_sign=1):
 # ---------------------------------------------------------------- コメント (rules.yaml)
 
 def rules_path() -> Path:
+    """rules.yaml の場所。exe では exe 同階層の config/ (編集可能) を優先し、無ければ同梱 (_internal/config)。"""
     import sys
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent / "config" / "rules.yaml"   # exe 同階層 (編集可能)
+        beside = Path(sys.executable).parent / "config" / "rules.yaml"
+        if beside.exists():
+            return beside
     return resource_root() / "config" / "rules.yaml"
 
 

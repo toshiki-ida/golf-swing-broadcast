@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-import glob, importlib, os
+import glob, importlib, os, shutil
 from PyInstaller.utils.hooks import collect_all
 _ctk_dir = os.path.dirname(importlib.import_module('customtkinter').__file__)
 
@@ -16,26 +16,51 @@ _mp_datas, _mp_binaries, _mp_hiddenimports = collect_all('mediapipe')
 _mp_hiddenimports += ['mediapipe', 'mediapipe.tasks.python',
                       'mediapipe.tasks.python.vision']
 
+# ai パッケージは app.py から関数内 import (try/except) で読まれるため明示する
+_ai_hiddenimports = ['ai', 'ai.config', 'ai.store', 'ai.edit_hook', 'ai.club_tracker',
+                     'ai.swing_analyzer', 'ai.sns_render', 'ai.selftest',
+                     'yaml', 'scipy.signal', 'scipy.interpolate', 'PIL.ImageFont', 'PIL.ImageDraw']
+
 # AI アセット (setup_assets.py で取得)。存在するものだけ同梱する。
+# config/ (rules.yaml) は _internal/config に入れる。exe 同階層に config/ を置けばそちらが優先される
+# (ai.swing_analyzer.rules_path 参照)。
 _asset_datas = []
 for _src, _dst in [('models', 'models'), (os.path.join('assets', 'fonts'), os.path.join('assets', 'fonts')),
                    ('config', 'config')]:
     if os.path.isdir(_src):
         _asset_datas.append((_src, _dst))
 
-# ffmpeg 同梱 (EXEフォルダだけで動作するように)
-_ffmpeg_dir = r'C:\ffmpeg\bin'
-_ffmpeg_files = [(f, '.') for f in
-                 glob.glob(os.path.join(_ffmpeg_dir, 'ffmpeg.exe')) +
-                 glob.glob(os.path.join(_ffmpeg_dir, '*.dll'))
-                 if os.path.exists(f)]
+# ffmpeg / ffprobe 同梱 (EXEフォルダだけで動作するように)
+#   1. C:\ffmpeg\bin (従来の固定パス)
+#   2. PATH 上の ffmpeg (winget の Gyan.FFmpeg はシンボリックリンクなので実体に辿る)
+# どちらにも無ければ同梱しない (録画・書き出しは実行時に PATH の ffmpeg を探す)。
+def _find_ffmpeg_dir():
+    fixed = r'C:\ffmpeg\bin'
+    if os.path.exists(os.path.join(fixed, 'ffmpeg.exe')):
+        return fixed
+    exe = shutil.which('ffmpeg')
+    if exe:
+        return os.path.dirname(os.path.realpath(exe))
+    return None
+
+_ffmpeg_dir = _find_ffmpeg_dir()
+_ffmpeg_files = []
+if _ffmpeg_dir:
+    _ffmpeg_files = [(f, '.') for f in
+                     glob.glob(os.path.join(_ffmpeg_dir, 'ffmpeg.exe')) +
+                     glob.glob(os.path.join(_ffmpeg_dir, 'ffprobe.exe')) +
+                     glob.glob(os.path.join(_ffmpeg_dir, '*.dll'))
+                     if os.path.exists(f)]
+    print(f'[spec] ffmpeg: {_ffmpeg_dir} ({len(_ffmpeg_files)} files)')
+else:
+    print('[spec] ffmpeg が見つかりません。同梱しません')
 
 a = Analysis(
     ['app.py'],
     pathex=[],
     binaries=_np_binaries + _sp_binaries + _mp_binaries + _ffmpeg_files,
     datas=[(_ctk_dir, 'customtkinter')] + _np_datas + _sp_datas + _mp_datas + _asset_datas,
-    hiddenimports=['comtypes.stream'] + _np_hiddenimports + _sp_hiddenimports + _mp_hiddenimports,
+    hiddenimports=['comtypes.stream'] + _np_hiddenimports + _sp_hiddenimports + _mp_hiddenimports + _ai_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

@@ -125,6 +125,13 @@ clips.json / playout.json / settings.json
 - ラベル (`tests/club_labels.json`) は評価中に動かさない。直す場合は別コミットで理由を書く。
 - 現在のラベルは Claude の目視 (sample / IMG_1095 の 12 点)。実収録素材のラベルはオーナーが付ける。
 
+## ブランチ運用ルール
+
+- **main への直接 push は禁止。** 作業は必ず `feature/*` ブランチで行い、Pull Request で提出する。
+- ローカルには `.git/hooks/pre-push` を入れて main への push をブロックする(`tools/install_hooks.py` で設置)。
+- `feature/*` への push は CI を起動しない(`.github/workflows/build.yml` は main への push と手動実行のみ)。
+- Public リポジトリなので、push 前に動画・画像・モデル・フォント・個人のパスや名前が入っていないか `git ls-files` で確認する。
+
 ## 依存関係 (`requirements.txt`)
 
 opencv-python / numpy / scipy / customtkinter / Pillow / comtypes / hidapi。

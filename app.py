@@ -5093,7 +5093,16 @@ def main():
     parser = argparse.ArgumentParser(description="Golf Swing Broadcast System")
     parser.add_argument("--project", type=str, default=None,
                         help="プロジェクトフォルダパス")
+    parser.add_argument("--ai-selftest", nargs=2, metavar=("VIDEO", "OUT_DIR"), default=None,
+                        help="AI 機能の動作確認 (軌道自動生成 → 縦型書き出し) を実行して終了")
+    parser.add_argument("--in", dest="in_frame", type=int, default=0)
+    parser.add_argument("--out", dest="out_frame", type=int, default=-1)
     args = parser.parse_args()
+
+    if args.ai_selftest:
+        from ai.selftest import run_selftest
+        sys.exit(run_selftest(GolfBroadcastApp, args.ai_selftest[0], args.ai_selftest[1],
+                              args.in_frame, args.out_frame))
 
     app = GolfBroadcastApp(project_dir=args.project)
     app.mainloop()
