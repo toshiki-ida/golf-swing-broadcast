@@ -7,6 +7,22 @@ _ctk_dir = os.path.dirname(importlib.import_module('customtkinter').__file__)
 _np_datas, _np_binaries, _np_hiddenimports = collect_all('numpy')
 _sp_datas, _sp_binaries, _sp_hiddenimports = collect_all('scipy')
 
+# MediaPipe (AI 解析用)。tasks API は .binarypb / .so 等のデータファイルを
+# パッケージ内から読むため collect_all で丸ごと同梱する。
+# app.py は mediapipe を直接 import しないので hiddenimports でも明示する。
+# matplotlib (約 15 MB) は mediapipe.tasks.python.vision.__init__ が無条件に import する
+# ため除外できない (除外すると frozen 環境で `from mediapipe.tasks.python import vision` が失敗する)。
+_mp_datas, _mp_binaries, _mp_hiddenimports = collect_all('mediapipe')
+_mp_hiddenimports += ['mediapipe', 'mediapipe.tasks.python',
+                      'mediapipe.tasks.python.vision']
+
+# AI アセット (setup_assets.py で取得)。存在するものだけ同梱する。
+_asset_datas = []
+for _src, _dst in [('models', 'models'), (os.path.join('assets', 'fonts'), os.path.join('assets', 'fonts')),
+                   ('config', 'config')]:
+    if os.path.isdir(_src):
+        _asset_datas.append((_src, _dst))
+
 # ffmpeg 同梱 (EXEフォルダだけで動作するように)
 _ffmpeg_dir = r'C:\ffmpeg\bin'
 _ffmpeg_files = [(f, '.') for f in
@@ -17,9 +33,9 @@ _ffmpeg_files = [(f, '.') for f in
 a = Analysis(
     ['app.py'],
     pathex=[],
-    binaries=_np_binaries + _sp_binaries + _ffmpeg_files,
-    datas=[(_ctk_dir, 'customtkinter')] + _np_datas + _sp_datas,
-    hiddenimports=['comtypes.stream'] + _np_hiddenimports + _sp_hiddenimports,
+    binaries=_np_binaries + _sp_binaries + _mp_binaries + _ffmpeg_files,
+    datas=[(_ctk_dir, 'customtkinter')] + _np_datas + _sp_datas + _mp_datas + _asset_datas,
+    hiddenimports=['comtypes.stream'] + _np_hiddenimports + _sp_hiddenimports + _mp_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
