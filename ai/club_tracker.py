@@ -100,18 +100,23 @@ class ClubTrackResult:
                          min_gap: float = 2.0) -> list:
         """確信点だけを、編集タブの制御点として使える点数に間引いて返す。"""
         good = [p for p in self.points if self.conf.get(p[2], 0.0) >= min_conf]
+        # 先頭/末尾の静止保持点 (アドレス・フィニッシュ) は位置として正しいので制御点に含める
+        if self.points and self.conf.get(self.points[0][2], 0.0) == HOLD_CONF and                 (not good or good[0][2] != self.points[0][2]):
+            good.insert(0, self.points[0])
+        if self.points and self.conf.get(self.points[-1][2], 0.0) == HOLD_CONF and                 (not good or good[-1][2] != self.points[-1][2]):
+            good.append(self.points[-1])
         if len(good) < 2:
             return list(self.points[:: max(1, len(self.points) // max_pts)])
-        out = [good[0]]
-        for p in good[1:]:
-            if p[2] - out[-1][2] >= min_gap:
-                out.append(p)
-        if out[-1][2] != good[-1][2]:
-            out.append(good[-1])
-        if len(out) > max_pts:
-            idx = np.linspace(0, len(out) - 1, max_pts).round().astype(int)
-            out = [out[i] for i in sorted(set(idx.tolist()))]
-        return out
+        # 信頼度の高い点から貪欲に採用し (min_gap 以内の近接点は捨てる)、最後にフレーム順に並べる。
+        # 先頭・末尾は必ず残す
+        ends = [good[0], good[-1]]
+        chosen = list(ends)
+        for p in sorted(good[1:-1], key=lambda q: -self.conf.get(q[2], 0.0)):
+            if len(chosen) >= max_pts:
+                break
+            if all(abs(p[2] - q[2]) >= min_gap for q in chosen):
+                chosen.append(p)
+        return sorted(chosen, key=lambda q: q[2])
 
     def weak_ranges(self, min_conf: float = CONF_OK, min_len: int = 3) -> list:
         """観測できなかった連続区間 [(開始, 終了), ...] (オペレーターの手直し箇所)。"""
@@ -481,5 +486,7 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
     res.detect_seconds = t_detect
     res.raw = {frame_ids[k]: v for k, v in raw.items()}   # 補間前の観測値 (診断用)
     res.trace = {frame_ids[k]: v for k, v in trace.items()}
+    # 骨格 33 点 (欠測補間済み、元解像度 px)。縦型書き出しの骨格線・クロップに使う
+    res.landmarks = {frame_ids[i]: (arr[i] * inv).tolist() for i in range(T)}
     report(1.0, "完了")
     return res

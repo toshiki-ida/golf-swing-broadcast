@@ -50,6 +50,9 @@ pyinstaller GolfSwingBroadcast.spec --noconfirm        # → dist/GolfSwingBroad
 | `trajectory.py` | 軌道描画。`TimedSpline`(Catmull-Rom / ベジェ、フレーム同期)、`draw_gradient_trail`、`render_trajectory_on_frame` |
 | `playout.py` | `PlayoutEngine`: プレイリスト、cue/play/pause/seek、先読みリーダースレッド、DeckLink スケジュール出力、playout.json 永続化、exports/ スキャン |
 | `shuttle_pro.py` | ShuttlePRO v2 HID ドライバ(hidapi)。レポート形式自動検出、ジョグ/シャトル/ボタンをコールバック通知 |
+| `ai/` | AI 試作。`club_tracker.py` (骨格基点のクラブヘッド追跡)、`sns_render.py` (縦型動画)、`edit_hook.py` (編集タブの 2 ボタン。app.py からの唯一の入口)、`config.py` (settings.json の "ai" 既定値)、`store.py` (`analysis/{clip_id}/`) |
+| `tools/` | `label_club.py` (正解ラベル)、`eval_club.py` (誤差評価、`--all` で tests/real を一括)、`run_club_tracker.py` / `run_autotrace.py` (予測 JSON + 確認動画) |
+| `docs/AI_INTEGRATION_DESIGN.md` / `docs/CLUB_TRACKING_EVAL.md` | AI 統合設計と、autotrace (YOLO) vs club_tracker の比較評価 |
 | `docs/HFR_double_speed_recording.md` | HFR 2x の設計メモ。**「通常モードは 2 枚中 1 枚を間引いて 29.97fps 録画」と書かれているが現行コードは `recording_frame_divisor=1`、通常モードは 59.94fps 全フレーム録画**。コードが正 |
 | `NOTION_DOC.md` / `README.md` | 利用者向け概要。行数表などは古い |
 
@@ -111,6 +114,15 @@ clips.json / playout.json / settings.json
 - `os.environ["OPENCV_FFMPEG_THREAD_COUNT"] = "1"` を cv2 import 前に設定している(mp4v マルチスレッドデコードのクラッシュ対策)。外さない。
 - ログは `print` 中心。`playout` ロガーだけ DEBUG。
 - 日本語 UI。フォントは Meiryo UI。CustomTkinter の dark テーマ。
+
+## 追跡精度の評価ルール (club_tracker を触るとき)
+
+- **調整前の数値を必ず先に記録する**: `python tools/eval_club.py --all --tag before` を実行し、
+  `tests/real/results/<日時>_before_<commit>.md` をコミットしてから `ai/club_tracker.py` を変更する。
+- 調整後は `--tag after` で別ファイルに残す。結果ファイルは上書き・削除しない(履歴が比較材料)。
+- 既存素材で下がった項目があれば、良くなった項目と一緒に報告する。平均だけでなく最大誤差を見る。
+- ラベル (`tests/club_labels.json`) は評価中に動かさない。直す場合は別コミットで理由を書く。
+- 現在のラベルは Claude の目視 (sample / IMG_1095 の 12 点)。実収録素材のラベルはオーナーが付ける。
 
 ## 依存関係 (`requirements.txt`)
 

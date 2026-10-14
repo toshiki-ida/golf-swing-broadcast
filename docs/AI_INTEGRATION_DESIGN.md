@@ -144,6 +144,24 @@ REC 停止 / クリップ切り出し
   Phase 1 でも mediapipe の import はワーカー内で遅延させる(import 自体に約 0.8〜1.7 s)。
 - GitHub Actions は未変更。CI を spec ベース(onedir + zip)に切り替えるのは別コミット。
 
+## 8.2 実装状況 (2026-10-14, feature/ai-analysis)
+
+優先順位の変更 (軌道自動描画が最優先) に伴い、§4〜§6 の「AI/SNS タブ + jobs/store/panel」より先に、
+編集タブへの最小フックで動くところまで実装した。
+
+| 実装済み | 場所 |
+|---|---|
+| クラブヘッド追跡 (骨格基点、torch 不使用) | `ai/club_tracker.py` (評価: `docs/CLUB_TRACKING_EVAL.md`) |
+| 編集タブの「ヘッド軌道を自動生成」「縦型動画 (SNS) 書き出し」 | `ai/edit_hook.py`。app.py の変更は `_build_edit_tab` の 5 行のみ |
+| 自動生成した軌道は手描きと同じ `trajectories/{clip_id}_trajectory.json` に保存 | 既存の点編集・ベジェ・Undo・書き出しがそのまま使える |
+| 縦型動画 (軌道主役、骨格線 / サマリーは設定で ON/OFF) | `ai/sns_render.py`。局面はまず軌道から推定 (`derive_phases`) |
+| 設定の既定値 (`settings.json["ai"]`) | `ai/config.py` (設定タブ UI は未実装。JSON を直接編集) |
+| 解析結果の置き場 `analysis/{clip_id}/club_track.json` | `ai/store.py` |
+| 実収録素材の一括評価 (`tools/eval_club.py --all`) | 結果は `tests/real/results/` に蓄積 |
+
+未実装: swingcut 由来の局面/指標 (`swing_analyzer`)、フィードバックコメント、ジョブキュー、AI/SNS タブ。
+sns_render の `phases` / `extra_lines` 引数は、将来 `swing_analyzer` の結果を差し込むための口。
+
 ## 9. フェーズ
 
 | Phase | 内容 | ブランチ |

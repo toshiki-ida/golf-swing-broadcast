@@ -5,6 +5,14 @@ tests/club_labels.json (tools/label_club.py で作成) と、各手法が出力�
 使い方:
     python tools/eval_club.py <予測JSON ...>
     python tools/eval_club.py build/club_eval/*/*.pred.json
+    python tools/eval_club.py --all [--tag before|after|<任意>] [--no-run] [--interlaced]
+
+--all: tests/real/ にある動画のうち tests/club_labels.json にラベルがあるものを
+       すべて ai/club_tracker.py で追跡し (build/club_eval/real/<名前>/)、評価して
+       tests/real/results/<日時>_<tag>_<commit>.md に結果を残す (既存ファイルは上書きしない)。
+       --no-run は追跡を省略して既存の予測で評価だけ行う。
+       --interlaced は 1080i 素材をフィールド単位で処理する (ファイル名に "_i" か
+       ラベルに "interlaced": true があれば自動で付く)。
 
 予測 JSON の形式 (手法ごとに 1 ファイル):
     {
@@ -52,15 +60,84 @@ def predict_at(points: list, frame: float):
     return float(np.interp(frame, fs, xs)), float(np.interp(frame, fs, ys)), True
 
 
+REAL_DIR = ROOT / "tests" / "real"
+VIDEO_EXTS = (".mp4", ".mov", ".mxf", ".mkv", ".avi")
+
+
+def run_all(args: list) -> int:
+    """tests/real/ の素材を一括で追跡・評価し、結果を tests/real/results/ に残す。"""
+    import datetime
+    import io
+    import subprocess
+    from contextlib import redirect_stdout
+
+    tag = args[args.index("--tag") + 1] if "--tag" in args else "run"
+    no_run = "--no-run" in args
+    force_i = "--interlaced" in args
+    labels = json.loads(LABELS_PATH.read_text(encoding="utf-8")) if LABELS_PATH.exists() else {}
+    videos = sorted(p for p in REAL_DIR.glob("*") if p.suffix.lower() in VIDEO_EXTS) if REAL_DIR.exists() else []
+    if not videos:
+        print(f"素材がありません: {REAL_DIR} に動画を置き、tools/label_club.py でラベルを付けてください")
+        return 1
+    preds = []
+    for v in videos:
+        if v.name not in labels:
+            print(f"[skip] {v.name}: ラベルなし (tools/label_club.py {v} --frames ...)")
+            continue
+        out_dir = ROOT / "build" / "club_eval" / "real" / v.stem
+        pred = out_dir / "club_tracker.pred.json"
+        inter = force_i or "_i" in v.stem.lower() or bool(labels[v.name].get("interlaced"))
+        if not no_run or not pred.exists():
+            cmd = [sys.executable, str(ROOT / "tools" / "run_club_tracker.py"), str(v), str(out_dir)]
+            if inter:
+                cmd.append("--interlaced")
+            print(f"[run ] {v.name}{' (interlaced)' if inter else ''}")
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            tail = [ln for ln in r.stdout.splitlines() if ln.startswith("[club_tracker]")]
+            print("       " + (tail[-2] if len(tail) >= 2 else r.stdout[-300:] + r.stderr[-300:]))
+        if pred.exists():
+            preds.append(str(pred))
+    if not preds:
+        return 1
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        rc = evaluate(preds)
+    text = buf.getvalue()
+    print(text)
+    try:
+        commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
+                                cwd=ROOT).stdout.strip() or "nogit"
+        dirty = "+dirty" if subprocess.run(["git", "status", "--porcelain", "ai/", "tools/"],
+                                           capture_output=True, text=True, cwd=ROOT).stdout.strip() else ""
+    except Exception:
+        commit, dirty = "nogit", ""
+    res_dir = REAL_DIR / "results"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    out = res_dir / f"{stamp}_{tag}_{commit}{dirty}.md"
+    header = f"# club_tracker 評価 ({stamp}, tag={tag}, commit={commit}{dirty})"
+    body = "素材: " + ", ".join(Path(p).parent.name for p in preds)
+    out.write_text(header + "\n\n" + body + "\n\n```\n" + text + "\n```\n",
+                   encoding="utf-8")
+    print(f"結果を保存: {out}")
+    return rc
+
+
 def main() -> int:
+    if "--all" in sys.argv[1:]:
+        return run_all(sys.argv[1:])
     paths = [Path(a) for a in sys.argv[1:]]
     if not paths or not LABELS_PATH.exists():
         print(__doc__)
         if not LABELS_PATH.exists():
             print(f"ラベルがありません: {LABELS_PATH} (先に tools/label_club.py)")
         return 1
-    labels = json.loads(LABELS_PATH.read_text(encoding="utf-8"))
+    return evaluate([str(p) for p in paths])
 
+
+def evaluate(pred_paths: list) -> int:
+    labels = json.loads(LABELS_PATH.read_text(encoding="utf-8"))
+    paths = [Path(p) for p in pred_paths]
     preds = []
     for p in paths:
         d = json.loads(p.read_text(encoding="utf-8"))

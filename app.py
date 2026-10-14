@@ -2000,6 +2000,13 @@ class GolfBroadcastApp(ctk.CTk):
         self.edit_swing_label = ctk.CTkLabel(edit_scroll, text="Swing 1 (0 pts)")
         self.edit_swing_label.pack(padx=10, pady=5)
 
+        # AI 試作 (ヘッド軌道の自動生成 / 縦型書き出し)。ai パッケージが無くても編集タブは動く
+        try:
+            from ai.edit_hook import attach_edit_tools
+            self.ai_edit_tools = attach_edit_tools(self, edit_scroll)
+        except Exception as e:
+            print(f"[AI] 編集タブ拡張をスキップ: {e}")
+
         # 編集状態
         self._edit_clip_id = None
         self._edit_cache = None
