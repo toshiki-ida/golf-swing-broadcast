@@ -39,6 +39,8 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))   # ai / clip_manager を import するため
 LABELS_PATH = ROOT / "tests" / "club_labels.json"
 PHASE_ORDER = ["address", "takeaway", "top", "downswing", "impact", "follow"]
 
@@ -64,6 +66,84 @@ REAL_DIR = ROOT / "tests" / "real"
 VIDEO_EXTS = (".mp4", ".mov", ".mxf", ".mkv", ".avi")
 
 
+def track_summary(video: Path, out_dir: Path) -> dict:
+    """1 本分の追跡率と局面検出 (軌道由来 / 骨格由来 / 統合) をまとめる。club_tracker や analyzer は変更せず呼ぶだけ。"""
+    import logging
+    row = {"name": video.name}
+    pred_path = out_dir / "club_tracker.pred.json"
+    track_path = out_dir / "club_track.json"
+    if not pred_path.exists():
+        row["error"] = "追跡失敗 (出力なし)"
+        return row
+    pred = json.loads(pred_path.read_text(encoding="utf-8"))
+    conf = pred.get("conf", {})
+    row.update({"frames": len(pred.get("points", [])), "observed": len(pred.get("raw", {})),
+                "confident": sum(1 for v in conf.values() if v >= 1.5),
+                "weak": len(pred.get("weak_ranges", [])), "seconds": pred.get("seconds")})
+    try:
+        import cv2
+        cap = cv2.VideoCapture(str(video))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        W, H, n = int(cap.get(3)), int(cap.get(4)), int(cap.get(7))
+        cap.release()
+        row["video_frames"] = n
+        from clip_manager import TrajectoryData
+        from ai.config import realtime_factor
+        from ai.sns_render import derive_phases, fuse_phases
+        from ai.store import landmarks_from_track
+        from ai.swing_analyzer import analyze
+        track = json.loads(track_path.read_text(encoding="utf-8")) if track_path.exists() else None
+        dense = [tuple(p) for p in (track or pred)["points"]]
+        swings = [TrajectoryData(points=[tuple(p) for p in pred["confident_points"]])]
+        traj = derive_phases(swings, 0, dense)
+        row["traj_phases"] = traj
+        lm = landmarks_from_track(track)
+        warnings = []
+        if lm:
+            factor = realtime_factor(fps, "auto")
+            logging.getLogger("swing_analyzer").setLevel(logging.ERROR)
+            logging.getLogger("sns_render").setLevel(logging.ERROR)
+            a = analyze(lm, W, H, fps, fps * factor, video_path=str(video), in_frame=0, dense_points=dense)
+            row["skel_phases"] = a["phases"]
+            row["camera"] = f"{a['camera']['angle']} ({a['camera']['ratio']:.2f}, {a['camera']['confidence']:.2f})"
+            row["impact_method"] = a["impact"]["chosen"]
+            row["swing_frames"] = a["phases"]["finish"] - a["phases"]["address"]
+            warnings += a["warnings"]
+            fused, src = fuse_phases(traj, a["phases"], warnings)
+            row["fused"] = fused
+            row["fused_src"] = src
+        row["warnings"] = warnings
+    except Exception as e:
+        row["analyze_error"] = f"{type(e).__name__}: {e}"
+    return row
+
+
+def format_summary(rows: list) -> str:
+    lines = ["=== 追跡率・局面検出 (全素材) ===",
+             f"{'素材':<22} {'動画f':>6} {'観測':>6} {'確信':>6} {'率':>6} {'欠測':>5} {'秒':>5}  "
+             f"{'軌道 top/imp':<13} {'骨格 top/imp':<13} {'採用':<10} {'ｽｲﾝｸﾞf':>7} {'撮影方向 (比, 信頼度)':<24} 警告"]
+    for r in rows:
+        if "error" in r:
+            lines.append(f"{r['name']:<22} {r['error']}")
+            continue
+        rate = f"{100 * r['observed'] / max(1, r.get('video_frames', r['frames'])):.0f}%"
+        tp = r.get("traj_phases") or {}
+        sp = r.get("skel_phases") or {}
+        src = r.get("fused_src") or {}
+        warn = "; ".join(r.get("warnings", []))
+        if r.get("analyze_error"):
+            warn = (warn + "; " if warn else "") + r["analyze_error"]
+        tps = f"{tp.get('top', '-')}/{tp.get('impact', '-')}" if tp else "-"
+        sps = f"{sp.get('top', '-')}/{sp.get('impact', '-')}" if sp else "-"
+        srcs = f"{str(src.get('top', '-'))[:4]}/{str(src.get('impact', '-'))[:4]}" if src else "-"
+        lines.append(f"{r['name']:<22} {r.get('video_frames', '?'):>6} {r['observed']:>6} {r['confident']:>6} {rate:>6} {r['weak']:>5} "
+                     f"{(r.get('seconds') or 0):>5.0f}  {tps:<13} {sps:<13} {srcs:<10} {str(r.get('swing_frames', '-')):>7} "
+                     f"{r.get('camera', '-'):<24} {warn}")
+    lines.append("観測 = 位置を観測できたフレーム数、確信 = 信頼度 1.5 以上、率 = 観測/動画フレーム、欠測 = 欠測区間の数。"
+                 "採用 = 統合後の出所 (traj=軌道 / skel=骨格)。ｽｲﾝｸﾞf = 骨格由来のアドレス→フィニッシュのフレーム数。")
+    return chr(10).join(lines)
+
+
 def run_all(args: list) -> int:
     """tests/real/ の素材を一括で追跡・評価し、結果を tests/real/results/ に残す。"""
     import datetime
@@ -80,30 +160,37 @@ def run_all(args: list) -> int:
         print(f"素材がありません: {REAL_DIR} に動画を置き、tools/label_club.py でラベルを付けてください")
         return 1
     preds = []
+    summary_rows = []   # 全素材の追跡率・局面・警告 (ラベルの有無によらず)
     for v in videos:
-        if v.name not in labels:
-            print(f"[skip] {v.name}: ラベルなし (tools/label_club.py {v} --frames ...)")
-            continue
         out_dir = ROOT / "build" / "club_eval" / "real" / v.stem
         pred = out_dir / "club_tracker.pred.json"
-        inter = force_i or "_i" in v.stem.lower() or bool(labels[v.name].get("interlaced"))
+        lab = labels.get(v.name, {})
+        inter = force_i or "_i" in v.stem.lower() or bool(lab.get("interlaced"))
         if not no_run or not pred.exists():
             cmd = [sys.executable, str(ROOT / "tools" / "run_club_tracker.py"), str(v), str(out_dir)]
             if inter:
                 cmd.append("--interlaced")
-            print(f"[run ] {v.name}{' (interlaced)' if inter else ''}")
+            print(f"[run ] {v.name}{' (interlaced)' if inter else ''}", flush=True)
             r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             tail = [ln for ln in r.stdout.splitlines() if ln.startswith("[club_tracker]")]
-            print("       " + (tail[-2] if len(tail) >= 2 else r.stdout[-300:] + r.stderr[-300:]))
-        if pred.exists():
+            print("       " + (tail[-2] if len(tail) >= 2 else (r.stdout[-300:] + r.stderr[-300:]).strip()), flush=True)
+        summary_rows.append(track_summary(v, out_dir))
+        if v.name in labels and pred.exists():
             preds.append(str(pred))
+        elif v.name not in labels:
+            print(f"       ラベルなし → 追跡率と確認動画のみ ({out_dir / 'club_tracker_overlay.mp4'})", flush=True)
+    summary_text = format_summary(summary_rows)
+    print(summary_text)
     if not preds:
-        return 1
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        rc = evaluate(preds)
-    text = buf.getvalue()
-    print(text)
+        text = "(正解ラベルのある素材がないため誤差評価なし)"
+        rc = 0
+    else:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = evaluate(preds)
+        text = buf.getvalue()
+        print(text)
+    text = summary_text + chr(10) + chr(10) + text
     try:
         commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True,
                                 cwd=ROOT).stdout.strip() or "nogit"
@@ -116,7 +203,7 @@ def run_all(args: list) -> int:
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
     out = res_dir / f"{stamp}_{tag}_{commit}{dirty}.md"
     header = f"# club_tracker 評価 ({stamp}, tag={tag}, commit={commit}{dirty})"
-    body = "素材: " + ", ".join(Path(p).parent.name for p in preds)
+    body = f"素材: {len(summary_rows)} 本 (正解ラベルあり {len(preds)} 本)"
     out.write_text(header + "\n\n" + body + "\n\n```\n" + text + "\n```\n",
                    encoding="utf-8")
     print(f"結果を保存: {out}")
