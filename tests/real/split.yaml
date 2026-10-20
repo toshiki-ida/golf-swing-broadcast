@@ -14,7 +14,7 @@ tune:
   rec_0611_161853.mp4: ok
   rec_0611_130035.mp4: trajectory   # 終盤ズームで身長代替値が膨らむ
   rec_0611_161732.mp4: trajectory   # 追跡率 19%、後ろの 2 人に引かれた疑い
-  rec_0611_135231.mp4: trajectory   # 引きの画、人物 390px
+  rec_0612_135231.mp4: trajectory   # 引きの画、人物 390px (59.94p)
   rec_0611_162742.mp4: trajectory   # 長尺・スイング 2 回 (切り出し後に再評価)
   rec_0611_141938.mp4: phase        # 骨格トップが遅い
   rec_0611_162655.mp4: phase
