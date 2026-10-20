@@ -15,3 +15,5 @@ build/
 # setup_assets.py で取得するアセット (数十MB。exe には spec が同梱する)
 models/
 assets/fonts/
+handoff/*
+!handoff/README.md

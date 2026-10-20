@@ -33,6 +33,43 @@ DECKLINK_TLB_PATH = (
     "C:/Program Files/Blackmagic Design/Blackmagic Desktop Video/DeckLinkAPI64.dll"
 )
 
+def _dll_file_version(path):
+    """DeckLinkAPI64.dll のファイルバージョン (= Desktop Video のバージョン) を Windows API で読む"""
+    try:
+        import ctypes as _ct
+        ver = _ct.windll.version
+        size = ver.GetFileVersionInfoSizeW(path, None)
+        if not size:
+            return None
+        buf = _ct.create_string_buffer(size)
+        if not ver.GetFileVersionInfoW(path, 0, size, buf):
+            return None
+        pfi = _ct.c_void_p()
+        plen = _ct.c_uint()
+        if not ver.VerQueryValueW(buf, "\\", _ct.byref(pfi), _ct.byref(plen)):
+            return None
+        fi = _ct.cast(pfi, _ct.POINTER(_ct.c_uint32 * 13)).contents
+        ms, ls = fi[2], fi[3]   # dwFileVersionMS / LS
+        return f"{ms >> 16}.{ms & 0xFFFF}.{ls >> 16}.{ls & 0xFFFF}"
+    except Exception:
+        return None
+
+
+def log_decklink_environment():
+    """現場での切り分け用: SDK (API) バージョン、DLL バージョン、デバイス一覧を起動時にログに出す"""
+    if not DECKLINK_AVAILABLE:
+        print(f"[DeckLink] SDK なし (DeckLinkAPI64.dll が見つからない): {DECKLINK_TLB_PATH}")
+        return
+    print(f"[DeckLink] DeckLinkAPI64.dll version: {_dll_file_version(DECKLINK_TLB_PATH) or '不明'}")
+    try:
+        info = comtypes.CoCreateInstance(_dl_mod.CDeckLinkAPIInformation._reg_clsid_,
+                                         interface=_dl_mod.IDeckLinkAPIInformation)
+        # BMDDeckLinkAPIVersion ('vstr' = 0x76737472) 文字列版
+        print(f"[DeckLink] API version: {info.GetString(0x76737472)}")
+    except Exception as e:
+        print(f"[DeckLink] API version 取得失敗: {e}")
+
+
 try:
     import comtypes
     import comtypes.client
@@ -40,6 +77,7 @@ try:
     _dl_mod = comtypes.client.GetModule(DECKLINK_TLB_PATH)
     DECKLINK_AVAILABLE = True
     print("[DeckLink] SDK type library loaded OK")
+    log_decklink_environment()
 except ImportError:
     print("[DeckLink] comtypes not installed. DeckLink disabled.")
 except OSError:
@@ -273,6 +311,8 @@ class DeckLinkCaptureDevice:
         # bmdFormat8BitYUV = 0x32767579
         # bmdVideoInputEnableFormatDetection = 0x40
         self._input.EnableVideoInput(0x48693539, 0x32767579, 0x40)
+        print("[DeckLink Input] EnableVideoInput: 1080i59.94 / 8bit YUV (UYVY) / 入力フォーマット自動検出 ON "
+              f"(要求 {self.width}x{self.height}, capture_mode={self._capture_mode.value})")
 
         # ストリーム開始
         self._input.StartStreams()
@@ -482,8 +522,19 @@ if DECKLINK_AVAILABLE:
                         self._capture._upper_field_first = (field_dom == 5)
                     mode = 'interlaced' if is_interlaced else 'progressive'
                     eff_fps = self._capture.effective_fps
-                    print(f"[DeckLink] Format changed: {newDisplayMode.GetWidth()}x{h} "
-                          f"{mode} (effective {eff_fps:.2f}fps)")
+                    try:
+                        name = newDisplayMode.GetName()
+                    except Exception:
+                        name = "?"
+                    try:
+                        dur, scale = newDisplayMode.GetFrameRate()
+                        fps_txt = f"{scale / dur:.3f}fps"
+                    except Exception:
+                        fps_txt = "?fps"
+                    # detectedSignalFlags: 1=YCbCr422, 2=RGB444, 4=DualStream3D, 8=12bit, 16=10bit, 32=8bit
+                    print(f"[DeckLink] Format changed: {name} {newDisplayMode.GetWidth()}x{h} {fps_txt} "
+                          f"{mode} fieldDominance={field_dom} signalFlags=0x{int(detectedSignalFlags):X} "
+                          f"(effective {eff_fps:.2f}fps)")
             except Exception as e:
                 print(f"[DeckLink] Format change handler: {e}")
             return 0  # S_OK
