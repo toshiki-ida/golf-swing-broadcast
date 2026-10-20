@@ -14,7 +14,7 @@ swingcut/render.py の構成 (通常速 → スロー → サマリーカード)
 局面:
   - 軌道 (クラブヘッド) 由来: derive_phases()
   - 骨格 (手首 / ボール ROI) 由来: ai.swing_analyzer (骨格があるとき)
-  両方あるときは、トップ / インパクトそれぞれで差が PHASE_TOL 以内なら軌道側、
+  両方あるときは、トップ / インパクトそれぞれで差が実時間 PHASE_TOL_SEC (50 ms) 以内なら軌道側、
   それ以上ずれたら警告をログに出して骨格側を採用する。アドレス / フィニッシュは骨格側。
 
 素材の fps と実時間:
@@ -57,7 +57,7 @@ SAFE_BOTTOM = int(OUT_H * 0.80)
 MAX_ZOOM = 1.6
 CONTENT_MARGIN = 0.06
 SPLINE_RES = 600
-PHASE_TOL = 2                     # 軌道由来と骨格由来の局面差の許容 (フレーム)
+PHASE_TOL_SEC = 0.05              # 軌道由来と骨格由来の局面差の許容 (実時間 50 ms。59.94p で 3f、HFR 2x で 6f)
 AUDIO_SR = 48000
 NOSE, L_SHOULDER, R_SHOULDER, L_HIP, R_HIP, L_ANKLE, R_ANKLE = 0, 11, 12, 23, 24, 27, 28
 SKELETON = [(11, 12), (11, 13), (13, 15), (12, 14), (14, 16), (11, 23), (12, 24), (23, 24),
@@ -183,19 +183,20 @@ def derive_phases(swings, in_frame: int, dense_points=None) -> dict:
             "impact": in_frame + int(round(fs[imp_i])), "finish": in_frame + int(round(fs[fin_i]))}
 
 
-def fuse_phases(traj: dict, skel: Optional[dict], warnings: list):
-    """軌道由来と骨格由来の局面を統合する (差が PHASE_TOL 以内なら軌道側、以上なら骨格側)。"""
+def fuse_phases(traj: dict, skel: Optional[dict], warnings: list, real_fps: float = 30.0):
+    """軌道由来と骨格由来の局面を統合する (差が実時間 PHASE_TOL_SEC 以内なら軌道側、以上なら骨格側)。"""
     if not skel:
         return dict(traj), {"top": "trajectory", "impact": "trajectory"}
+    tol = max(1, int(round(PHASE_TOL_SEC * real_fps)))
     out = {"address": skel["address"], "finish": max(skel["finish"], traj["finish"])}
     src = {}
     for k in ("top", "impact"):
         d = abs(traj[k] - skel[k])
-        if d <= PHASE_TOL:
+        if d <= tol:
             out[k], src[k] = traj[k], "trajectory"
         else:
             out[k], src[k] = skel[k], "skeleton"
-            msg = f"{k}: 軌道由来 {traj[k]} と骨格由来 {skel[k]} が {d} フレームずれ → 骨格側を採用"
+            msg = f"{k}: 軌道由来 {traj[k]} と骨格由来 {skel[k]} が {d} フレーム ({d / real_fps * 1000:.0f} ms, 許容 {tol}f) ずれ → 骨格側を採用"
             log.warning(msg)
             warnings.append(msg)
     if out["top"] >= out["impact"]:
@@ -493,7 +494,7 @@ def render_sns(video_path, out_path, *, in_frame: int = 0, out_frame: int = -1,
             warnings.append(f"骨格解析をスキップ: {e}")
     log.info("軌道由来の局面: %s", traj_phases)
     if phases is None:
-        phases, phase_src = fuse_phases(traj_phases, skel_phases, warnings)
+        phases, phase_src = fuse_phases(traj_phases, skel_phases, warnings, real_fps)
     else:
         phase_src = {"top": "given", "impact": "given"}
     addr, top, imp, fin = phases["address"], phases["top"], phases["impact"], phases["finish"]

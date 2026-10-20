@@ -114,7 +114,7 @@ def track_summary(video: Path, out_dir: Path) -> dict:
             row["impact_method"] = a["impact"]["chosen"]
             row["swing_frames"] = a["phases"]["finish"] - a["phases"]["address"]
             warnings += a["warnings"]
-            fused, src = fuse_phases(traj, a["phases"], warnings)
+            fused, src = fuse_phases(traj, a["phases"], warnings, fps * factor)
             row["fused"] = fused
             row["fused_src"] = src
             tol = max(2, int(round(0.05 * fps * factor)))   # 実時間 50 ms
