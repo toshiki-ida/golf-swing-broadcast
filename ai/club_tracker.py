@@ -35,6 +35,7 @@ torch / ultralytics は使わない。依存は mediapipe + opencv + numpy (+ sc
 from __future__ import annotations
 
 import collections
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,6 +43,8 @@ from typing import Callable, Optional
 
 import cv2
 import numpy as np
+
+log = logging.getLogger("club_tracker")
 
 # MediaPipe Pose 33 点のうち使うもの
 NOSE = 0
@@ -82,6 +85,8 @@ CONF_OK = 1.5               # これ以上を「確信点」とする
 WRIST_MIN_VIS = 0.5         # これ未満の visibility の手首は欠測として補間
 WRIST_MAX_JUMP = 0.33       # 手首が 1 フレームでこれ (身長代替値比) 以上跳んだら欠測扱い
 HOLD_CONF = 0.8             # 静止区間で保持した位置の信頼度
+MAX_POSES = 4               # 同時に検出する人数の上限 (キャディ・カメラマンを含めて選手を選ぶため)
+TRACK_ASSOC = 1.0           # 腰中点の距離 (胴体長比) がこれ未満なら同じ人物トラック
 BODY_H_WINDOW = 0.4         # 身長代替値を決めるのに使うクリップ前半の割合 (アドレス付近。終盤のズームを除外)
 
 
@@ -184,9 +189,59 @@ def _make_landmarker(model_path: Path):
         raise FileNotFoundError(f"モデルがありません: {model_path} (setup_assets.py を実行)")
     opts = vision.PoseLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=str(model_path)),
-        running_mode=vision.RunningMode.VIDEO, num_poses=1,
+        running_mode=vision.RunningMode.VIDEO, num_poses=MAX_POSES,
         min_pose_detection_confidence=0.3, min_tracking_confidence=0.3)
     return mp, vision.PoseLandmarker.create_from_options(opts)
+
+
+def _select_golfer(per_frame: list) -> list:
+    """フレームごとの複数人の骨格 [(33, 3) ...] から、選手 1 人分の系列 [(33, 3) or None] を返す。
+
+    腰中点の位置でトラックに束ね (近い人物は同じトラック)、トラックごとに
+    「手首中点の移動範囲 ÷ 胴体長」を測り、最も大きい (= スイングした) トラックを選手とする。
+    キャディ・カメラマン・ギャラリーは立っているだけなので手首がほとんど動かない。
+    """
+    tracks: list = []    # {"hip": 最近の腰中点, "torso": 胴体長, "frames": {i: lm}}
+    for i, poses in enumerate(per_frame):
+        used = set()
+        for lm in poses or []:
+            hip = (lm[L_HIP, :2] + lm[R_HIP, :2]) / 2
+            sh = (lm[L_SHOULDER, :2] + lm[R_SHOULDER, :2]) / 2
+            torso = float(np.linalg.norm(sh - hip)) + 1e-6
+            best, best_d = None, None
+            for k, t in enumerate(tracks):
+                if k in used:
+                    continue
+                d = float(np.linalg.norm(t["hip"] - hip)) / max(t["torso"], torso)
+                if d < TRACK_ASSOC and (best_d is None or d < best_d):
+                    best, best_d = k, d
+            if best is None:
+                tracks.append({"hip": hip, "torso": torso, "frames": {i: lm}})
+                used.add(len(tracks) - 1)
+            else:
+                t = tracks[best]
+                t["hip"] = 0.7 * t["hip"] + 0.3 * hip
+                t["torso"] = 0.7 * t["torso"] + 0.3 * torso
+                t["frames"][i] = lm
+                used.add(best)
+    if not tracks:
+        return [None] * len(per_frame)
+    T = len(per_frame)
+
+    def score(t):
+        fr = sorted(t["frames"])
+        if len(fr) < max(4, 0.2 * T):
+            return -1.0
+        w = np.array([(t["frames"][f][L_WRIST, :2] + t["frames"][f][R_WRIST, :2]) / 2 for f in fr])
+        rng = float(np.linalg.norm(w.max(axis=0) - w.min(axis=0)))
+        return rng / t["torso"]
+
+    scores = [score(t) for t in tracks]
+    k = int(np.argmax(scores))
+    log.info("人物トラック %d 本: 手首移動量/胴長 = %s → %d を選手に", len(tracks),
+             [round(x, 2) for x in scores], k)
+    chosen = tracks[k]
+    return [chosen["frames"].get(i) for i in range(T)]
 
 
 def _fill_missing(arr: np.ndarray) -> np.ndarray:
@@ -260,11 +315,8 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
             res = landmarker.detect_for_video(
                 mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), int(i * 1000 / 120))
             t_pose += time.time() - t0
-            if res.pose_landmarks:
-                lm = res.pose_landmarks[0]
-                lms.append(np.array([(p.x * aw, p.y * ah, p.visibility) for p in lm], dtype=np.float32))
-            else:
-                lms.append(None)
+            lms.append([np.array([(p.x * aw, p.y * ah, p.visibility) for p in lm], dtype=np.float32)
+                        for lm in res.pose_landmarks] if res.pose_landmarks else None)
             frame_ids.append(fno)
             if i % 20 == 0:
                 report(0.02 + 0.45 * min(1.0, i / max(1, n_total * (2 if interlaced else 1))),
@@ -275,6 +327,7 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
     T = len(frame_ids)
     if T < 2 * gap_slow + 2:
         raise ValueError("フレームが足りません")
+    lms = _select_golfer(lms)   # 複数人 → 手首が最も動く 1 人
 
     # ---- 骨格の整形: 欠測補間、身長代替値、手首中点
     arr = np.full((T, 33, 2), np.nan, dtype=np.float32)
