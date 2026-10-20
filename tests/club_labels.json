@@ -80,5 +80,50 @@
       }
     },
     "labeler": "claude"
+  },
+  "rec_0611_131029_trim.mp4": {
+    "video": "tests/real/trimmed/rec_0611_131029_trim.mp4",
+    "width": 1920,
+    "height": 1080,
+    "fps": 29.97,
+    "labeler": "claude",
+    "note": "Claude の目視 (0.25 秒刻みサムネイル、±2 フレーム)。インパクトのフレーム番号のみで座標は無し。参考扱い",
+    "frames": {
+      "45": {
+        "x": null,
+        "y": null,
+        "phase": "impact"
+      }
+    }
+  },
+  "rec_0611_130035_trim.mp4": {
+    "video": "tests/real/trimmed/rec_0611_130035_trim.mp4",
+    "width": 1920,
+    "height": 1080,
+    "fps": 29.97,
+    "labeler": "claude",
+    "note": "Claude の目視 (0.25 秒刻みサムネイル、±2 フレーム)。インパクトのフレーム番号のみで座標は無し。参考扱い",
+    "frames": {
+      "159": {
+        "x": null,
+        "y": null,
+        "phase": "impact"
+      }
+    }
+  },
+  "rec_0611_141938_trim.mp4": {
+    "video": "tests/real/trimmed/rec_0611_141938_trim.mp4",
+    "width": 1920,
+    "height": 1080,
+    "fps": 29.97,
+    "labeler": "claude",
+    "note": "Claude の目視 (0.25 秒刻みサムネイル、±2 フレーム)。インパクトのフレーム番号のみで座標は無し。参考扱い",
+    "frames": {
+      "101": {
+        "x": null,
+        "y": null,
+        "phase": "impact"
+      }
+    }
   }
 }

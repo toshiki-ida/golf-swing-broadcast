@@ -82,6 +82,7 @@ CONF_OK = 1.5               # これ以上を「確信点」とする
 WRIST_MIN_VIS = 0.5         # これ未満の visibility の手首は欠測として補間
 WRIST_MAX_JUMP = 0.33       # 手首が 1 フレームでこれ (身長代替値比) 以上跳んだら欠測扱い
 HOLD_CONF = 0.8             # 静止区間で保持した位置の信頼度
+BODY_H_WINDOW = 0.4         # 身長代替値を決めるのに使うクリップ前半の割合 (アドレス付近。終盤のズームを除外)
 
 
 @dataclass
@@ -204,6 +205,26 @@ def _fill_missing(arr: np.ndarray) -> np.ndarray:
     return out
 
 
+
+
+def _estimate_body_h(arr: np.ndarray) -> float:
+    """身長代替値 (鼻〜足首中点の距離, 解析解像度 px) をアドレス付近から決める。
+
+    クリップ前半 (BODY_H_WINDOW) の値だけを使い、中央値フィルタで単発の外れ値を均したうえで
+    90 パーセンタイルを取る (前傾で縮む分の補正)。終盤に選手の顔へズームする素材で、
+    拡大後のフレームが身長代替値を押し上げて探索円環・人物マスク・ヘッド径が膨らむのを防ぐ。
+    """
+    from scipy.signal import medfilt
+    T = arr.shape[0]
+    dist = np.linalg.norm(arr[:, NOSE] - (arr[:, L_ANKLE] + arr[:, R_ANKLE]) / 2, axis=1)
+    dist = np.nan_to_num(dist, nan=float(np.nanmedian(dist)) if np.isfinite(dist).any() else 100.0)
+    k = max(3, (T // 20) | 1)
+    if k < T:
+        dist = medfilt(dist, kernel_size=k)
+    head = dist[: max(5, int(T * BODY_H_WINDOW))]
+    return max(float(np.percentile(head, 90)), 40.0)
+
+
 # ---------------------------------------------------------------- 本体
 
 def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
@@ -269,18 +290,13 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
     if detected < 4:
         raise ValueError("骨格を検出できませんでした")
     arr = _fill_missing(arr)
+    body_h = _estimate_body_h(arr)
     # 手首の跳び (1 フレームで身長代替値の 1/3 以上) も欠測にして補間し直す
-    _tmp_h = float(np.nanpercentile(np.linalg.norm(arr[:, NOSE] - (arr[:, L_ANKLE] + arr[:, R_ANKLE]) / 2, axis=1), 90))
     for w in (L_WRIST, R_WRIST):
         step = np.linalg.norm(np.diff(arr[:, w], axis=0), axis=1)
-        bad = np.flatnonzero(step > WRIST_MAX_JUMP * _tmp_h) + 1
+        bad = np.flatnonzero(step > WRIST_MAX_JUMP * body_h) + 1
         arr[bad, w] = np.nan
     arr = _fill_missing(arr)
-    nose = arr[:, NOSE]
-    ankle = (arr[:, L_ANKLE] + arr[:, R_ANKLE]) / 2
-    # 前傾で鼻〜足首が縮むので、直立に近いフレームの値 (90 パーセンタイル) を使う
-    body_h = float(np.percentile(np.linalg.norm(nose - ankle, axis=1), 90))
-    body_h = max(body_h, 40.0)
     wrist = (arr[:, L_WRIST] + arr[:, R_WRIST]) / 2
     r_min, r_max = R_MIN_RATIO * body_h, R_MAX_RATIO * body_h
     body_w = max(3, int(BODY_WIDTH_RATIO * body_h))
