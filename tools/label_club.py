@@ -71,6 +71,7 @@ class Labeler:
         self.H = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         entry.update({"video": str(video), "width": self.W, "height": self.H,
                       "fps": self.cap.get(cv2.CAP_PROP_FPS)})
+        entry.setdefault("labeler", "owner")   # このツールで付けたラベルは正解として扱う
         self.jump = jump_frames
         self.jump_idx = 0
         self.cur = jump_frames[0] if jump_frames else 0

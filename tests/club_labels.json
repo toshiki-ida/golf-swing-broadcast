@@ -37,7 +37,8 @@
         "phase": "follow"
       }
     },
-    "source": "swingcut の input/sample.mov を 30fps に正規化したもの (リポジトリには含めない)"
+    "source": "swingcut の input/sample.mov を 30fps に正規化したもの (リポジトリには含めない)",
+    "labeler": "claude"
   },
   "IMG_1095_1080p.mp4": {
     "video": "tests/real/IMG_1095_1080p.mp4",
@@ -77,6 +78,7 @@
         "y": 735,
         "phase": "follow"
       }
-    }
+    },
+    "labeler": "claude"
   }
 }

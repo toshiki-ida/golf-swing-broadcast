@@ -1,0 +1,33 @@
+# 調整用 (tune) と確認用 (holdout) の振り分け。
+# カテゴリは 2026-10-20 の「調整前」評価 (tests/real/results/20261020_1709_before_*.md) と確認動画の目視による。
+# holdout は修正中に一切見ない・実行しない。修正完了後に tools/eval_club.py --all --split holdout で初めて実行する。
+# 130219 はスイングが収まっていないため評価対象外 (trim.yaml の skip)。
+
+categories:
+  ok:         問題なく動いた (軌道が描け、トップ/インパクトの両手法差が小さい)
+  trajectory: 軌道が崩れた (追跡率が低い、別の物を追った、ズームで探索範囲が壊れた)
+  phase:      局面がずれた (軌道は概ね描けたが、軌道由来と骨格由来のトップ/インパクトが大きく食い違う)
+  person:     そもそも人物を捉えられなかった (骨格がキャディ等の別人に付いた)
+
+tune:
+  rec_0611_131029.mp4: ok
+  rec_0611_161853.mp4: ok
+  rec_0611_130035.mp4: trajectory   # 終盤ズームで身長代替値が膨らむ
+  rec_0611_161732.mp4: trajectory   # 追跡率 19%、後ろの 2 人に引かれた疑い
+  rec_0611_135231.mp4: trajectory   # 引きの画、人物 390px
+  rec_0611_162742.mp4: trajectory   # 長尺・スイング 2 回 (切り出し後に再評価)
+  rec_0611_141938.mp4: phase        # 骨格トップが遅い
+  rec_0611_162655.mp4: phase
+  rec_0611_164140.mp4: phase        # 骨格インパクトが遅い
+  rec_0612_123119.mp4: phase        # 59.94p、ズーム前で切る
+  rec_0611_164617.mp4: person       # 骨格がキャディに付き「動き出しを検出できず」
+
+holdout:
+  rec_0611_165010.mp4: ok
+  rec_0611_130128.mp4: trajectory
+  rec_0611_160311.mp4: trajectory
+  rec_0611_162834.mp4: trajectory
+  rec_0611_151507.mp4: phase
+  rec_0611_163425.mp4: phase
+  rec_0612_122051.mp4: phase
+  rec_0611_150726.mp4: person       # 骨格がキャディに付いた (鼻 x 中央値 282px)

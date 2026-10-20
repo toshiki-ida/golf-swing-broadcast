@@ -5,11 +5,14 @@ tests/club_labels.json (tools/label_club.py で作成) と、各手法が出力�
 使い方:
     python tools/eval_club.py <予測JSON ...>
     python tools/eval_club.py build/club_eval/*/*.pred.json
-    python tools/eval_club.py --all [--tag before|after|<任意>] [--no-run] [--interlaced]
+    python tools/eval_club.py --all --split tune|holdout|all [--tag before|after_N|<任意>] [--no-run] [--interlaced]
+                              [--include-claude-labels]
 
---all: tests/real/ にある動画のうち tests/club_labels.json にラベルがあるものを
-       すべて ai/club_tracker.py で追跡し (build/club_eval/real/<名前>/)、評価して
-       tests/real/results/<日時>_<tag>_<commit>.md に結果を残す (既存ファイルは上書きしない)。
+--all: tests/real/trimmed/ (無ければ tests/real/) の動画を ai/club_tracker.py で追跡し
+       (build/club_eval/real/<名前>/)、追跡率・局面を全素材で集計、ラベルのある素材は誤差も評価して
+       tests/real/results/<日時>_<tag>_<split>_<commit>.md に残す (既存ファイルは上書きしない)。
+       --split: tests/real/split.yaml の tune / holdout を選ぶ (省略時 tune。holdout は修正完了後のみ実行する)。
+       正解ラベルは "labeler": "owner" のものだけを使う。Claude の目視ラベルは --include-claude-labels で参考表示。
        --no-run は追跡を省略して既存の予測で評価だけ行う。
        --interlaced は 1080i 素材をフィールド単位で処理する (ファイル名に "_i" か
        ラベルに "interlaced": true があれば自動で付く)。
@@ -63,6 +66,8 @@ def predict_at(points: list, frame: float):
 
 
 REAL_DIR = ROOT / "tests" / "real"
+TRIM_DIR = REAL_DIR / "trimmed"
+SPLIT_PATH = REAL_DIR / "split.yaml"
 VIDEO_EXTS = (".mp4", ".mov", ".mxf", ".mkv", ".avi")
 
 
@@ -112,6 +117,9 @@ def track_summary(video: Path, out_dir: Path) -> dict:
             fused, src = fuse_phases(traj, a["phases"], warnings)
             row["fused"] = fused
             row["fused_src"] = src
+            tol = max(2, int(round(0.05 * fps * factor)))   # 実時間 50 ms
+            row["tol"] = tol
+            row["agree"] = {k: abs(traj[k] - a["phases"][k]) <= tol for k in ("top", "impact")}
         row["warnings"] = warnings
     except Exception as e:
         row["analyze_error"] = f"{type(e).__name__}: {e}"
@@ -121,7 +129,7 @@ def track_summary(video: Path, out_dir: Path) -> dict:
 def format_summary(rows: list) -> str:
     lines = ["=== 追跡率・局面検出 (全素材) ===",
              f"{'素材':<22} {'動画f':>6} {'観測':>6} {'確信':>6} {'率':>6} {'欠測':>5} {'秒':>5}  "
-             f"{'軌道 top/imp':<13} {'骨格 top/imp':<13} {'採用':<10} {'ｽｲﾝｸﾞf':>7} {'撮影方向 (比, 信頼度)':<24} 警告"]
+             f"{'軌道 top/imp':<13} {'骨格 top/imp':<13} {'採用':<10} {'一致':<8} {'ｽｲﾝｸﾞf':>7} {'撮影方向 (比, 信頼度)':<24} 警告"]
     for r in rows:
         if "error" in r:
             lines.append(f"{r['name']:<22} {r['error']}")
@@ -136,11 +144,13 @@ def format_summary(rows: list) -> str:
         tps = f"{tp.get('top', '-')}/{tp.get('impact', '-')}" if tp else "-"
         sps = f"{sp.get('top', '-')}/{sp.get('impact', '-')}" if sp else "-"
         srcs = f"{str(src.get('top', '-'))[:4]}/{str(src.get('impact', '-'))[:4]}" if src else "-"
+        ag = r.get("agree")
+        ags = ("".join("o" if ag[k] else "x" for k in ("top", "impact")) + f"(±{r.get('tol')})") if ag else "-"
         lines.append(f"{r['name']:<22} {r.get('video_frames', '?'):>6} {r['observed']:>6} {r['confident']:>6} {rate:>6} {r['weak']:>5} "
-                     f"{(r.get('seconds') or 0):>5.0f}  {tps:<13} {sps:<13} {srcs:<10} {str(r.get('swing_frames', '-')):>7} "
+                     f"{(r.get('seconds') or 0):>5.0f}  {tps:<13} {sps:<13} {srcs:<10} {ags:<8} {str(r.get('swing_frames', '-')):>7} "
                      f"{r.get('camera', '-'):<24} {warn}")
     lines.append("観測 = 位置を観測できたフレーム数、確信 = 信頼度 1.5 以上、率 = 観測/動画フレーム、欠測 = 欠測区間の数。"
-                 "採用 = 統合後の出所 (traj=軌道 / skel=骨格)。ｽｲﾝｸﾞf = 骨格由来のアドレス→フィニッシュのフレーム数。")
+                 "採用 = 統合後の出所 (traj=軌道 / skel=骨格)。一致 = トップ/インパクトで軌道と骨格が実時間 50ms 以内か (o/x)。ｽｲﾝｸﾞf = 骨格由来のアドレス→フィニッシュのフレーム数。")
     return chr(10).join(lines)
 
 
@@ -155,10 +165,27 @@ def run_all(args: list) -> int:
     no_run = "--no-run" in args
     force_i = "--interlaced" in args
     labels = json.loads(LABELS_PATH.read_text(encoding="utf-8")) if LABELS_PATH.exists() else {}
-    videos = sorted(p for p in REAL_DIR.glob("*") if p.suffix.lower() in VIDEO_EXTS) if REAL_DIR.exists() else []
+    include_claude = "--include-claude-labels" in args
+    if not include_claude:   # 正解はオーナーのラベルだけ。Claude の目視ラベルは参考扱い
+        labels = {k: v for k, v in labels.items() if v.get("labeler") == "owner"}
+    split = args[args.index("--split") + 1] if "--split" in args else "tune"
+    src_dir = TRIM_DIR if TRIM_DIR.is_dir() and any(TRIM_DIR.glob("*_trim.*")) else REAL_DIR
+    videos = sorted(p for p in src_dir.glob("*") if p.suffix.lower() in VIDEO_EXTS)
+    if SPLIT_PATH.exists() and split != "all":
+        import yaml
+        sp = yaml.safe_load(SPLIT_PATH.read_text(encoding="utf-8")) or {}
+        chosen = sp.get(split) or {}
+        if not chosen:
+            print(f"split.yaml に {split} がありません")
+            return 1
+        stems = {Path(k).stem for k in chosen}
+        videos = [v for v in videos if v.stem.replace("_trim", "") in stems]
+        if split == "holdout":
+            print("*** holdout を実行します。修正中に実行してはいけません ***")
     if not videos:
-        print(f"素材がありません: {REAL_DIR} に動画を置き、tools/label_club.py でラベルを付けてください")
+        print(f"素材がありません: {src_dir} (tools/trim_real.py で切り出し、split.yaml を確認)")
         return 1
+    print(f"対象: {len(videos)} 本 ({src_dir.name}, split={split}, ラベル {len(labels)} 件)")
     preds = []
     summary_rows = []   # 全素材の追跡率・局面・警告 (ラベルの有無によらず)
     for v in videos:
@@ -201,8 +228,8 @@ def run_all(args: list) -> int:
     res_dir = REAL_DIR / "results"
     res_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-    out = res_dir / f"{stamp}_{tag}_{commit}{dirty}.md"
-    header = f"# club_tracker 評価 ({stamp}, tag={tag}, commit={commit}{dirty})"
+    out = res_dir / f"{stamp}_{tag}_{split}_{commit}{dirty}.md"
+    header = f"# club_tracker 評価 ({stamp}, tag={tag}, split={split}, src={src_dir.name}, commit={commit}{dirty})"
     body = f"素材: {len(summary_rows)} 本 (正解ラベルあり {len(preds)} 本)"
     out.write_text(header + "\n\n" + body + "\n\n```\n" + text + "\n```\n",
                    encoding="utf-8")
