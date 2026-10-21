@@ -69,6 +69,11 @@ foreach ($r in $required) {
 $ort = Get-ChildItem -Path (Join-Path $dist "_internal") -Recurse -Filter "onnxruntime*.dll" | Select-Object -First 1
 if (-not $ort) { throw "missing in bundle: onnxruntime DLL" }
 Write-Host ("  ok  " + $ort.FullName.Substring($dist.Length + 1))
+# MSVC runtime must be the current one (an old 14.16 copy picked up from PATH crashes onnxruntime)
+$crt = (Get-Item (Join-Path $dist "_internal\msvcp140.dll")).VersionInfo
+$crtVer = [version]("{0}.{1}.{2}.{3}" -f $crt.FileMajorPart, $crt.FileMinorPart, $crt.FileBuildPart, $crt.FilePrivatePart)
+if ($crtVer -lt [version]"14.40.0.0") { throw "bundled msvcp140.dll is too old ($crtVer); check the spec runtime replacement" }
+Write-Host ("  ok  _internal\msvcp140.dll " + $crtVer)
 $clubOnnx = Join-Path $dist "_internal\models\clubhead.onnx"
 $hasDetector = Test-Path $clubOnnx
 if ($hasDetector) { Write-Host "  ok  _internal\models\clubhead.onnx (detector bundled)" }

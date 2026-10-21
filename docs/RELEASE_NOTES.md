@@ -26,6 +26,8 @@ feature/ai-analysis の現場 PC (UltraStudio 4K Mini) 持ち込み版。PR #1 �
 - **検出モード (実験的)**: `_internal\models\clubhead.onnx` が同梱されていれば、学習ベースのクラブヘッド検出器の候補を追跡に加える。
   現時点のモデルは 12 点で学習した仮のもので精度は未検証。候補の提案だけで、連続性・欠損・信頼度の判定は従来どおり。
   従来方式に戻すときは settings.json の `"ai": {"club_detector": "off"}`
+- **同梱の MSVC ランタイムを System32 の最新版に差し替え** (旧版 14.16 が混入すると onnxruntime がアクセス違反で落ちる。
+  `release.ps1` の同梱確認でバージョンを検査する)
 - 追跡のチューニング記録: `docs/CLUB_TRACKING_EVAL.md` §8〜9、検出器: `docs/CLUBHEAD_DETECTOR_PLAN.md` §8。holdout 未実行、実収録素材の正解ラベル未作成
 
 ## 現場での操作上の注意

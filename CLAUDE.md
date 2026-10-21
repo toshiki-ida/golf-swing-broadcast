@@ -36,6 +36,9 @@ pyinstaller GolfSwingBroadcast.spec --noconfirm        # → dist/GolfSwingBroad
 | `.github/workflows/build.yml` | **onefile** (`--onefile --windowed` + `--hidden-import` 列挙) | **なし** | spec を使わない。main への push で実行し `dist/*.exe` を Artifact 化 |
 
 新しい依存(データファイル同梱が必要なもの)を足すときは **両方** を更新すること。
+- spec は同梱する MSVC ランタイム (msvcp140 / vcruntime140) を System32 のものに差し替える。PATH 上の JDK 等から古い 14.16 が
+  拾われると onnxruntime が exe 内でアクセス違反になる (2026-10-22)。リリースは `tools/release.ps1` (ビルド → selftest → zip →
+  ドラフトリリース差し替え。Git Bash / cmd から実行。ウイルスバスターが exe を隔離することがある)。
 
 ## ファイル構成と役割
 

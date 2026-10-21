@@ -70,6 +70,20 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
+# MSVC ランタイム (msvcp140 / vcruntime140) の差し替え。
+# PyInstaller は PATH 上で最初に見つけた DLL を拾うため、JDK などに入っている古い 14.16 が同梱されることがあり、
+# それだと onnxruntime 1.31 (clubhead.onnx の推論) がアクセス違反で落ちる (2026-10-22 に発生)。
+# System32 の新しいもの (VC++ 2015-2022 再頒布可能パッケージ) に置き換える。
+_crt_names = ('msvcp140.dll', 'msvcp140_1.dll', 'msvcp140_2.dll', 'vcruntime140.dll', 'vcruntime140_1.dll')
+_crt_dropped = [b for b in a.binaries if os.path.basename(b[0]).lower() in _crt_names]
+a.binaries = [b for b in a.binaries if os.path.basename(b[0]).lower() not in _crt_names]
+_sys32 = os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32')
+for _n in _crt_names:
+    _src = os.path.join(_sys32, _n)
+    if os.path.exists(_src):
+        a.binaries.append((_n, _src, 'BINARY'))
+print(f'[spec] MSVC runtime: dropped {[b[1] for b in _crt_dropped]} -> System32')
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
