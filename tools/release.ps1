@@ -7,6 +7,13 @@
 # ffmpeg in C:\ffmpeg\bin or on PATH (bundled by the spec), GitHub CLI (token from Git Credential Manager).
 # Release notes body = docs/RELEASE_NOTES.md (UTF-8). The script only prepends the build header.
 # The script is ASCII-only on purpose (Windows PowerShell 5.1 reads BOM-less files as ANSI).
+#
+# Known issues on the dev PC (Trend Micro / Virus Buster Cloud):
+#   - the freshly built exe can be quarantined right after the build (dist\GolfSwingBroadcast.exe disappears,
+#     a ~25 MB file appears in C:\ProgramData\Trend Micro\AMSP\quarantine). Restore it or rebuild; add dist\ to the
+#     exclusion list if it keeps happening.
+#   - run this script from cmd.exe or Git Bash (powershell -ExecutionPolicy Bypass -File toolselease.ps1);
+#     some PowerShell hosts cannot start the unsigned exe at all ("Access is denied").
 
 param(
     [string]$Tag = "v0.2.0-ai-preview",
@@ -73,10 +80,13 @@ Step "selftest"
 $st = Join-Path $root ("build\selftest_" + $sha)
 if (Test-Path $st) { Remove-Item -Recurse -Force $st }
 $t0 = Get-Date
-$p = Start-Process -FilePath $exe -ArgumentList @("--ai-selftest", (Resolve-Path $Sample).Path, $st) -Wait -PassThru -NoNewWindow
+# Call operator + pipe (waits for the windowed exe). Start-Process is blocked by the antivirus
+# on the dev PC ("Access is denied"), so do not use it here.
+& $exe --ai-selftest (Resolve-Path $Sample).Path $st 2>&1 | Out-Null
+$selftestExit = $LASTEXITCODE
 $selftestSec = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
 $resultPath = Join-Path $st "selftest_result.json"
-if (-not (Test-Path $resultPath)) { throw "selftest produced no result (exit $($p.ExitCode))" }
+if (-not (Test-Path $resultPath)) { throw "selftest produced no result (exit $selftestExit)" }
 $result = Get-Content $resultPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($result.status -ne "OK") { throw "selftest failed: $($result.status) $($result.error)" }
 Write-Host ("  status=OK frozen=" + $result.frozen + " seconds=" + $selftestSec)
