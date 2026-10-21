@@ -127,6 +127,33 @@ class ClubTrackResult:
             out.append(cur)
         return out
 
+    def segment_quality(self, max_gap_sec: float = GAP_MAX_SEC, min_pts: int = 4) -> list:
+        """区間ごとの品質。[(points, quality, reliable), ...]。区間内の観測率・連続性・手元接続率で判定。"""
+        max_step = MAX_HEAD_SPEED_BH * self.body_h / max(self.real_fps, 1.0)
+        out = []
+        for seg in self.segments(max_gap_sec, min_pts):
+            fs = [p[2] for p in seg]
+            span = fs[-1] - fs[0] + 1
+            rate = len(seg) / max(span, 1)
+            pairs = [(a, b) for a, b in zip(seg[:-1], seg[1:]) if b[2] - a[2] <= 3]
+            cont = (sum(1 for a, b in pairs if np.hypot(b[0] - a[0], b[1] - a[1]) <= max_step * (b[2] - a[2]))
+                    / len(pairs)) if pairs else 0.0
+            att_map = getattr(self, "attached", {})
+            att = sum(1 for p in seg if att_map.get(p[2])) / len(seg)
+            reasons = []
+            if len(seg) < RELIABLE_MIN_OBS:
+                reasons.append(f"観測 {len(seg)}f")
+            if rate < RELIABLE_MIN_RATE:
+                reasons.append(f"観測率 {rate:.0%}")
+            if cont < RELIABLE_MIN_CONT:
+                reasons.append(f"連続性 {cont:.0%}")
+            if att < RELIABLE_MIN_ATT:
+                reasons.append(f"手元接続 {att:.0%}")
+            q = {"frames": (fs[0], fs[-1]), "observed": len(seg), "span": span, "rate": round(rate, 3),
+                 "continuity": round(cont, 3), "attached": round(att, 3), "reasons": reasons}
+            out.append((seg, q, not reasons))
+        return out
+
     def confident_points(self, min_conf: float = CONF_OK, max_pts: int = 18,
                          min_gap: float = 2.0, points: list = None) -> list:
         """確信点だけを、編集タブの制御点として使える点数に間引いて返す (points で区間を指定可)。"""
@@ -672,6 +699,13 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
                           frames_total=T, frames_detected=len(ks), real_fps=real_fps,
                           quality=quality, reliable=reliable)
     res.detect_seconds = t_detect
+    res.attached = {frame_ids[k]: bool(v) for k, v in attached.items()}
+    seg_q = res.segment_quality()
+    quality["segments"] = [{**q, "reliable": ok} for _, q, ok in seg_q]
+    if seg_q and any(ok for _, _, ok in seg_q):
+        res.reliable = True          # 信頼できる区間が 1 つでもあれば、その区間だけ描く
+        quality["reasons"] = [] if reliable else quality.get("reasons", [])
+    res.quality = quality
     res.raw = {frame_ids[k]: v for k, v in raw.items()}
     res.trace = {frame_ids[k]: v for k, v in trace.items()}
     res.landmarks = {frame_ids[i]: (arr[i] * inv).tolist() for i in range(T)}

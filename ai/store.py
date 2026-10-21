@@ -69,3 +69,45 @@ def save_clip_ai_settings(dir_path, **kw) -> None:
     d = load_clip_ai_settings(dir_path)
     d.update(kw)
     (Path(dir_path) / "settings.json").write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def save_auto_snapshot(dir_path, segments: list, undrawn: list) -> None:
+    """自動生成した制御点 (区間ごと) と未描画区間を残す。corrections の突き合わせに使う。"""
+    import time as _t
+    (Path(dir_path) / "auto_points.json").write_text(json.dumps({
+        "created": _t.strftime("%Y-%m-%d %H:%M:%S"),
+        "segments": [[[int(x), int(y), f] for x, y, f in seg] for seg in segments],
+        "undrawn": [[a, b] for a, b in undrawn],
+    }, ensure_ascii=False), encoding="utf-8")
+
+
+def record_corrections(dir_path, swings) -> dict | None:
+    """保存された軌道と auto_points.json を突き合わせ、人が足した・動かした・消した点を corrections.json に記録する。
+
+    記録形式: {"frames": {"<frame>": {"x", "y", "source": "auto"|"manual"|"moved", "auto_xy": [x, y]|null}},
+               "deleted": [[x, y, frame], ...], "updated": "..."}
+    """
+    d = Path(dir_path)
+    ap = d / "auto_points.json"
+    if not ap.exists():
+        return None
+    auto = json.loads(ap.read_text(encoding="utf-8"))
+    auto_pts = {f: (x, y) for seg in auto.get("segments", []) for x, y, f in seg}
+    cur = {}
+    for sw in swings:
+        for x, y, f in getattr(sw, "points", []):
+            cur[f] = (int(x), int(y))
+    frames = {}
+    for f, (x, y) in cur.items():
+        if f in auto_pts:
+            ax, ay = auto_pts[f]
+            src = "auto" if (abs(ax - x) <= 1 and abs(ay - y) <= 1) else "moved"
+            frames[str(f)] = {"x": x, "y": y, "source": src, "auto_xy": [ax, ay]}
+        else:
+            frames[str(f)] = {"x": x, "y": y, "source": "manual", "auto_xy": None}
+    deleted = [[ax, ay, f] for f, (ax, ay) in auto_pts.items() if f not in cur]
+    import time as _t
+    out = {"frames": frames, "deleted": deleted, "undrawn_at_generation": auto.get("undrawn", []),
+           "updated": _t.strftime("%Y-%m-%d %H:%M:%S")}
+    (d / "corrections.json").write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    return out

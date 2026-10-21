@@ -22,7 +22,7 @@ from clip_manager import TrajectoryData
 from ai import ai_available
 from ai.config import get_ai_settings, realtime_factor
 from ai.store import (analysis_dir, load_club_track, landmarks_from_track, save_club_track,
-                      load_clip_ai_settings, save_clip_ai_settings)
+                      load_clip_ai_settings, save_clip_ai_settings, save_auto_snapshot, record_corrections)
 
 
 class EditTools:
@@ -50,9 +50,23 @@ class EditTools:
                                                  font=("", 11), command=self._on_camera_changed)
         self.camera_seg.set("auto")
         self.camera_seg.pack(side="left", padx=6)
+        self.undrawn_label = ctk.CTkLabel(sec, text="", font=("", 10), text_color="#E0B040",
+                                          wraplength=200, justify="left")
+        self.undrawn_label.pack(anchor="w", padx=8, pady=(4, 0))
+        row2 = ctk.CTkFrame(sec, fg_color="transparent")
+        row2.pack(fill="x", padx=8, pady=(2, 0))
+        self.jump_btn = ctk.CTkButton(row2, text="次の未描画区間へ", width=120, height=24, font=("", 11),
+                                      command=self.jump_to_undrawn)
+        self.jump_btn.pack(side="left")
+        self.merge_btn = ctk.CTkButton(row2, text="区間を結合", width=80, height=24, font=("", 11),
+                                       command=self.merge_segments)
+        self.merge_btn.pack(side="left", padx=4)
         self.status = ctk.CTkLabel(sec, text="", font=("", 10), text_color="#AAAAAA",
                                    wraplength=200, justify="left")
         self.status.pack(anchor="w", padx=8, pady=(2, 6))
+        self._undrawn: dict = {}      # clip_id -> [(a, b), ...] 未描画区間 (in_frame 基準の相対フレーム)
+        self._undrawn_idx = 0
+        self._wrap_save_trajectory()
         if not ai_available():
             self.trace_btn.configure(state="disabled")
             self.sns_btn.configure(state="disabled")
@@ -95,6 +109,69 @@ class EditTools:
 
         threading.Thread(target=run, daemon=True, name=f"ai-{label}").start()
 
+    # ---------------------------------------------------------------- 未描画区間 / 手直しの記録
+    def _wrap_save_trajectory(self):
+        """ClipManager.save_trajectory を包み、保存のたびに corrections.json を更新する (app.py は変更しない)"""
+        cm = self.app.clip_manager
+        if getattr(cm, "_ai_wrapped", False):
+            return
+        orig = cm.save_trajectory
+
+        def wrapped(clip_id, swings, edit_in=0, edit_out=-1, _orig=orig):
+            _orig(clip_id, swings, edit_in=edit_in, edit_out=edit_out)
+            try:
+                record_corrections(analysis_dir(self.app.project_dir, clip_id), swings)
+            except Exception as e:
+                print(f"[AI] corrections の記録に失敗: {e}")
+
+        cm.save_trajectory = wrapped
+        cm._ai_wrapped = True
+
+    def _show_undrawn(self, clip_id):
+        spans = self._undrawn.get(clip_id) or []
+        if not spans:
+            self.undrawn_label.configure(text="")
+            return
+        txt = "未描画区間 (手描きで補える): " + " ".join(f"F{a}-{b}" for a, b in spans[:6])
+        if len(spans) > 6:
+            txt += f" 他 {len(spans) - 6}"
+        self.undrawn_label.configure(text=txt)
+
+    def jump_to_undrawn(self):
+        """未描画区間の先頭フレームへ順番に移動する (編集タブのスライダーと表示を更新)"""
+        app = self.app
+        cid = getattr(app, "_edit_clip_id", None)
+        spans = self._undrawn.get(cid) or []
+        if not spans:
+            self._set_status("未描画区間はありません")
+            return
+        a, b = spans[self._undrawn_idx % len(spans)]
+        self._undrawn_idx += 1
+        app._edit_frame_no = max(0, min(int(a), app._edit_total - 1))
+        app._edit_update_display()
+        self._set_status(f"未描画区間 F{a}-{b} の先頭へ移動 (左クリックで点を足す)")
+
+    def merge_segments(self):
+        """自動生成の区間と手描きの点を 1 本の Swing に結合して連続表示にする (Undo 可)"""
+        app = self.app
+        cid = getattr(app, "_edit_clip_id", None)
+        if not cid or not app._edit_swings:
+            return
+        app._edit_push_undo()
+        pts = sorted({p for sw in app._edit_swings for p in sw.points}, key=lambda q: q[2])
+        base = app._edit_swings[0]
+        merged = TrajectoryData(points=pts, color_start_hex=base.color_start_hex, color_end_hex=base.color_end_hex,
+                                thickness=base.thickness, blur=getattr(base, "blur", 0),
+                                fade_frames=getattr(base, "fade_frames", 0), alpha=getattr(base, "alpha", 0.85),
+                                handles=[None] * len(pts))
+        app._edit_swings = [merged]
+        app._edit_swing_idx = 0
+        app._edit_spline_cache.clear()
+        app._edit_update_color_buttons()
+        app._edit_update_display()
+        app._edit_autosave_trajectory()
+        self._set_status(f"{len(pts)} 点を 1 本の軌道に結合しました (未描画区間も補間で繋がります)")
+
     def _on_camera_changed(self, value):
         """撮影方向をクリップごとに保存 (auto / dtl / face_on)"""
         cid = getattr(self.app, "_edit_clip_id", None)
@@ -123,24 +200,41 @@ class EditTools:
             from ai.club_tracker import track_club
             res = track_club(clip.source_path, in_f, out_f,
                              progress=lambda r, m: self._set_status(f"{m} {r * 100:.0f}%"))
-            save_club_track(analysis_dir(app.project_dir, clip.id), res, in_f, clip.source_path)
-            if not res.reliable:
+            adir = analysis_dir(app.project_dir, clip.id)
+            save_club_track(adir, res, in_f, clip.source_path)
+            # 区間ごとに信頼度を判定し、信頼できる区間だけを Swing にする
+            seg_q = res.segment_quality()
+            good = [(seg, q) for seg, q, ok in seg_q if ok]
+            bad = [(seg, q) for seg, q, ok in seg_q if not ok]
+            total_span = (res.frames_total - 1)
+            # 未描画区間 = 信頼できる区間以外 (区間の隙間 + 信頼度不足の区間)
+            drawn = sorted((q["frames"][0] - in_f, q["frames"][1] - in_f) for _, q in good)
+            undrawn, cursor = [], 0
+            for a, b in drawn:
+                if a - cursor >= 2:
+                    undrawn.append((cursor, a - 1))
+                cursor = b + 1
+            if total_span - cursor >= 2:
+                undrawn.append((cursor, total_span))
+            if not good:
                 q = res.quality
-                self._set_status("軌道: 信頼度不足 → 描画しません\n"
+                self._undrawn[clip.id] = undrawn
+                save_auto_snapshot(adir, [], undrawn)
+                app.after(0, lambda: self._show_undrawn(clip.id))
+                self._set_status("軌道: 信頼度不足 → 描画しません (全区間)\n"
                                  + " / ".join(q.get("reasons", [])) + "\n"
                                  + f"(観測 {q.get('observed')}/{q.get('frames')}f, 率 {q.get('rate', 0):.0%}, "
-                                   f"連続性 {q.get('continuity', 0):.0%}, 手元接続 {q.get('attached', 0):.0%})", "#E0704B")
+                                   f"手元接続 {q.get('attached', 0):.0%}) 手描きで補えます", "#E0704B")
                 return
-            # 欠損で分割した区間ごとに 1 本の Swing (欠損区間は描かない)
-            segs = [[(int(x), int(y), f - in_f) for x, y, f in res.confident_points(points=seg)]
-                    for seg in res.segments()]
+            segs = [[(int(x), int(y), f - in_f) for x, y, f in res.confident_points(points=seg)] for seg, _ in good]
             segs = [sg for sg in segs if len(sg) >= 2]
-            weak = [(a - in_f, b - in_f) for a, b in res.weak_ranges()]
-            app.after(0, lambda: self._apply_trajectory(clip, segs, weak, style, res))
+            self._undrawn[clip.id] = undrawn
+            save_auto_snapshot(adir, segs, undrawn)
+            app.after(0, lambda: self._apply_trajectory(clip, segs, undrawn, style, res, len(bad)))
 
         self._start(worker, "軌道生成")
 
-    def _apply_trajectory(self, clip, segs, weak, style, res):
+    def _apply_trajectory(self, clip, segs, weak, style, res, n_bad=0):
         """GUI スレッド: 生成した制御点 (区間ごと) を軌道として保存し、編集タブに反映する。"""
         app = self.app
         editing = getattr(app, "_edit_clip_id", None) == clip.id
@@ -180,11 +274,14 @@ class EditTools:
             app._edit_update_display()
         app._clips_tab_dirty = app._edit_tab_dirty = True
         q = res.quality
-        msg = (f"完了 ({res.seconds:.0f}秒): {len(segs)} 区間 / 制御点 {sum(len(s_) for s_ in segs)} 点"
-               f" (観測 {q.get('observed')}/{q.get('frames')}f, 率 {q.get('rate', 0):.0%}, 連続性 {q.get('continuity', 0):.0%})")
+        self._show_undrawn(clip.id)
+        msg = (f"完了 ({res.seconds:.0f}秒): 描画 {len(segs)} 区間 / 制御点 {sum(len(s_) for s_ in segs)} 点"
+               f" (観測 {q.get('observed')}/{q.get('frames')}f)")
+        if n_bad:
+            msg += f" / 信頼度不足で非描画 {n_bad} 区間"
         if weak:
-            msg += " / 欠損 F" + " ".join(f"{a}-{b}" for a, b in weak[:3])
-        self._set_status(msg, "#E0B040" if weak else "#88CC88")
+            msg += " / 未描画区間は「次の未描画区間へ」で移動し手描きで補える"
+        self._set_status(msg, "#E0B040" if (weak or n_bad) else "#88CC88")
 
     # ---------------------------------------------------------------- 縦型書き出し
     def run_sns_export(self):
@@ -200,6 +297,18 @@ class EditTools:
         cfg = get_ai_settings(app.settings)
         track = load_club_track(analysis_dir(app.project_dir, clip.id))
         unreliable = bool(track) and not track.get("reliable", True)
+        segs_q = ((track or {}).get("quality") or {}).get("segments") or []
+        partial = bool(track) and not unreliable and any(not sq.get("reliable") for sq in segs_q)
+        auto_undrawn = self._undrawn.get(clip.id)
+        if auto_undrawn is None:
+            try:
+                from ai.store import load_clip_ai_settings as _l  # noqa
+                import json as _j
+                ap = analysis_dir(app.project_dir, clip.id) / "auto_points.json"
+                auto_undrawn = [tuple(x) for x in _j.loads(ap.read_text(encoding="utf-8")).get("undrawn", [])] if ap.exists() else []
+            except Exception:
+                auto_undrawn = []
+        partial = partial or bool(auto_undrawn)
         if not swings and not track:
             self._set_status("軌道も骨格もありません。先に自動生成か手描きをしてください", "#E0B040")
             return
@@ -219,7 +328,8 @@ class EditTools:
             rep = render_sns(
                 clip.source_path, out_path, in_frame=clip.in_frame, out_frame=clip.get_out_frame(),
                 swings=swings, landmarks=landmarks, realtime_factor=factor, options=cfg["sns"],
-                dense_points=dense, camera_angle=camera, trajectory_note=("軌道: 信頼度不足" if unreliable else None),
+                dense_points=dense, camera_angle=camera,
+                trajectory_note=("軌道: 信頼度不足" if unreliable else ("軌道: 一部区間のみ" if partial else None)),
                 progress=lambda r, m: self._set_status(f"{m} {r * 100:.0f}%"))
             self._set_status(f"完了: {out_path.name} ({rep['frames']}f, {rep['seconds']:.0f}秒)"
                              f"\n{out_dir}", "#88CC88")
