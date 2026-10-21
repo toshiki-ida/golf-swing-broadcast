@@ -42,6 +42,7 @@ jobs:
             --hidden-import=comtypes `
             --hidden-import=comtypes.client `
             --hidden-import=hid `
+            --hidden-import=onnxruntime `
             --collect-data customtkinter `
             app.py
         shell: pwsh

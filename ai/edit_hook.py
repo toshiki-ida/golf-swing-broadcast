@@ -21,6 +21,7 @@ import customtkinter as ctk
 from clip_manager import TrajectoryData
 from ai import ai_available
 from ai.config import get_ai_settings, realtime_factor
+from ai.dataset import collect_clip_labels
 from ai.store import (analysis_dir, load_club_track, landmarks_from_track, save_club_track,
                       load_clip_ai_settings, save_clip_ai_settings, save_auto_snapshot, record_corrections)
 
@@ -67,6 +68,7 @@ class EditTools:
         self._undrawn: dict = {}      # clip_id -> [(a, b), ...] 未描画区間 (in_frame 基準の相対フレーム)
         self._undrawn_idx = 0
         self._wrap_save_trajectory()
+        self._wrap_edit_export()
         if not ai_available():
             self.trace_btn.configure(state="disabled")
             self.sns_btn.configure(state="disabled")
@@ -126,6 +128,44 @@ class EditTools:
 
         cm.save_trajectory = wrapped
         cm._ai_wrapped = True
+
+    def _collect_dataset(self, clip, swings, label=""):
+        """書き出し時: そのクリップの軌道を承認済みラベルとして datasets/clubhead に保存 (holdout は除外、再書き出しは上書き)"""
+        try:
+            import json as _j
+            adir = analysis_dir(self.app.project_dir, clip.id)
+            track = load_club_track(adir)
+            corr_p = adir / "corrections.json"
+            corr = _j.loads(corr_p.read_text(encoding="utf-8")) if corr_p.exists() else None
+            lm = landmarks_from_track(track)
+            body_h = (track or {}).get("body_h")
+            real_fps = (track or {}).get("real_fps") or \
+                clip.fps * realtime_factor(clip.fps, get_ai_settings(self.app.settings)["source_kind"])
+            res = collect_clip_labels(clip.id, clip.source_path, clip.in_frame, swings, corrections=corr,
+                                      landmarks=lm, body_h=body_h, real_fps=real_fps, labeler="operator",
+                                      note=f"{label}書き出し時に承認")
+            if res is None:
+                print(f"[AI] ラベル収集: {clip.name} は holdout のため除外 (または点が 2 点未満)")
+            else:
+                print(f"[AI] ラベル収集: {clip.name} → strong {res['n_strong']} / weak {res['n_weak']} {res['sources']}")
+            return res
+        except Exception as e:
+            print(f"[AI] ラベル収集に失敗: {e}")
+            return None
+
+    def _wrap_edit_export(self):
+        """app._do_edit_export (送出用の軌道焼き込み書き出し) を包み、書き出し完了後にラベルを収集する"""
+        app = self.app
+        if getattr(app, "_ai_export_wrapped", False) or not hasattr(app, "_do_edit_export"):
+            return
+        orig = app._do_edit_export
+
+        def wrapped(clip, swings, out_path, cache, total, edit_in=0, _orig=orig):
+            _orig(clip, swings, out_path, cache, total, edit_in)
+            self._collect_dataset(clip, [s for s in swings if len(s.points) >= 2], "送出用")
+
+        app._do_edit_export = wrapped
+        app._ai_export_wrapped = True
 
     def _show_undrawn(self, clip_id):
         spans = self._undrawn.get(clip_id) or []
@@ -331,7 +371,9 @@ class EditTools:
                 dense_points=dense, camera_angle=camera,
                 trajectory_note=("軌道: 信頼度不足" if unreliable else ("軌道: 一部区間のみ" if partial else None)),
                 progress=lambda r, m: self._set_status(f"{m} {r * 100:.0f}%"))
-            self._set_status(f"完了: {out_path.name} ({rep['frames']}f, {rep['seconds']:.0f}秒)"
+            ds = self._collect_dataset(clip, swings, "縦型") if swings else None
+            dsn = f"  ラベル保存 strong {ds['n_strong']} / weak {ds['n_weak']}" if ds else ""
+            self._set_status(f"完了: {out_path.name} ({rep['frames']}f, {rep['seconds']:.0f}秒){dsn}"
                              f"\n{out_dir}", "#88CC88")
 
         self._start(worker, "縦型書き出し")

@@ -12,3 +12,5 @@ hidapi>=0.14.0
 mediapipe>=1.1.0
 # フィードバックコメントのルール (config/rules.yaml)
 PyYAML>=6.0
+
+onnxruntime>=1.17

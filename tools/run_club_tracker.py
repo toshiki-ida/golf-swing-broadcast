@@ -1,6 +1,7 @@
 """run_club_tracker — ai/club_tracker.py を評価用に実行し、予測 JSON と確認動画を出力する。
 
     python tools/run_club_tracker.py <動画> <出力dir> [--in N] [--out N] [--interlaced] [--debug]
+                                     [--no-detector | --detector]   (省略時: models/clubhead.onnx があれば使う)
 
 出力:
     <出力dir>/club_tracker.pred.json     tools/eval_club.py 用 (全フレーム点 + 信頼度 + 確信点)
@@ -42,12 +43,13 @@ args = sys.argv[3:]
 in_f = int(args[args.index("--in") + 1]) if "--in" in args else 0
 out_f = int(args[args.index("--out") + 1]) if "--out" in args else -1
 interlaced = "--interlaced" in args
+use_det = False if "--no-detector" in args else (True if "--detector" in args else None)
 debug_dir = out_dir / "debug" if "--debug" in args else None
 out_dir.mkdir(parents=True, exist_ok=True)
 
 print(f"[club_tracker] {video.name}  in={in_f} out={out_f} interlaced={interlaced}")
 t0 = time.time()
-res = track_club(str(video), in_f, out_f, interlaced=interlaced, debug_dir=debug_dir,
+res = track_club(str(video), in_f, out_f, interlaced=interlaced, debug_dir=debug_dir, use_detector=use_det,
                  progress=lambda r, m: print(f"  {r * 100:3.0f}% {m}", flush=True))
 cp = res.confident_points()
 weak = res.weak_ranges()
@@ -56,7 +58,7 @@ print(f"[club_tracker] {res.seconds:.1f}s (pose {res.pose_seconds:.1f}s)  frames
       f"  control={len(cp)}  body_h={res.body_h:.0f}px  reliable={res.reliable} quality={res.quality}  weak={weak[:4]}")
 
 pred = {
-    "method": "club_tracker",
+    "method": "club_tracker" + ("+det" if getattr(res, "detector_used", False) else ""),
     "video": video.name,
     "points": [[x, y, f] for x, y, f in res.points],
     "confident_points": [[x, y, f] for x, y, f in cp],

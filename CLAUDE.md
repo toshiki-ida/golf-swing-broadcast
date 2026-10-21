@@ -50,9 +50,9 @@ pyinstaller GolfSwingBroadcast.spec --noconfirm        # → dist/GolfSwingBroad
 | `trajectory.py` | 軌道描画。`TimedSpline`(Catmull-Rom / ベジェ、フレーム同期)、`draw_gradient_trail`、`render_trajectory_on_frame` |
 | `playout.py` | `PlayoutEngine`: プレイリスト、cue/play/pause/seek、先読みリーダースレッド、DeckLink スケジュール出力、playout.json 永続化、exports/ スキャン |
 | `shuttle_pro.py` | ShuttlePRO v2 HID ドライバ(hidapi)。レポート形式自動検出、ジョグ/シャトル/ボタンをコールバック通知 |
-| `ai/` | AI 試作。`club_tracker.py` (骨格基点のクラブヘッド追跡)、`swing_analyzer.py` (swingcut 由来の局面・指標・撮影方向判定・rules.yaml コメント)、`sns_render.py` (縦型動画、軌道由来と骨格由来の局面を統合)、`edit_hook.py` (編集タブの 2 ボタン。app.py からの唯一の入口)、`config.py` (settings.json の "ai" 既定値)、`store.py` (`analysis/{clip_id}/`) |
+| `ai/` | AI 試作。`club_tracker.py` (骨格基点のクラブヘッド追跡)、`swing_analyzer.py` (swingcut 由来の局面・指標・撮影方向判定・rules.yaml コメント)、`sns_render.py` (縦型動画、軌道由来と骨格由来の局面を統合)、`edit_hook.py` (編集タブの AI 操作。app.py からの唯一の入口。書き出し時に `dataset.py` でラベルを蓄積)、`config.py` (settings.json の "ai" 既定値)、`store.py` (`analysis/{clip_id}/`)、`club_detector.py` (ONNX Runtime CPU のヘッド検出器。`models/clubhead.onnx` が無ければ無効)、`dataset.py` (書き出し時に承認済みヘッド座標を `datasets/clubhead/<clip_id>/` に保存。holdout 除外) |
 | `config/rules.yaml` | フィードバックコメントのルール (DTL は swingcut と同じ、`angle: face_on` が正面用)。exe では exe 同階層の config/ を読む |
-| `tools/` | `label_club.py` (正解ラベル)、`eval_club.py` (誤差評価、`--all` で tests/real を一括)、`run_club_tracker.py` / `run_autotrace.py` (予測 JSON + 確認動画) |
+| `tools/` | `label_club.py` (正解ラベル)、`eval_club.py` (誤差評価、`--all` で tests/real を一括、`--detector off|on|both` で検出器なし/ありを同じ表に)、`run_club_tracker.py` / `run_autotrace.py` (予測 JSON + 確認動画)、`import_labels.py` (tests/club_labels.json → datasets/clubhead)、`train_clubhead.py` (datasets/clubhead から検出器を学習し `models/clubhead.onnx` を書き出す。torch 入りの別 venv で実行) |
 | `docs/AI_INTEGRATION_DESIGN.md` / `docs/CLUB_TRACKING_EVAL.md` | AI 統合設計と、autotrace (YOLO) vs club_tracker の比較評価 |
 | `docs/HFR_double_speed_recording.md` | HFR 2x の設計メモ。**「通常モードは 2 枚中 1 枚を間引いて 29.97fps 録画」と書かれているが現行コードは `recording_frame_divisor=1`、通常モードは 59.94fps 全フレーム録画**。コードが正 |
 | `NOTION_DOC.md` / `README.md` | 利用者向け概要。行数表などは古い |
@@ -98,6 +98,7 @@ clips.json / playout.json / settings.json
   `shuttle_pos_mapping`, `keyboard_shortcuts`, `*_sash_x`。`AppSettings` は既定 dict に `update()` するので
   新キーは `AppSettings.__init__` の既定に追加するだけでよい。
 - `project_dir` は既定フォルダの settings.json に「ポインタ」として保存され、起動時にそこへ切り替わる。
+- 学習用ラベルはプロジェクトフォルダではなく **リポジトリ直下の `datasets/clubhead/`** に貯まる (`ai/dataset.py` の `DATASET_DIR`)。
 - クリップ/送出/編集の一覧は `source_path` の親ディレクトリ名 (`MM-DD`) で日付グループ化される。
 
 ## 設計上の約束ごと
@@ -124,6 +125,18 @@ clips.json / playout.json / settings.json
 - 既存素材で下がった項目があれば、良くなった項目と一緒に報告する。平均だけでなく最大誤差を見る。
 - ラベル (`tests/club_labels.json`) は評価中に動かさない。直す場合は別コミットで理由を書く。
 - 現在のラベルは Claude の目視 (sample / IMG_1095 の 12 点)。実収録素材のラベルはオーナーが付ける。
+
+### 学習ベース検出器 (clubhead.onnx) の運用
+
+- 学習データは **書き出し時に自動で貯まる** (`ai/dataset.py`): 送出用書き出し・縦型書き出しのたびに、そのクリップの制御点を
+  manual / auto_confirmed (強ラベル)、スプライン補間点を interpolated (弱ラベル) として `datasets/clubhead/<clip_id>/` に保存する。
+  同じクリップの再書き出しはフォルダごと上書き。`tests/real/split.yaml` の holdout は保存しない (評価が汚れる)。
+- `datasets/` と `models/` は .gitignore 済み (公開リポジトリに映像・モデルを入れない)。
+- 学習: `..\golf-autotrace\.venv\Scripts\python.exe tools/train_clubhead.py` (CUDA)。クリップ単位で train/val を分け、
+  結果は `models/clubhead_train.json` に残る (件数・検証 px 誤差・PCK)。
+- `ai/club_tracker.track_club(use_detector=None)` は `models/clubhead.onnx` があれば検出器の候補を足す。
+  検出器は **候補の提案だけ** で、連続性・欠損・区間・信頼度の判定は従来どおり。モデルが無ければ従来方式のまま。
+- 検出器を学習し直したら `tools/eval_club.py --all --split tune --tag det_N --detector both` で従来/検出器ありを同じ表に残す。
 
 ## ブランチ運用ルール
 

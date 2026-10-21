@@ -17,3 +17,4 @@ models/
 assets/fonts/
 handoff/*
 !handoff/README.md
+datasets/

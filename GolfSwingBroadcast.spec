@@ -13,11 +13,13 @@ _sp_datas, _sp_binaries, _sp_hiddenimports = collect_all('scipy')
 # matplotlib (約 15 MB) は mediapipe.tasks.python.vision.__init__ が無条件に import する
 # ため除外できない (除外すると frozen 環境で `from mediapipe.tasks.python import vision` が失敗する)。
 _mp_datas, _mp_binaries, _mp_hiddenimports = collect_all('mediapipe')
+# onnxruntime (クラブヘッド検出器 models/clubhead.onnx の推論)。DLL を含むので丸ごと同梱する
+_ort_datas, _ort_binaries, _ort_hiddenimports = collect_all('onnxruntime')
 _mp_hiddenimports += ['mediapipe', 'mediapipe.tasks.python',
                       'mediapipe.tasks.python.vision']
 
 # ai パッケージは app.py から関数内 import (try/except) で読まれるため明示する
-_ai_hiddenimports = ['ai', 'ai.config', 'ai.store', 'ai.edit_hook', 'ai.club_tracker',
+_ai_hiddenimports = ['ai', 'ai.config', 'ai.store', 'ai.edit_hook', 'ai.club_tracker', 'ai.club_detector', 'ai.dataset',
                      'ai.swing_analyzer', 'ai.sns_render', 'ai.selftest',
                      'yaml', 'scipy.signal', 'scipy.interpolate', 'PIL.ImageFont', 'PIL.ImageDraw']
 
@@ -58,9 +60,9 @@ else:
 a = Analysis(
     ['app.py'],
     pathex=[],
-    binaries=_np_binaries + _sp_binaries + _mp_binaries + _ffmpeg_files,
-    datas=[(_ctk_dir, 'customtkinter')] + _np_datas + _sp_datas + _mp_datas + _asset_datas,
-    hiddenimports=['comtypes.stream'] + _np_hiddenimports + _sp_hiddenimports + _mp_hiddenimports + _ai_hiddenimports,
+    binaries=_np_binaries + _sp_binaries + _mp_binaries + _ort_binaries + _ffmpeg_files,
+    datas=[(_ctk_dir, 'customtkinter')] + _np_datas + _sp_datas + _mp_datas + _ort_datas + _asset_datas,
+    hiddenimports=['comtypes.stream'] + _np_hiddenimports + _sp_hiddenimports + _mp_hiddenimports + _ort_hiddenimports + _ai_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

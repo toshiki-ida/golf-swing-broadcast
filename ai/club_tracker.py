@@ -354,15 +354,29 @@ def _estimate_body_h(arr: np.ndarray) -> float:
 def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
                interlaced: bool = False, upper_field_first: bool = True,
                model_path: Optional[Path] = None, realtime_factor: Optional[float] = None,
+               use_detector: Optional[bool] = None,
                progress: Optional[Callable[[float, str], None]] = None,
                debug_dir: Optional[Path] = None) -> ClubTrackResult:
     """クラブヘッド軌道を推定する。座標は元解像度のピクセル。
 
     realtime_factor: 素材 1 フレームが実時間の何フレーム分か (HFR 2x = 4)。省略時は fps から推定。
+    use_detector:    models/clubhead.onnx (ONNX Runtime CPU) をヘッド候補の提案に使う。None = あれば使う。
+                     時間的連続性・欠損・信頼度の判定は検出器の有無によらず同じ。
     """
     from ai import default_pose_model
     from ai.config import realtime_factor as _rt
     t_start = time.time()
+    detector = None
+    if use_detector is None or use_detector:
+        try:
+            from ai.club_detector import ClubDetector
+            det = ClubDetector()
+            if det.available():
+                detector = det
+            elif use_detector:
+                log.warning("models/clubhead.onnx が無いため従来方式で動きます")
+        except Exception as e:
+            log.warning("検出器を初期化できません (%s)。従来方式で動きます", e)
     model_path = Path(model_path) if model_path else default_pose_model()
     W, H, n_total, _fps = _probe(video_path)
     real_fps = _fps * (realtime_factor if realtime_factor else _rt(_fps, "auto")) * (2 if interlaced else 1)
@@ -580,6 +594,21 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
                 continue
             score = 0.5 + 0.5 * min(1.0, L / (0.7 * r_max))
             cands.append((score, theta, (fx, fy), near, 0, "shaft", True))
+        # --- (c) 学習ベース検出器 (ONNX) の候補。手首中心の切り出しだけを見るので背景の動きに引かれにくい
+        if detector is not None:
+            try:
+                for dx_, dy_, sc in detector.detect(cur, (wx, wy), body_h):
+                    dd = float(np.hypot(dx_ - wx, dy_ - wy))
+                    iy, ix = int(min(ah - 1, max(0, dy_))), int(min(aw - 1, max(0, dx_)))
+                    if dd < r_min or dd > r_max or not ok[iy, ix]:
+                        continue
+                    theta = float(np.degrees(np.arctan2(dy_ - wy, dx_ - wx)) % 360.0)
+                    # is_att=False: 検出器の候補は「手元接続」に数えない。学習データが少ないうちは誤検出もあり、
+                    # 接続ありに数えると信頼度ゲートを素通りする (det_1 で 130128 がバッグを追ったまま通過した)。
+                    # 追跡開始は motion の遠方塊と同じく 2 フレーム連続で同じ向き・距離に出たときだけ
+                    cands.append((0.6 + 1.0 * float(sc), theta, (float(dx_), float(dy_)), 0.0, 0, "det", False))
+            except Exception as e:
+                log.debug("detector error: %s", e)
         # --- 時間的連続性 (前フレームからの移動量の上限) と向きの予測で選ぶ
         best = None
         infos = []
@@ -596,7 +625,7 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
                 # 追跡開始前: 手元から伸びていない動きでは原則始めない (ギャラリー・服・影)。
                 # ただし遠くの大きな塊が 2 フレーム続けて同じ向き・同じ距離に出るなら (ヘッドだけが動き出した) 開始する
                 far_d = float(np.hypot(hx - wx, hy - wy))
-                weak = kind == "motion" and far_d >= 0.4 * r_max and n_sel >= 2.0 * head_d ** 2
+                weak = (kind == "motion" and far_d >= 0.4 * r_max and n_sel >= 2.0 * head_d ** 2) or kind == "det"
                 pend = state.get("pending")
                 consistent = (weak and pend is not None and i - pend[0] <= 2
                               and abs((theta - pend[1] + 180.0) % 360.0 - 180.0) <= 12.0
@@ -699,6 +728,8 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
                           frames_total=T, frames_detected=len(ks), real_fps=real_fps,
                           quality=quality, reliable=reliable)
     res.detect_seconds = t_detect
+    res.detector_used = detector is not None
+    quality["detector"] = detector is not None
     res.attached = {frame_ids[k]: bool(v) for k, v in attached.items()}
     seg_q = res.segment_quality()
     quality["segments"] = [{**q, "reliable": ok} for _, q, ok in seg_q]
