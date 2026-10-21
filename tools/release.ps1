@@ -85,13 +85,15 @@ Step "selftest"
 $st = Join-Path $root ("build\selftest_" + $sha)
 if (Test-Path $st) { Remove-Item -Recurse -Force $st }
 $t0 = Get-Date
-# Call operator + pipe (waits for the windowed exe). Start-Process is blocked by the antivirus
-# on the dev PC ("Access is denied"), so do not use it here.
-& $exe --ai-selftest (Resolve-Path $Sample).Path $st 2>&1 | Out-Null
+# Run through cmd.exe with the output redirected to a log file. Start-Process is blocked by the antivirus
+# on the dev PC ("Access is denied"), and redirecting a native command's stderr inside Windows PowerShell 5.1
+# turns every stderr line (the app logs warnings there) into a terminating error under $ErrorActionPreference=Stop.
+$selftestLog = Join-Path $root ("build\selftest_" + $sha + ".log")
+cmd.exe /c ('"' + $exe + '" --ai-selftest "' + (Resolve-Path $Sample).Path + '" "' + $st + '" > "' + $selftestLog + '" 2>&1')
 $selftestExit = $LASTEXITCODE
 $selftestSec = [math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
 $resultPath = Join-Path $st "selftest_result.json"
-if (-not (Test-Path $resultPath)) { throw "selftest produced no result (exit $selftestExit)" }
+if (-not (Test-Path $resultPath)) { throw "selftest produced no result (exit $selftestExit); see $selftestLog" }
 $result = Get-Content $resultPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($result.status -ne "OK") { throw "selftest failed: $($result.status) $($result.error)" }
 Write-Host ("  status=OK frozen=" + $result.frozen + " seconds=" + $selftestSec)
