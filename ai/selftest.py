@@ -92,6 +92,13 @@ def run_selftest(app_cls, video: str, out_dir: str, in_f: int = 0, out_f: int = 
         res["steps"].append("sns ok")
         res["sns_mp4"] = str(mp4)
         res["sns_frames"] = r.get("frames")
+        try:
+            from ai.club_detector import ClubDetector, model_path
+            from ai.dataset import dataset_dir, summary
+            res["club_detector"] = {"available": ClubDetector().available(), "model": str(model_path())}
+            res["labels"] = {"dir": str(dataset_dir(project)), **summary(dataset_dir(project))}
+        except Exception as e:
+            res["labels_error"] = str(e)
         res["analysis"] = {k: r.get(k) for k in ("phases", "phase_source", "trajectory_phases",
                                                   "skeleton_phases", "camera", "metrics", "comments",
                                                   "warnings", "tempo", "layout", "trajectory_drawn", "trajectory_note")}

@@ -21,7 +21,7 @@ import customtkinter as ctk
 from clip_manager import TrajectoryData
 from ai import ai_available
 from ai.config import get_ai_settings, realtime_factor
-from ai.dataset import collect_clip_labels
+from ai.dataset import collect_clip_labels, dataset_dir
 from ai.store import (analysis_dir, load_club_track, landmarks_from_track, save_club_track,
                       load_clip_ai_settings, save_clip_ai_settings, save_auto_snapshot, record_corrections)
 
@@ -131,6 +131,9 @@ class EditTools:
 
     def _collect_dataset(self, clip, swings, label=""):
         """書き出し時: そのクリップの軌道を承認済みラベルとして datasets/clubhead に保存 (holdout は除外、再書き出しは上書き)"""
+        cfg = get_ai_settings(self.app.settings)
+        if not cfg.get("collect_labels", True):
+            return None
         try:
             import json as _j
             adir = analysis_dir(self.app.project_dir, clip.id)
@@ -139,15 +142,14 @@ class EditTools:
             corr = _j.loads(corr_p.read_text(encoding="utf-8")) if corr_p.exists() else None
             lm = landmarks_from_track(track)
             body_h = (track or {}).get("body_h")
-            real_fps = (track or {}).get("real_fps") or \
-                clip.fps * realtime_factor(clip.fps, get_ai_settings(self.app.settings)["source_kind"])
+            real_fps = (track or {}).get("real_fps") or clip.fps * realtime_factor(clip.fps, cfg["source_kind"])
             res = collect_clip_labels(clip.id, clip.source_path, clip.in_frame, swings, corrections=corr,
                                       landmarks=lm, body_h=body_h, real_fps=real_fps, labeler="operator",
-                                      note=f"{label}書き出し時に承認")
+                                      note=f"{label}書き出し時に承認", out_root=dataset_dir(self.app.project_dir))
             if res is None:
                 print(f"[AI] ラベル収集: {clip.name} は holdout のため除外 (または点が 2 点未満)")
             else:
-                print(f"[AI] ラベル収集: {clip.name} → strong {res['n_strong']} / weak {res['n_weak']} {res['sources']}")
+                print(f"[AI] ラベル収集: {clip.name} → strong {res['n_strong']} / weak {res['n_weak']} {res['sources']} → {res['dir']}")
             return res
         except Exception as e:
             print(f"[AI] ラベル収集に失敗: {e}")
@@ -236,9 +238,11 @@ class EditTools:
         in_f, out_f = clip.in_frame, clip.get_out_frame()
         style = app.settings.data.get("trajectory_style", {})
 
+        use_det = None if get_ai_settings(app.settings).get("club_detector", "auto") == "auto" else False
+
         def worker():
             from ai.club_tracker import track_club
-            res = track_club(clip.source_path, in_f, out_f,
+            res = track_club(clip.source_path, in_f, out_f, use_detector=use_det,
                              progress=lambda r, m: self._set_status(f"{m} {r * 100:.0f}%"))
             adir = analysis_dir(app.project_dir, clip.id)
             save_club_track(adir, res, in_f, clip.source_path)

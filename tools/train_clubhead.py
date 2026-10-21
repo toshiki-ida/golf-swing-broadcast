@@ -1,6 +1,9 @@
 """train_clubhead — datasets/clubhead のラベルからクラブヘッド検出 (ヒートマップ回帰) を学習し、ONNX に書き出す。
 
-    <torch 入り venv>/python.exe tools/train_clubhead.py [--epochs 80] [--val-clips 1] [--arch tiny] [--out models/clubhead.onnx]
+    <torch 入り venv>/python.exe tools/train_clubhead.py [--dataset <保存先>] [--epochs 80] [--val-clips 1] [--arch tiny] [--out models/clubhead.onnx]
+
+    --dataset の既定はリポジトリ直下の datasets/clubhead。現場 PC から持ち帰ったラベルは
+    <プロジェクトフォルダ>/datasets/clubhead を指定する (複数ある場合は 1 つのフォルダにまとめてから)
 
 - 学習データ: datasets/clubhead/*/labels.json の strong 点 (manual / auto_confirmed)。weak (interpolated) は既定で使わない (--use-weak で含める)
 - 分割: クリップ単位 (同じクリップのフレームは train / val のどちらか一方だけ)。--val-clips 本を検証に回す
@@ -33,9 +36,9 @@ HM = INPUT // STRIDE
 
 # ---------------------------------------------------------------- データ
 
-def load_records(use_weak: bool):
+def load_records(use_weak: bool, root=DATASET_DIR):
     recs = []
-    for lab in sorted(DATASET_DIR.glob("*/labels.json")):
+    for lab in sorted(Path(root).glob("*/labels.json")):
         meta = json.loads(lab.read_text(encoding="utf-8"))
         for r in meta["points"]:
             if (r.get("weak") and not use_weak) or not r.get("in_crop", True):
@@ -154,6 +157,7 @@ def evaluate(model, recs, device):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", default=str(DATASET_DIR), help="labels.json を含むフォルダ群の親")
     ap.add_argument("--epochs", type=int, default=80)
     ap.add_argument("--min-steps", type=int, default=1500,
                     help="最低限回す勾配ステップ数。データが少ないときは epochs を自動で増やす")
@@ -171,9 +175,9 @@ def main() -> int:
     random.seed(a.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    recs = load_records(a.use_weak)
+    recs = load_records(a.use_weak, a.dataset)
     if len(recs) < 4:
-        print(f"ラベルが足りません ({len(recs)} 点)。datasets/clubhead にラベルを貯めてください")
+        print(f"ラベルが足りません ({len(recs)} 点 in {a.dataset})。書き出しでラベルを貯めるか --dataset を確認してください")
         return 1
     train, valid, val_clips = split_by_clip(recs, a.val_clips, a.seed)
     print(f"device={device} 学習 {len(train)} 点 / 検証 {len(valid)} 点 (検証クリップ: {val_clips})  "
@@ -224,7 +228,7 @@ def main() -> int:
     info = {"trained": time.strftime("%Y-%m-%d %H:%M:%S"), "arch": a.arch, "params": n_params,
             "input": INPUT, "stride": STRIDE, "epochs": a.epochs, "device": device, "seconds": round(secs, 1),
             "n_train": len(train), "n_val": len(valid), "val_clips": val_clips,
-            "clips": sorted({r["clip"] for r in recs}), "use_weak": a.use_weak,
+            "clips": sorted({r["clip"] for r in recs}), "use_weak": a.use_weak, "dataset": str(a.dataset),
             "val": final_val, "train_fit": final_train, "history": hist,
             "onnx": str(out), "onnx_mb": round(out.stat().st_size / 1e6, 2)}
     out.with_name("clubhead_train.json").write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")

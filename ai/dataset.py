@@ -11,9 +11,12 @@
 除外: tests/real/split.yaml の holdout に含まれるクリップ (元ファイル名で判定)。
 同じクリップを再書き出ししたらフォルダごと上書きする。
 
+保存先:
+  アプリ (編集タブの書き出し) … <プロジェクトフォルダ>/datasets/clubhead/<clip_id>/   ← exe フォルダの外。exe を差し替えても残る
+  開発ツール (import/train) の既定 … <リポジトリ>/datasets/clubhead/   (--dataset で指定可)
 レイアウト:
-  datasets/clubhead/<clip_id>/labels.json
-  datasets/clubhead/<clip_id>/frames/<frame>.jpg
+  <保存先>/<clip_id>/labels.json
+  <保存先>/<clip_id>/frames/<frame>.jpg
 """
 from __future__ import annotations
 
@@ -26,7 +29,14 @@ import cv2
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-DATASET_DIR = ROOT / "datasets" / "clubhead"
+DATASET_DIR = ROOT / "datasets" / "clubhead"      # 開発ツールの既定 (exe では _internal 配下になるので使わない)
+
+
+def dataset_dir(project_dir=None) -> Path:
+    """ラベルの保存先。project_dir を渡すと <project_dir>/datasets/clubhead (アプリはこちら)。無ければ開発用の既定。"""
+    if project_dir:
+        return Path(project_dir) / "datasets" / "clubhead"
+    return DATASET_DIR
 CROP_RATIO = 2.4            # 切り出し正方形の一辺 (身長代替値比)
 CROP_SIZE = 320             # 保存する切り出し画像の一辺 (px)
 WEAK_STEP_SEC = 0.1         # 補間点を何秒おきに記録するか
@@ -126,8 +136,10 @@ def _sample_interpolated(swings, real_fps: float):
 
 def collect_clip_labels(clip_id: str, source_path, in_frame: int, swings: list, *,
                         corrections: dict | None, landmarks: dict | None, body_h: float | None,
-                        real_fps: float, labeler: str = "operator", note: str = "") -> dict | None:
-    """書き出し時に呼ぶ。承認済みラベルを datasets/clubhead/<clip_id>/ に保存して要約を返す (holdout なら None)。"""
+                        real_fps: float, labeler: str = "operator", note: str = "",
+                        out_root=None) -> dict | None:
+    """書き出し時に呼ぶ。承認済みラベルを <out_root>/<clip_id>/ に保存して要約を返す (holdout なら None)。
+    out_root 省略時は開発用の既定 (DATASET_DIR)。アプリは dataset_dir(project_dir) を渡す。"""
     if is_holdout(source_path):
         return None
     pts_all = sorted({tuple(p) for sw in swings for p in sw.points}, key=lambda p: p[2])
@@ -145,7 +157,7 @@ def collect_clip_labels(clip_id: str, source_path, in_frame: int, swings: list, 
     weak = [{"frame": f, "x": x, "y": y, "source": "interpolated"}
             for x, y, f in _sample_interpolated(swings, real_fps)]
 
-    out_dir = DATASET_DIR / clip_id
+    out_dir = (Path(out_root) if out_root else DATASET_DIR) / clip_id
     if out_dir.exists():
         shutil.rmtree(out_dir)              # 再書き出しは上書き
     (out_dir / "frames").mkdir(parents=True)
@@ -209,10 +221,10 @@ def collect_clip_labels(clip_id: str, source_path, in_frame: int, swings: list, 
             "sources": {s: sum(1 for r in records if r["source"] == s) for s in ("manual", "auto_confirmed", "interpolated")}}
 
 
-def load_all(strong_only: bool = True) -> list:
-    """datasets/clubhead 配下の全ラベルを [(clip_id, record, image_path), ...] で返す。"""
+def load_all(strong_only: bool = True, root=None) -> list:
+    """保存先配下の全ラベルを [(clip_id, record, image_path), ...] で返す。"""
     out = []
-    for lab in sorted(DATASET_DIR.glob("*/labels.json")):
+    for lab in sorted((Path(root) if root else DATASET_DIR).glob("*/labels.json")):
         meta = json.loads(lab.read_text(encoding="utf-8"))
         for r in meta["points"]:
             if strong_only and r.get("weak"):
@@ -223,9 +235,9 @@ def load_all(strong_only: bool = True) -> list:
     return out
 
 
-def summary() -> dict:
+def summary(root=None) -> dict:
     clips = {}
-    for lab in sorted(DATASET_DIR.glob("*/labels.json")):
+    for lab in sorted((Path(root) if root else DATASET_DIR).glob("*/labels.json")):
         meta = json.loads(lab.read_text(encoding="utf-8"))
         clips[meta["clip_id"]] = {"strong": meta["n_strong"], "weak": meta["n_weak"], "labeler": meta.get("labeler"),
                                   "source_stem": meta.get("source_stem")}

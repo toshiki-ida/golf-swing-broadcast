@@ -14,6 +14,12 @@ AI_DEFAULTS = {
     "source_kind": "auto",
     # auto / dtl / face_on。auto はアドレス時の肩幅/胴長の比から推定 (斜めで判定不能なら指標を省く)
     "camera_angle": "auto",
+    # 書き出し (送出用 / 縦型) のたびに、承認した軌道をクラブヘッド検出器の学習データとして
+    # <プロジェクトフォルダ>/datasets/clubhead/ に保存する (ai/dataset.py)。False で保存しない
+    "collect_labels": True,
+    # クラブヘッド検出器 (models/clubhead.onnx, ONNX Runtime) をヘッド候補の提案に使うか。
+    #   auto: モデルが同梱されていれば使う / off: 使わない (従来方式のみ)
+    "club_detector": "auto",
     # 縦型 (SNS) 書き出し
     "sns": {
         "skeleton": True,       # スロー区間に骨格線を描く (club_track.json に骨格があるときのみ)
