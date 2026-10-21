@@ -447,7 +447,7 @@ def render_sns(video_path, out_path, *, in_frame: int = 0, out_frame: int = -1,
                swings: list, landmarks: Optional[dict] = None, phases: Optional[dict] = None,
                realtime_factor: float = 1.0, options: Optional[dict] = None,
                camera_angle: str = "auto", dense_points: Optional[list] = None,
-               stills_dir=None,
+               stills_dir=None, trajectory_note: Optional[str] = None,
                progress: Optional[Callable[[float, str], None]] = None) -> dict:
     """縦型動画を書き出す。swings / landmarks / dense_points のフレーム番号は in_frame 基準の相対値。"""
     opt = dict(AI_DEFAULTS["sns"])
@@ -472,13 +472,15 @@ def render_sns(video_path, out_path, *, in_frame: int = 0, out_frame: int = -1,
         out_frame = total - 1
     real_fps = fps * realtime_factor
     swings = [s for s in swings if len(s.points) >= 2]
-    if not swings:
-        raise ValueError("軌道がありません")
     landmarks = landmarks or {}
+    if not swings and not landmarks:
+        raise ValueError("軌道も骨格もありません")
+    if not swings and trajectory_note is None:
+        trajectory_note = "軌道: 信頼度不足"
 
     # --- 局面: 軌道由来 + 骨格由来 → 統合
     report(0.02, "局面を解析")
-    traj_phases = derive_phases(swings, in_frame, dense_points)
+    traj_phases = derive_phases(swings, in_frame, dense_points) if (swings or dense_points) else None
     analysis = None
     skel_phases = None
     if landmarks:
@@ -494,7 +496,12 @@ def render_sns(video_path, out_path, *, in_frame: int = 0, out_frame: int = -1,
             warnings.append(f"骨格解析をスキップ: {e}")
     log.info("軌道由来の局面: %s", traj_phases)
     if phases is None:
-        phases, phase_src = fuse_phases(traj_phases, skel_phases, warnings, real_fps)
+        if traj_phases is None and skel_phases is None:
+            raise ValueError("局面を決められません (軌道も骨格解析も無い)")
+        if traj_phases is None:
+            phases, phase_src = dict(skel_phases), {"top": "skeleton", "impact": "skeleton"}
+        else:
+            phases, phase_src = fuse_phases(traj_phases, skel_phases, warnings, real_fps)
     else:
         phase_src = {"top": "given", "impact": "given"}
     addr, top, imp, fin = phases["address"], phases["top"], phases["impact"], phases["finish"]
@@ -509,6 +516,8 @@ def render_sns(video_path, out_path, *, in_frame: int = 0, out_frame: int = -1,
     # --- レイアウト: 軌道 + 骨格の範囲から固定クロップ
     xs = [p[0] for s in swings for p in s.points]
     ys = [p[1] for s in swings for p in s.points]
+    if not xs:
+        xs, ys = [W * 0.5], [H * 0.5]
     for lm in landmarks.values():
         xs.extend(p[0] for p in lm)
         ys.extend(p[1] for p in lm)
@@ -596,9 +605,12 @@ def render_sns(video_path, out_path, *, in_frame: int = 0, out_frame: int = -1,
                         draw_skeleton(fr, landmarks[rel], skel_thick)
                     drawer.draw(fr, rel)
                     big = tf(fr)
+                    note_items = [(trajectory_note, (60, SAFE_TOP + 60), 40, "lm", (255, 160, 120))] if trajectory_note else []
+                    if section == "normal" and note_items:
+                        big = draw_texts(big, note_items)
                     if section == "slow":
                         big = draw_texts(big, [(f"×1/{slow} スロー", (OUT_W - 60, SAFE_TOP + 60), 56, "rm", WHITE),
-                                               *legend_items(angle if use_skel else "")])
+                                               *note_items, *legend_items(angle if use_skel else "")])
                     elif section == "freeze":
                         if tracks is not None and angle in ("dtl", "face_on"):
                             big = draw_guides(big, tracks, frame_to_idx.get(rel, 0), angle, map_pt, head_ref_x)
@@ -642,7 +654,8 @@ def render_sns(video_path, out_path, *, in_frame: int = 0, out_frame: int = -1,
            "skeleton": use_skel, "summary": bool(summary_n), "tempo": tempo,
            "camera": analysis["camera"] if analysis else None,
            "metrics": analysis["metrics"] if analysis else None,
-           "comments": comments, "warnings": warnings, "stills": stills}
+           "comments": comments, "warnings": warnings, "stills": stills,
+           "trajectory_note": trajectory_note, "trajectory_drawn": bool(swings)}
     out_path.with_suffix(".json").write_text(json.dumps(rep, ensure_ascii=False, indent=1, default=str),
                                              encoding="utf-8")
     return rep

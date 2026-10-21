@@ -21,7 +21,8 @@ import customtkinter as ctk
 from clip_manager import TrajectoryData
 from ai import ai_available
 from ai.config import get_ai_settings, realtime_factor
-from ai.store import analysis_dir, load_club_track, landmarks_from_track, save_club_track
+from ai.store import (analysis_dir, load_club_track, landmarks_from_track, save_club_track,
+                      load_clip_ai_settings, save_clip_ai_settings)
 
 
 class EditTools:
@@ -42,6 +43,13 @@ class EditTools:
             fg_color="#4A3B6B", hover_color="#5E4D86",
             command=self.run_sns_export)
         self.sns_btn.pack(fill="x", padx=8, pady=2)
+        row = ctk.CTkFrame(sec, fg_color="transparent")
+        row.pack(fill="x", padx=8, pady=(4, 0))
+        ctk.CTkLabel(row, text="撮影方向", font=("", 11)).pack(side="left")
+        self.camera_seg = ctk.CTkSegmentedButton(row, values=["auto", "dtl", "face_on"], width=150,
+                                                 font=("", 11), command=self._on_camera_changed)
+        self.camera_seg.set("auto")
+        self.camera_seg.pack(side="left", padx=6)
         self.status = ctk.CTkLabel(sec, text="", font=("", 10), text_color="#AAAAAA",
                                    wraplength=200, justify="left")
         self.status.pack(anchor="w", padx=8, pady=(2, 6))
@@ -87,6 +95,21 @@ class EditTools:
 
         threading.Thread(target=run, daemon=True, name=f"ai-{label}").start()
 
+    def _on_camera_changed(self, value):
+        """撮影方向をクリップごとに保存 (auto / dtl / face_on)"""
+        cid = getattr(self.app, "_edit_clip_id", None)
+        if cid:
+            save_clip_ai_settings(analysis_dir(self.app.project_dir, cid), camera_angle=value)
+            self._set_status(f"撮影方向: {value} (このクリップに保存)")
+
+    def camera_angle_for(self, clip_id) -> str:
+        """クリップごとの設定 → 無ければ settings.json の ai.camera_angle"""
+        saved = load_clip_ai_settings(analysis_dir(self.app.project_dir, clip_id)).get("camera_angle")
+        if saved:
+            self.camera_seg.set(saved)
+            return saved
+        return get_ai_settings(self.app.settings).get("camera_angle", "auto")
+
     # ---------------------------------------------------------------- 自動トレース
     def run_autotrace(self):
         clip = self._current_clip()
@@ -101,14 +124,24 @@ class EditTools:
             res = track_club(clip.source_path, in_f, out_f,
                              progress=lambda r, m: self._set_status(f"{m} {r * 100:.0f}%"))
             save_club_track(analysis_dir(app.project_dir, clip.id), res, in_f, clip.source_path)
-            ctrl = [(int(x), int(y), f - in_f) for x, y, f in res.confident_points()]
+            if not res.reliable:
+                q = res.quality
+                self._set_status("軌道: 信頼度不足 → 描画しません\n"
+                                 + " / ".join(q.get("reasons", [])) + "\n"
+                                 + f"(観測 {q.get('observed')}/{q.get('frames')}f, 率 {q.get('rate', 0):.0%}, "
+                                   f"連続性 {q.get('continuity', 0):.0%}, 手元接続 {q.get('attached', 0):.0%})", "#E0704B")
+                return
+            # 欠損で分割した区間ごとに 1 本の Swing (欠損区間は描かない)
+            segs = [[(int(x), int(y), f - in_f) for x, y, f in res.confident_points(points=seg)]
+                    for seg in res.segments()]
+            segs = [sg for sg in segs if len(sg) >= 2]
             weak = [(a - in_f, b - in_f) for a, b in res.weak_ranges()]
-            app.after(0, lambda: self._apply_trajectory(clip, ctrl, weak, style, res))
+            app.after(0, lambda: self._apply_trajectory(clip, segs, weak, style, res))
 
         self._start(worker, "軌道生成")
 
-    def _apply_trajectory(self, clip, ctrl, weak, style, res):
-        """GUI スレッド: 生成した制御点を軌道として保存し、編集タブに反映する。"""
+    def _apply_trajectory(self, clip, segs, weak, style, res):
+        """GUI スレッド: 生成した制御点 (区間ごと) を軌道として保存し、編集タブに反映する。"""
         app = self.app
         editing = getattr(app, "_edit_clip_id", None) == clip.id
         if editing:
@@ -117,32 +150,40 @@ class EditTools:
             app._edit_push_undo()
         else:
             swings, edit_in, edit_out = app.clip_manager.load_trajectory(clip.id)
-        new_swing = TrajectoryData(
-            points=ctrl,
-            color_start_hex=style.get("color_start_hex", "#FFFF00"),
-            color_end_hex=style.get("color_end_hex", "#FF0000"),
-            thickness=style.get("thickness", 3), blur=style.get("blur", 0),
-            fade_frames=style.get("fade_frames", 0), alpha=style.get("alpha", 0.85),
-            handles=[None] * len(ctrl))
-        # 空のスイングがあればそこに入れ、無ければ新しいスイングとして追加 (手描きは消さない)
-        idx = next((i for i, s in enumerate(swings) if len(s.points) < 2), None)
-        if idx is None:
-            swings.append(new_swing)
-            idx = len(swings) - 1
-        else:
-            swings[idx] = new_swing
+        first_idx = None
+        for sg in segs:
+            new_swing = TrajectoryData(
+                points=sg,
+                color_start_hex=style.get("color_start_hex", "#FFFF00"),
+                color_end_hex=style.get("color_end_hex", "#FF0000"),
+                thickness=style.get("thickness", 3), blur=style.get("blur", 0),
+                fade_frames=style.get("fade_frames", 0), alpha=style.get("alpha", 0.85),
+                handles=[None] * len(sg))
+            # 空のスイングがあればそこに入れ、無ければ新しいスイングとして追加 (手描きは消さない)
+            idx = next((i for i, s_ in enumerate(swings) if len(s_.points) < 2), None)
+            if idx is None:
+                swings.append(new_swing)
+                idx = len(swings) - 1
+            else:
+                swings[idx] = new_swing
+            if first_idx is None:
+                first_idx = idx
+        if first_idx is None:
+            self._set_status("軌道: 描ける区間がありません", "#E0704B")
+            return
         app.clip_manager.save_trajectory(clip.id, swings, edit_in=edit_in, edit_out=edit_out)
         if editing:
             app._edit_swings = swings
             app._edit_spline_cache.clear()
-            app._edit_swing_idx = idx
+            app._edit_swing_idx = first_idx
             app._edit_update_color_buttons()
             app._edit_update_display()
         app._clips_tab_dirty = app._edit_tab_dirty = True
-        msg = (f"完了 ({res.seconds:.0f}秒): 制御点 {len(ctrl)} 点 → Swing {idx + 1}"
-               f" (観測 {res.frames_detected}/{res.frames_total}f)")
+        q = res.quality
+        msg = (f"完了 ({res.seconds:.0f}秒): {len(segs)} 区間 / 制御点 {sum(len(s_) for s_ in segs)} 点"
+               f" (観測 {q.get('observed')}/{q.get('frames')}f, 率 {q.get('rate', 0):.0%}, 連続性 {q.get('continuity', 0):.0%})")
         if weak:
-            msg += " / 要手直し F" + " ".join(f"{a}-{b}" for a, b in weak[:3])
+            msg += " / 欠損 F" + " ".join(f"{a}-{b}" for a, b in weak[:3])
         self._set_status(msg, "#E0B040" if weak else "#88CC88")
 
     # ---------------------------------------------------------------- 縦型書き出し
@@ -156,16 +197,21 @@ class EditTools:
             app._edit_autosave_trajectory()
         swings, edit_in, edit_out = app.clip_manager.load_trajectory(clip.id)
         swings = [s for s in swings if len(s.points) >= 2]
-        if not swings:
-            self._set_status("軌道がありません。先に自動生成か手描きをしてください", "#E0B040")
-            return
         cfg = get_ai_settings(app.settings)
+        track = load_club_track(analysis_dir(app.project_dir, clip.id))
+        unreliable = bool(track) and not track.get("reliable", True)
+        if not swings and not track:
+            self._set_status("軌道も骨格もありません。先に自動生成か手描きをしてください", "#E0B040")
+            return
+        if not swings and unreliable:
+            self._set_status("軌道: 信頼度不足のため軌道なしで書き出します (骨格の局面のみ)", "#E0B040")
+        camera = self.camera_angle_for(clip.id)
         out_dir = app.project_dir / "exports" / "sns"
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{clip.name}_short.mp4"
-        track = load_club_track(analysis_dir(app.project_dir, clip.id))
         landmarks = landmarks_from_track(track)
-        dense = [tuple(p) for p in track.get("points", [])] if track else None
+        # 信頼度不足の軌道は局面推定にも使わない (骨格由来のみ)
+        dense = [tuple(p) for p in track.get("points", [])] if (track and not unreliable) else None
         factor = realtime_factor(clip.fps, cfg["source_kind"])
 
         def worker():
@@ -173,7 +219,7 @@ class EditTools:
             rep = render_sns(
                 clip.source_path, out_path, in_frame=clip.in_frame, out_frame=clip.get_out_frame(),
                 swings=swings, landmarks=landmarks, realtime_factor=factor, options=cfg["sns"],
-                dense_points=dense, camera_angle=cfg.get("camera_angle", "auto"),
+                dense_points=dense, camera_angle=camera, trajectory_note=("軌道: 信頼度不足" if unreliable else None),
                 progress=lambda r, m: self._set_status(f"{m} {r * 100:.0f}%"))
             self._set_status(f"完了: {out_path.name} ({rep['frames']}f, {rep['seconds']:.0f}秒)"
                              f"\n{out_dir}", "#88CC88")

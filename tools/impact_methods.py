@@ -16,6 +16,13 @@ build/club_eval/real/<名前>/club_track.json (骨格 33 点・全フレーム) 
 """
 from __future__ import annotations
 
+import sys as _sys
+for _st in (_sys.stdout, _sys.stderr):   # Windows の cp932 コンソールでも落ちないように
+    try:
+        _st.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import json
 import sys
 from pathlib import Path

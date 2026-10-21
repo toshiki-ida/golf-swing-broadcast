@@ -30,6 +30,9 @@ def save_club_track(dir_path, res, in_frame: int, source_path: str) -> Path:
         "conf": {str(rel(f)): round(float(c), 2) for f, c in res.conf.items()},
         "weak_ranges": [[rel(a), rel(b)] for a, b in res.weak_ranges()],
         "body_h": round(float(res.body_h), 1),
+        "quality": getattr(res, "quality", {}),
+        "reliable": bool(getattr(res, "reliable", True)),
+        "real_fps": float(getattr(res, "real_fps", 30.0)),
         "seconds": round(float(res.seconds), 2),
         "landmarks": {str(rel(f)): [[round(float(x), 1), round(float(y), 1)] for x, y in lm]
                       for f, lm in getattr(res, "landmarks", {}).items()},
@@ -55,3 +58,14 @@ def landmarks_from_track(track: dict | None) -> dict:
         f = float(k)
         out[int(f) if f.is_integer() else f] = [(float(x), float(y)) for x, y in lm]
     return out
+
+
+def load_clip_ai_settings(dir_path) -> dict:
+    p = Path(dir_path) / "settings.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+
+def save_clip_ai_settings(dir_path, **kw) -> None:
+    d = load_clip_ai_settings(dir_path)
+    d.update(kw)
+    (Path(dir_path) / "settings.json").write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")

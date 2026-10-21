@@ -12,6 +12,13 @@
 """
 from __future__ import annotations
 
+import sys as _sys
+for _st in (_sys.stdout, _sys.stderr):   # Windows の cp932 コンソールでも落ちないように
+    try:
+        _st.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import json
 import shutil
 import subprocess
@@ -46,7 +53,7 @@ cp = res.confident_points()
 weak = res.weak_ranges()
 print(f"[club_tracker] {res.seconds:.1f}s (pose {res.pose_seconds:.1f}s)  frames={res.frames_total}"
       f"  observed={res.frames_detected}  confident={sum(1 for v in res.conf.values() if v >= CONF_OK)}"
-      f"  control={len(cp)}  body_h={res.body_h:.0f}px  weak={weak}")
+      f"  control={len(cp)}  body_h={res.body_h:.0f}px  reliable={res.reliable} quality={res.quality}  weak={weak[:4]}")
 
 pred = {
     "method": "club_tracker",
@@ -55,6 +62,7 @@ pred = {
     "confident_points": [[x, y, f] for x, y, f in cp],
     "conf": {str(f): round(c, 2) for f, c in res.conf.items()},
     "weak_ranges": weak,
+    "quality": res.quality, "reliable": res.reliable, "real_fps": res.real_fps,
     "raw": {str(f): [round(x, 1), round(y, 1), round(c, 2)] for f, (x, y, c) in res.raw.items()},
     "seconds": round(res.seconds, 2),
     "pose_seconds": round(res.pose_seconds, 2),

@@ -66,10 +66,14 @@ def run_selftest(app_cls, video: str, out_dir: str, in_f: int = 0, out_f: int = 
         res["autotrace_status"] = status
         pts = [len(s.points) for s in app._edit_swings]
         res["swing_points"] = pts
-        if not pts or max(pts) < 2:
+        res["trajectory_gated"] = "信頼度不足" in status
+        if res["trajectory_gated"]:
+            res["steps"].append("autotrace gated (信頼度不足 → 軌道なしで縦型書き出しへ)")
+        elif not pts or max(pts) < 2:
             fail(f"軌道が生成されませんでした: {status}")
             return
-        res["steps"].append("autotrace ok")
+        else:
+            res["steps"].append("autotrace ok")
         tools.run_sns_export()
         app.after(500, lambda: wait_sns(clip, tools))
 
@@ -90,7 +94,7 @@ def run_selftest(app_cls, video: str, out_dir: str, in_f: int = 0, out_f: int = 
         res["sns_frames"] = r.get("frames")
         res["analysis"] = {k: r.get(k) for k in ("phases", "phase_source", "trajectory_phases",
                                                   "skeleton_phases", "camera", "metrics", "comments",
-                                                  "warnings", "tempo", "layout")}
+                                                  "warnings", "tempo", "layout", "trajectory_drawn", "trajectory_note")}
         res["status"] = "OK"
         res["seconds"] = round(time.time() - t0, 1)
         result_path.write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")

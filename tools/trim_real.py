@@ -8,6 +8,13 @@ HFR 2x 素材はフレームをそのまま残す (fps は変えない)。skip: 
 """
 from __future__ import annotations
 
+import sys as _sys
+for _st in (_sys.stdout, _sys.stderr):   # Windows の cp932 コンソールでも落ちないように
+    try:
+        _st.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import sys
 from pathlib import Path
 

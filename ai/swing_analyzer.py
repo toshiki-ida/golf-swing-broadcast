@@ -30,19 +30,21 @@ from ai import resource_root
 log = logging.getLogger("swing_analyzer")
 
 NOSE = 0
+L_EYE, R_EYE = 2, 5
+L_EAR, R_EAR = 7, 8
 L_SHOULDER, R_SHOULDER = 11, 12
 L_ELBOW, R_ELBOW = 13, 14
 L_WRIST, R_WRIST = 15, 16
 L_HIP, R_HIP = 23, 24
 L_KNEE, R_KNEE = 25, 26
 L_ANKLE, R_ANKLE = 27, 28
-USED = [NOSE, L_SHOULDER, R_SHOULDER, L_ELBOW, R_ELBOW, L_WRIST, R_WRIST,
+USED = [NOSE, L_EYE, R_EYE, L_EAR, R_EAR, L_SHOULDER, R_SHOULDER, L_ELBOW, R_ELBOW, L_WRIST, R_WRIST,
         L_HIP, R_HIP, L_KNEE, R_KNEE, L_ANKLE, R_ANKLE]
 SKELETON = [(11, 12), (11, 13), (13, 15), (12, 14), (14, 16), (11, 23), (12, 24), (23, 24),
             (23, 25), (25, 27), (24, 26), (26, 28)]
 
 DTL_MAX_RATIO = 0.35      # 肩幅/胴長 がこれ未満なら DTL
-FACE_MIN_RATIO = 0.65     # これ以上なら正面
+FACE_MIN_RATIO = 0.55     # これ以上なら正面 (実収録の正面素材は 0.6 前後)
 
 
 # ---------------------------------------------------------------- 前処理
@@ -241,20 +243,45 @@ def detect_impact_ball(video_path, in_frame, raw, ph, W, H, ball_sign):
 
 # ---------------------------------------------------------------- 撮影方向
 
-def estimate_camera_angle(tracks, address, W, H):
-    sh_l, sh_r = tracks[L_SHOULDER][address] * (W, H), tracks[R_SHOULDER][address] * (W, H)
-    hip = (tracks[L_HIP][address] + tracks[R_HIP][address]) / 2 * (W, H)
-    sh_mid = (sh_l + sh_r) / 2
-    shoulder_w = float(np.linalg.norm(sh_l - sh_r))
-    torso = float(np.linalg.norm(sh_mid - hip)) + 1e-6
-    ratio = shoulder_w / torso
-    if ratio < DTL_MAX_RATIO:
-        angle, conf = "dtl", min(1.0, (DTL_MAX_RATIO - ratio) / DTL_MAX_RATIO + 0.5)
-    elif ratio > FACE_MIN_RATIO:
-        angle, conf = "face_on", min(1.0, (ratio - FACE_MIN_RATIO) / 0.35 + 0.5)
-    else:
+def estimate_camera_angle(tracks, address, W, H, real_fps: float = 30.0):
+    """撮影方向 (dtl / face_on / unknown) を 3 つの手がかりの多数決で決める。
+
+    アドレス前後 ±0.3 秒の中央値を使う。
+      1. 肩幅 / 胴体長 (肩中点〜腰中点)   : DTL < 0.35 < 斜め < 0.55 < 正面
+      2. 腰幅 / 胴体長                    : DTL < 0.22 < 斜め < 0.40 < 正面
+      3. 顔の向き: (鼻 x − 両耳中点 x) / 両耳間距離
+                                          : 正面 |f| < 0.9、DTL |f| > 1.3 (鼻が両耳の外側に出る)
+    confidence = 一致した手がかりの割合。全て「斜め」なら unknown。
+    """
+    T = len(tracks[NOSE])
+    k = max(1, int(round(0.3 * real_fps)))
+    lo, hi = max(0, address - k), min(T, address + k + 1)
+    idx = np.arange(lo, hi)
+
+    def px(li):
+        return tracks[li][idx] * (W, H)
+
+    sh_l, sh_r, hip_l, hip_r = px(L_SHOULDER), px(R_SHOULDER), px(L_HIP), px(R_HIP)
+    torso = np.linalg.norm((sh_l + sh_r) / 2 - (hip_l + hip_r) / 2, axis=1) + 1e-6
+    r_sh = float(np.median(np.linalg.norm(sh_l - sh_r, axis=1) / torso))
+    r_hip = float(np.median(np.linalg.norm(hip_l - hip_r, axis=1) / torso))
+    nose, ear_l, ear_r = px(NOSE), px(L_EAR), px(R_EAR)
+    ear_d = np.linalg.norm(ear_l - ear_r, axis=1)
+    f = float(np.median(np.abs(nose[:, 0] - (ear_l[:, 0] + ear_r[:, 0]) / 2) / np.maximum(ear_d, 1e-6)))
+    votes = {
+        "shoulder": "dtl" if r_sh < DTL_MAX_RATIO else "face_on" if r_sh > FACE_MIN_RATIO else "unknown",
+        "hip": "dtl" if r_hip < 0.22 else "face_on" if r_hip > 0.40 else "unknown",
+        "face": "face_on" if f < 0.9 else "dtl" if f > 1.3 else "unknown",
+    }
+    counts = {a: sum(1 for v in votes.values() if v == a) for a in ("dtl", "face_on")}
+    angle = max(counts, key=counts.get)
+    n = counts[angle]
+    if n == 0 or (n == 1 and counts["dtl"] == counts["face_on"]):
         angle, conf = "unknown", 0.0
-    return {"angle": angle, "ratio": round(ratio, 3), "confidence": round(conf, 2), "source": "auto"}
+    else:
+        conf = round(n / 3, 2)
+    return {"angle": angle, "ratio": round(r_sh, 3), "hip_ratio": round(r_hip, 3), "face": round(f, 2),
+            "votes": votes, "confidence": conf, "source": "auto"}
 
 
 # ---------------------------------------------------------------- 指標
@@ -423,10 +450,11 @@ def analyze(landmarks: dict, W: int, H: int, fps: float, real_fps: float, *,
     phases_idx = {"address": ph["address"], "top": ph["top"], "impact": impact, "finish": max(ph["finish"], impact + 1)}
 
     # 撮影方向
-    cam = estimate_camera_angle(tracks, ph["address"], W, H)
+    cam = estimate_camera_angle(tracks, ph["address"], W, H, real_fps)
     if camera_angle in ("dtl", "face_on"):
         cam = {**cam, "angle": camera_angle, "confidence": 1.0, "source": "設定"}
-    log.info("camera angle: %s (肩幅/胴長=%.2f, 信頼度 %.2f, %s)", cam["angle"], cam["ratio"], cam["confidence"], cam["source"])
+    log.info("camera angle: %s (肩幅/胴長=%.2f 腰幅/胴長=%.2f 顔=%.2f votes=%s, 信頼度 %.2f, %s)", cam["angle"], cam["ratio"],
+             cam.get("hip_ratio", 0), cam.get("face", 0), cam.get("votes"), cam["confidence"], cam["source"])
     if cam["angle"] == "unknown":
         warnings.append(f"撮影方向を判定できません (肩幅/胴長={cam['ratio']:.2f}、斜め)。局面とテンポのみ出力")
 

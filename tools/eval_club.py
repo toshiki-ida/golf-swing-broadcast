@@ -34,6 +34,13 @@ tests/club_labels.json (tools/label_club.py で作成) と、各手法が出力�
 """
 from __future__ import annotations
 
+import sys as _sys
+for _st in (_sys.stdout, _sys.stderr):   # Windows の cp932 コンソールでも落ちないように
+    try:
+        _st.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import json
 import sys
 from collections import defaultdict
@@ -82,6 +89,9 @@ def track_summary(video: Path, out_dir: Path) -> dict:
         return row
     pred = json.loads(pred_path.read_text(encoding="utf-8"))
     conf = pred.get("conf", {})
+    q = pred.get("quality") or {}
+    row["reliable"] = pred.get("reliable")
+    row["cont"] = q.get("continuity")
     row.update({"frames": len(pred.get("points", [])), "observed": len(pred.get("raw", {})),
                 "confident": sum(1 for v in conf.values() if v >= 1.5),
                 "weak": len(pred.get("weak_ranges", [])), "seconds": pred.get("seconds")})
@@ -100,7 +110,7 @@ def track_summary(video: Path, out_dir: Path) -> dict:
         track = json.loads(track_path.read_text(encoding="utf-8")) if track_path.exists() else None
         dense = [tuple(p) for p in (track or pred)["points"]]
         swings = [TrajectoryData(points=[tuple(p) for p in pred["confident_points"]])]
-        traj = derive_phases(swings, 0, dense)
+        traj = derive_phases(swings, 0, dense) if len(dense) >= 4 else None
         row["traj_phases"] = traj
         lm = landmarks_from_track(track)
         warnings = []
@@ -119,7 +129,8 @@ def track_summary(video: Path, out_dir: Path) -> dict:
             row["fused_src"] = src
             tol = max(2, int(round(0.05 * fps * factor)))   # 実時間 50 ms
             row["tol"] = tol
-            row["agree"] = {k: abs(traj[k] - a["phases"][k]) <= tol for k in ("top", "impact")}
+            if traj:
+                row["agree"] = {k: abs(traj[k] - a["phases"][k]) <= tol for k in ("top", "impact")}
         row["warnings"] = warnings
     except Exception as e:
         row["analyze_error"] = f"{type(e).__name__}: {e}"
@@ -129,7 +140,7 @@ def track_summary(video: Path, out_dir: Path) -> dict:
 def format_summary(rows: list) -> str:
     lines = ["=== 追跡率・局面検出 (全素材) ===",
              f"{'素材':<22} {'動画f':>6} {'観測':>6} {'確信':>6} {'率':>6} {'欠測':>5} {'秒':>5}  "
-             f"{'軌道 top/imp':<13} {'骨格 top/imp':<13} {'採用':<10} {'一致':<8} {'ｽｲﾝｸﾞf':>7} {'撮影方向 (比, 信頼度)':<24} 警告"]
+             f"{'軌道 top/imp':<13} {'骨格 top/imp':<13} {'採用':<10} {'一致':<8} {'信頼':>3} {'連続':>5} {'ｽｲﾝｸﾞf':>7} {'撮影方向 (比, 信頼度)':<24} 警告"]
     for r in rows:
         if "error" in r:
             lines.append(f"{r['name']:<22} {r['error']}")
@@ -146,8 +157,10 @@ def format_summary(rows: list) -> str:
         srcs = f"{str(src.get('top', '-'))[:4]}/{str(src.get('impact', '-'))[:4]}" if src else "-"
         ag = r.get("agree")
         ags = ("".join("o" if ag[k] else "x" for k in ("top", "impact")) + f"(±{r.get('tol')})") if ag else "-"
+        rel = "-" if r.get("reliable") is None else ("OK" if r["reliable"] else "NG")
+        cont = "-" if r.get("cont") is None else f"{r['cont']:.0%}"
         lines.append(f"{r['name']:<22} {r.get('video_frames', '?'):>6} {r['observed']:>6} {r['confident']:>6} {rate:>6} {r['weak']:>5} "
-                     f"{(r.get('seconds') or 0):>5.0f}  {tps:<13} {sps:<13} {srcs:<10} {ags:<8} {str(r.get('swing_frames', '-')):>7} "
+                     f"{(r.get('seconds') or 0):>5.0f}  {tps:<13} {sps:<13} {srcs:<10} {ags:<8} {rel:>3} {cont:>5} {str(r.get('swing_frames', '-')):>7} "
                      f"{r.get('camera', '-'):<24} {warn}")
     lines.append("観測 = 位置を観測できたフレーム数、確信 = 信頼度 1.5 以上、率 = 観測/動画フレーム、欠測 = 欠測区間の数。"
                  "採用 = 統合後の出所 (traj=軌道 / skel=骨格)。一致 = トップ/インパクトで軌道と骨格が実時間 50ms 以内か (o/x)。ｽｲﾝｸﾞf = 骨格由来のアドレス→フィニッシュのフレーム数。")

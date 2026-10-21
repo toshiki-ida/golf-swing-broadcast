@@ -84,7 +84,15 @@ GROUND_MARGIN = 0.04        # 足の最下点からこの分より下は地面 (
 CONF_OK = 1.5               # これ以上を「確信点」とする
 WRIST_MIN_VIS = 0.5         # これ未満の visibility の手首は欠測として補間
 WRIST_MAX_JUMP = 0.33       # 手首が 1 フレームでこれ (身長代替値比) 以上跳んだら欠測扱い
-HOLD_CONF = 0.8             # 静止区間で保持した位置の信頼度
+PLAYER_DILATE_RATIO = 0.55  # 選手マスクの膨張半径 (身長代替値比)。この外側の動き (ギャラリー・バッグ・木) は見ない
+SHAFT_MIN_LEN_RATIO = 0.15  # シャフト線分の最小長 (r_max 比)
+SHAFT_PASS_RATIO = 2.0      # 線分の延長が手首中点からこの距離 (hand_r 比) 以内を通れば「手から伸びる線」
+MAX_HEAD_SPEED_BH = 30.0    # ヘッド速度の上限 (身長代替値/秒)。前の観測からこれ以上跳んだ候補は棄却
+GAP_MAX_SEC = 0.10          # これより長い欠損は軌道を分割して描かない
+RELIABLE_MIN_RATE = 0.35    # 信頼度ゲート: スイング区間の観測率
+RELIABLE_MIN_CONT = 0.70    # 信頼度ゲート: 連続する観測の移動量が上限内だった割合
+RELIABLE_MIN_OBS = 10       # 信頼度ゲート: 観測フレーム数
+RELIABLE_MIN_ATT = 0.40     # 信頼度ゲート: 手元から伸びるシャフトに繋がっていた観測の割合
 MAX_POSES = 4               # 同時に検出する人数の上限 (キャディ・カメラマンを含めて選手を選ぶため)
 TRACK_ASSOC = 1.0           # 腰中点の距離 (胴体長比) がこれ未満なら同じ人物トラック
 BODY_H_WINDOW = 0.4         # 身長代替値を決めるのに使うクリップ前半の割合 (アドレス付近。終盤のズームを除外)
@@ -92,8 +100,8 @@ BODY_H_WINDOW = 0.4         # 身長代替値を決めるのに使うクリッ�
 
 @dataclass
 class ClubTrackResult:
-    points: list                      # [(x, y, frame), ...] 全フレーム (補間含む)
-    conf: dict                        # {frame: 信頼度}  0 = 補間, HOLD_CONF = 静止保持
+    points: list                      # [(x, y, frame), ...] 観測できたフレームのみ (補間しない)
+    conf: dict                        # {frame: 信頼度}
     wrist: dict = field(default_factory=dict)   # {frame: (x, y)} 手首中点 (元解像度)
     body_h: float = 0.0               # 身長代替値 (元解像度 px)
     seconds: float = 0.0
@@ -101,18 +109,31 @@ class ClubTrackResult:
     scale: float = 1.0                # 解析解像度 / 元解像度
     frames_total: int = 0
     frames_detected: int = 0
+    real_fps: float = 30.0
+    quality: dict = field(default_factory=dict)   # 観測率・連続性・手元接続率・判定理由
+    reliable: bool = False                        # 信頼度ゲート (False なら軌道を描かない)
+
+    def segments(self, max_gap_sec: float = GAP_MAX_SEC, min_pts: int = 4) -> list:
+        """欠損 (max_gap_sec より長い) で分割した連続区間ごとの点列。短すぎる区間は捨てる。"""
+        max_gap = max(1.0, max_gap_sec * self.real_fps)
+        out, cur = [], []
+        for p in sorted(self.points, key=lambda q: q[2]):
+            if cur and p[2] - cur[-1][2] > max_gap:
+                if len(cur) >= min_pts:
+                    out.append(cur)
+                cur = []
+            cur.append(p)
+        if len(cur) >= min_pts:
+            out.append(cur)
+        return out
 
     def confident_points(self, min_conf: float = CONF_OK, max_pts: int = 18,
-                         min_gap: float = 2.0) -> list:
-        """確信点だけを、編集タブの制御点として使える点数に間引いて返す。"""
-        good = [p for p in self.points if self.conf.get(p[2], 0.0) >= min_conf]
-        # 先頭/末尾の静止保持点 (アドレス・フィニッシュ) は位置として正しいので制御点に含める
-        if self.points and self.conf.get(self.points[0][2], 0.0) == HOLD_CONF and                 (not good or good[0][2] != self.points[0][2]):
-            good.insert(0, self.points[0])
-        if self.points and self.conf.get(self.points[-1][2], 0.0) == HOLD_CONF and                 (not good or good[-1][2] != self.points[-1][2]):
-            good.append(self.points[-1])
+                         min_gap: float = 2.0, points: list = None) -> list:
+        """確信点だけを、編集タブの制御点として使える点数に間引いて返す (points で区間を指定可)。"""
+        src = points if points is not None else self.points
+        good = [p for p in src if self.conf.get(p[2], 0.0) >= min_conf]
         if len(good) < 2:
-            return list(self.points[:: max(1, len(self.points) // max_pts)])
+            return list(src[:: max(1, len(src) // max_pts)]) if len(src) >= 2 else list(src)
         # 信頼度の高い点から貪欲に採用し (min_gap 以内の近接点は捨てる)、最後にフレーム順に並べる。
         # 先頭・末尾は必ず残す
         ends = [good[0], good[-1]]
@@ -126,16 +147,11 @@ class ClubTrackResult:
 
     def weak_ranges(self, min_conf: float = CONF_OK, min_len: int = 3) -> list:
         """観測できなかった連続区間 [(開始, 終了), ...] (オペレーターの手直し箇所)。"""
-        out, run = [], []
-        for _, _, f in self.points:
-            if self.conf.get(f, 0.0) < min_conf:
-                run.append(f)
-            else:
-                if len(run) >= min_len:
-                    out.append((run[0], run[-1]))
-                run = []
-        if len(run) >= min_len:
-            out.append((run[0], run[-1]))
+        fs = sorted(p[2] for p in self.points if self.conf.get(p[2], 0.0) >= min_conf)
+        out = []
+        for a, b in zip(fs[:-1], fs[1:]):
+            if b - a - 1 >= min_len:
+                out.append((a + 1, b - 1))
         return out
 
 
@@ -194,12 +210,23 @@ def _make_landmarker(model_path: Path):
     return mp, vision.PoseLandmarker.create_from_options(opts)
 
 
-def _select_golfer(per_frame: list) -> list:
+def _ball_near_feet(frame_bgr, lm, W, H) -> bool:
+    """足元 (ボール側いずれか) に白い小さな球があるか (swing_analyzer.detect_ball_candidates を流用)"""
+    try:
+        from ai.swing_analyzer import detect_ball_candidates
+        ankle = ((lm[L_ANKLE, 0] + lm[R_ANKLE, 0]) / 2, (lm[L_ANKLE, 1] + lm[R_ANKLE, 1]) / 2)
+        return any(detect_ball_candidates(frame_bgr, ankle, sign, W, H) for sign in (1, -1))
+    except Exception:
+        return False
+
+
+def _select_golfer(per_frame: list, first_frame=None, size=None) -> list:
     """フレームごとの複数人の骨格 [(33, 3) ...] から、選手 1 人分の系列 [(33, 3) or None] を返す。
 
     腰中点の位置でトラックに束ね (近い人物は同じトラック)、トラックごとに
     「手首中点の移動範囲 ÷ 胴体長」を測り、最も大きい (= スイングした) トラックを選手とする。
     キャディ・カメラマン・ギャラリーは立っているだけなので手首がほとんど動かない。
+    上位 2 本が拮抗 (25% 以内) するときは、最初のフレームで足元にボールがある方を優先する。
     """
     tracks: list = []    # {"hip": 最近の腰中点, "torso": 胴体長, "frames": {i: lm}}
     for i, poses in enumerate(per_frame):
@@ -237,9 +264,24 @@ def _select_golfer(per_frame: list) -> list:
         return rng / t["torso"]
 
     scores = [score(t) for t in tracks]
-    k = int(np.argmax(scores))
-    log.info("人物トラック %d 本: 手首移動量/胴長 = %s → %d を選手に", len(tracks),
-             [round(x, 2) for x in scores], k)
+    order = sorted(range(len(tracks)), key=lambda j: -scores[j])
+    k = order[0]
+    ball_note = ""
+    if first_frame is not None and size is not None and len(order) >= 2 and scores[order[1]] > 0 \
+            and scores[order[1]] >= 0.75 * scores[order[0]]:
+        aw, ah = size
+        near = []
+        for j in order[:3]:
+            if scores[j] <= 0:
+                continue
+            f0 = min(tracks[j]["frames"])
+            near.append((j, _ball_near_feet(first_frame, tracks[j]["frames"][f0], aw, ah)))
+        with_ball = [j for j, b in near if b]
+        if len(with_ball) == 1:
+            k = with_ball[0]
+            ball_note = f" (手首移動量が拮抗 → 足元にボールがある {k} を採用)"
+    log.info("人物トラック %d 本: 手首移動量/胴長 = %s → %d を選手に%s", len(tracks),
+             [round(x, 2) for x in scores], k, ball_note)
     chosen = tracks[k]
     return [chosen["frames"].get(i) for i in range(T)]
 
@@ -284,14 +326,19 @@ def _estimate_body_h(arr: np.ndarray) -> float:
 
 def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
                interlaced: bool = False, upper_field_first: bool = True,
-               model_path: Optional[Path] = None,
+               model_path: Optional[Path] = None, realtime_factor: Optional[float] = None,
                progress: Optional[Callable[[float, str], None]] = None,
                debug_dir: Optional[Path] = None) -> ClubTrackResult:
-    """クラブヘッド軌道を推定する。座標は元解像度のピクセル。"""
+    """クラブヘッド軌道を推定する。座標は元解像度のピクセル。
+
+    realtime_factor: 素材 1 フレームが実時間の何フレーム分か (HFR 2x = 4)。省略時は fps から推定。
+    """
     from ai import default_pose_model
+    from ai.config import realtime_factor as _rt
     t_start = time.time()
     model_path = Path(model_path) if model_path else default_pose_model()
     W, H, n_total, _fps = _probe(video_path)
+    real_fps = _fps * (realtime_factor if realtime_factor else _rt(_fps, "auto")) * (2 if interlaced else 1)
     scale = min(1.0, ANALYSIS_MAX_W / max(W, H))
     aw, ah = int(round(W * scale)), int(round(H * scale))
     gap = MOTION_GAP * (2 if interlaced else 1)
@@ -307,9 +354,12 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
     frame_ids: list = []
     lms: list = []
     t_pose = 0.0
+    first_small = None
     try:
         for i, (fno, small) in enumerate(_iter_frames(video_path, in_frame, out_frame,
                                                       interlaced, upper_field_first, (aw, ah))):
+            if first_small is None:
+                first_small = small.copy()
             rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
             t0 = time.time()
             res = landmarker.detect_for_video(
@@ -327,7 +377,7 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
     T = len(frame_ids)
     if T < 2 * gap_slow + 2:
         raise ValueError("フレームが足りません")
-    lms = _select_golfer(lms)   # 複数人 → 手首が最も動く 1 人
+    lms = _select_golfer(lms, first_small, (aw, ah))   # 複数人 → 手首が最も動く 1 人 (拮抗時はボールの足元)
 
     # ---- 骨格の整形: 欠測補間、身長代替値、手首中点
     arr = np.full((T, 33, 2), np.nan, dtype=np.float32)
@@ -359,28 +409,31 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
     min_px = max(12.0, MIN_PX_RATIO * head_d ** 2)   # これ未満の動き画素は無視 (フレア等)
     foot_y = np.max(arr[:, [L_HEEL, R_HEEL, L_FOOT, R_FOOT], 1], axis=1)   # 足の最下点 (地面)
 
-    # ---- パス 2: 3 フレーム差分 + 円環内の角度ヒストグラム探索 (動画をもう一度読む)
+    # ---- パス 2: 動き差分 + シャフト線分 + 角度ヒストグラム (動画をもう一度読む)
     report(0.5, "ヘッド探索")
     yy, xx = np.mgrid[0:ah, 0:aw].astype(np.float32)
     kernel = np.ones((3, 3), np.uint8)
+    dil_r = max(5, int(PLAYER_DILATE_RATIO * body_h))
+    max_step = MAX_HEAD_SPEED_BH * body_h / real_fps     # 1 フレームあたりのヘッド移動量の上限 (解析解像度 px)
     raw: dict = {}                 # i -> (x, y, conf)
-    trace: dict = {}               # i -> [(score, theta, far, near, n_sel), ...] 診断用
-    state = {"theta": None, "omega": 0.0, "r": None, "last": None, "miss": 0, "pending": None}
-    buf = collections.deque()       # (i, small) の窓
+    attached: dict = {}            # i -> 手元から伸びる候補だったか
+    trace: dict = {}
+    state = {"theta": None, "omega": 0.0, "last": None, "miss": 0, "pending": None}
+    buf = collections.deque()
     t_detect = 0.0
     nb = 360 // ANGLE_BIN
     smooth_k = np.array([1, 2, 3, 2, 1], dtype=np.float32) / 9.0
-    # シャフトが半分写っている時の角度ヒストグラム重みの目安 (幅 3px, 重み 0.1+(d/r_max)^2 の積分)
     hist_ref = 0.3 * (r_max - r_min)
+    shaft_min_len = SHAFT_MIN_LEN_RATIO * r_max
 
-    def detect(i, prev, cur, nxt, dbg_tag=""):
-        """1 フレーム分のヘッド検出。見つかれば raw[i] に入れて True を返す。"""
-        t0 = time.time()
-        motion = cv2.min(cv2.absdiff(cur, prev), cv2.absdiff(cur, nxt)).max(axis=2)
-        mask = (motion > MOTION_THR).astype(np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        # 人物マスク (骨格の太線 + 手首まわり)、円環、地面より下 (影) を除外
+    def player_region(i):
+        """探索領域 = 膨張した選手マスク ∩ 手首円環、除外 = 人物の太線・手・頭・地面より下"""
         pts = arr[i]
+        lines = np.full((ah, aw), 255, np.uint8)
+        for a, b in BODY_LINES:
+            cv2.line(lines, tuple(pts[a].astype(int)), tuple(pts[b].astype(int)), 0, max(3, body_w // 2))
+        # 骨格線からの距離 dil_r 以内 (巨大カーネルの dilate より距離変換が速い)
+        region = (cv2.distanceTransform(lines, cv2.DIST_L2, 3) <= dil_r).astype(np.uint8) * 255
         body = np.zeros((ah, aw), np.uint8)
         for a, b in BODY_LINES:
             cv2.line(body, tuple(pts[a].astype(int)), tuple(pts[b].astype(int)), 255, body_w)
@@ -389,100 +442,169 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
         cv2.circle(body, tuple(pts[NOSE].astype(int)), head_excl, 255, -1)
         dist = np.hypot(xx - wx, yy - wy)
         ground = foot_y[i] + GROUND_MARGIN * body_h
-        mask[(body > 0) | (dist < r_min) | (dist > r_max) | (yy > ground)] = 0
+        ok = (region > 0) & (body == 0) & (dist >= r_min) & (dist <= r_max) & (yy <= ground)
+        return ok, dist, (wx, wy), ground
+
+    def shaft_lines(gray, gray_prev, gray_next, ok, wx, wy):
+        """手首から伸びる直線 (シャフト) を探し、[(theta, far_end, near_dist, length), ...] を返す。
+
+        前後フレームの同じ位置にもエッジがある線分は静止した背景 (木・バッグ・ギャラリーの輪郭) なので捨てる。
+        静止中のクラブ (アドレス・トップ) も落ちるが、その区間は欠損のままで良い。
+        """
+        x0, x1 = max(0, int(wx - r_max) - 2), min(aw, int(wx + r_max) + 3)
+        y0, y1 = max(0, int(wy - r_max) - 2), min(ah, int(wy + r_max) + 3)
+        edges = np.zeros_like(gray)
+        if x1 <= x0 or y1 <= y0:
+            return []
+        edges[y0:y1, x0:x1] = cv2.Canny(gray[y0:y1, x0:x1], 60, 160)
+        edges[~ok] = 0
+        static = np.zeros_like(gray)
+        static[y0:y1, x0:x1] = cv2.max(cv2.Canny(gray_prev[y0:y1, x0:x1], 60, 160),
+                                       cv2.Canny(gray_next[y0:y1, x0:x1], 60, 160))
+        static = cv2.dilate(static, kernel, iterations=2)
+        segs = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=18,
+                               minLineLength=int(shaft_min_len), maxLineGap=int(max(4, 0.03 * r_max)))
+        out = []
+        if segs is None:
+            return out
+        for x1, y1, x2, y2 in np.asarray(segs).reshape(-1, 4):
+            n = max(8, int(np.hypot(x2 - x1, y2 - y1) / 3))
+            sx = np.linspace(x1, x2, n).astype(int)
+            sy = np.linspace(y1, y2, n).astype(int)
+            if float((static[sy, sx] > 0).mean()) > 0.5:
+                continue   # 前後フレームにも同じエッジ → 動いていない線
+            d1, d2 = np.hypot(x1 - wx, y1 - wy), np.hypot(x2 - wx, y2 - wy)
+            near, far = ((x1, y1), d1) if d1 < d2 else ((x2, y2), d2)
+            far_pt = (x2, y2) if d1 < d2 else (x1, y1)
+            # 線分の延長が手首中点の近くを通るか (点と直線の距離)
+            vx, vy = x2 - x1, y2 - y1
+            L = np.hypot(vx, vy) + 1e-6
+            perp = abs(vx * (wy - y1) - vy * (wx - x1)) / L
+            if perp > SHAFT_PASS_RATIO * hand_r or near[1] > 0.6 * r_max:
+                continue
+            theta = float(np.degrees(np.arctan2(far_pt[1] - wy, far_pt[0] - wx)) % 360.0)
+            out.append((theta, far_pt, float(near[1]), float(L)))
+        out.sort(key=lambda t: -t[3])
+        return out[:6]
+
+    def detect(i, prev, cur, nxt, dbg_tag=""):
+        """1 フレーム分のヘッド検出。見つかれば raw[i] に入れて True を返す。"""
+        t0 = time.time()
+        ok, dist, (wx, wy), ground = player_region(i)
+        motion = cv2.min(cv2.absdiff(cur, prev), cv2.absdiff(cur, nxt)).max(axis=2)
+        mask = (motion > MOTION_THR).astype(np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask[~ok] = 0
+        gray = cv2.cvtColor(cur, cv2.COLOR_BGR2GRAY)
+        lines = shaft_lines(gray, cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY), cv2.cvtColor(nxt, cv2.COLOR_BGR2GRAY), ok, wx, wy)
         ys, xs = np.nonzero(mask)
         found = False
         head = None
+        cands = []     # (score, theta, head(x,y), near, n_sel, kind)
+        last_head = None
+        if state["last"] is not None and i - state["last"] <= 3:
+            last_head = np.array(raw[state["last"]][:2])
+            step_cap = max_step * (i - state["last"])
+
+        def continuity(hx, hy):
+            if last_head is None:
+                return 0.0, True
+            d = float(np.hypot(hx - last_head[0], hy - last_head[1]))
+            return d, d <= step_cap
+
+        # --- (a) 動き差分の角度ヒストグラム (従来法)
         if len(xs) >= min_px:
             d = dist[ys, xs]
             ang = np.degrees(np.arctan2(ys - wy, xs - wx)) % 360.0
             bins = (ang / ANGLE_BIN).astype(int) % nb
-            # シャフト+ヘッド+残像は手首から見て同じ角度に並ぶ → 角度ヒストグラムのピーク
-            # 遠い画素ほど重く (手元の腕・服の動きより、伸びたシャフトを優先)
             hist = np.bincount(bins, weights=0.1 + (d / r_max) ** 2, minlength=nb).astype(np.float32)
             hs = np.convolve(np.concatenate([hist[-2:], hist, hist[:2]]), smooth_k, "valid")
-            cand = [b for b in range(nb)
-                    if hs[b] >= hs[(b - 1) % nb] and hs[b] >= hs[(b + 1) % nb]
-                    and hs[b] >= 0.15 * hs.max() and hs[b] > 0]
+            peaks = [b for b in range(nb)
+                     if hs[b] >= hs[(b - 1) % nb] and hs[b] >= hs[(b + 1) % nb]
+                     and hs[b] >= 0.15 * hs.max() and hs[b] > 0]
             hs_norm = np.minimum(1.0, hs / hist_ref)
-            best = None
-            cands_info = []
-            pend_hit = None
-            # 手元から伸びる候補がこのフレームにあるか (あれば離れた塊を減点する)
-            has_attached = False
-            for b in cand:
-                theta = (b + 0.5) * ANGLE_BIN
-                dth = np.abs((ang - theta + 180.0) % 360.0 - 180.0)
-                sel = dth <= WEDGE_DEG
-                if sel.sum() >= max(6, 0.3 * min_px) and float(np.percentile(d[sel], 5)) <= 1.5 * r_min                         and (np.percentile(d[sel], 95) - np.percentile(d[sel], 5)) >= 0.12 * r_max:
-                    has_attached = True
-                    break
-            for b in cand:
+            for b in peaks:
                 theta = (b + 0.5) * ANGLE_BIN
                 dth = np.abs((ang - theta + 180.0) % 360.0 - 180.0)
                 sel = dth <= WEDGE_DEG
                 if sel.sum() < max(6, 0.3 * min_px):
-                    cands_info.append((-9.0, round(theta, 1), "few", int(sel.sum())))
                     continue
                 ds = d[sel]
-                far = float(np.percentile(ds, 95))
-                near = float(np.percentile(ds, 5))
+                far, near = float(np.percentile(ds, 95)), float(np.percentile(ds, 5))
                 if (far - near) < 0.12 * r_max and sel.sum() < head_d ** 2:
-                    cands_info.append((-8.0, round(theta, 1), "small", round(far, 1), round(near, 1), int(sel.sum())))
-                    continue   # 小さく短い塊 (フレア・服の縁) はヘッドでもシャフトでもない
-                if state["theta"] is None and (far - near) < 0.25 * r_max                         and sel.sum() < 2.0 * head_d ** 2:
-                    # 追跡開始前: シャフトが見えない小さな動きでは始めない。ただし遠くの塊が
-                    # 2 フレーム続けて同じ方向・同じ距離に出るなら (ヘッドだけが動き出した) 開始する
-                    weak = far >= 0.4 * r_max and sel.sum() >= 0.5 * head_d ** 2
-                    pend = state.get("pending")
-                    consistent = (weak and pend is not None and i - pend[0] <= 2
-                                  and abs((theta - pend[1] + 180.0) % 360.0 - 180.0) <= 12.0
-                                  and abs(far - pend[2]) <= 0.15 * r_max)
-                    if not consistent:
-                        if weak and (pend_hit is None or far > pend_hit[2]):
-                            pend_hit = (i, theta, far)
-                        cands_info.append((-7.0, round(theta, 1), "acq", round(far, 1), round(near, 1), int(sel.sum())))
-                        continue
-                score = hs_norm[b] + 0.4 * far / r_max + 0.3 * min(1.0, (far - near) / (0.4 * r_max))
-                # クラブは手に繋がっている: 手元から伸びている候補を優先し、離れた塊 (服・髪・影) は減点
-                if near <= 1.5 * r_min:
-                    score += 0.6
-                elif near > 2.5 * r_min and has_attached:
-                    score -= 0.5
-                if state["theta"] is not None:
-                    th_pred = state["theta"] + state["omega"]
-                    dang = abs((theta - th_pred + 180.0) % 360.0 - 180.0)
-                    score += 0.8 * np.exp(-(dang / ANGLE_GATE) ** 2) - (0.4 if dang > 2 * ANGLE_GATE else 0.0)
-                    if state["r"] is not None:
-                        score -= 0.4 * min(1.0, abs(far - state["r"]) / r_max)
-                cands_info.append((round(float(score), 2), round(theta, 1), round(far, 1), round(near, 1), int(sel.sum())))
-                if best is None or score > best[0]:
-                    best = (score, theta, far, sel)
-            state["pending"] = pend_hit
-            trace[i] = sorted(cands_info, reverse=True, key=lambda c: c[0])[:4] + [("npx", int(len(xs)), "state", None if state["theta"] is None else round(state["theta"], 1))]
-            if best is not None and best[0] >= 0.5:
-                score, theta, far, sel = best
+                    continue
                 tipsel = sel & (d >= far - 1.5 * head_d)
                 hx, hy = float(xs[tipsel].mean()), float(ys[tipsel].mean())
-                head = (hx, hy)
-                n_sel = int(sel.sum())
-                ext = float(np.percentile(d[sel], 95) - np.percentile(d[sel], 5))
-                conf = (1.0 + 0.6 * min(1.0, n_sel / (2.0 * head_d ** 2))
-                        + 0.6 * min(1.0, ext / (0.4 * r_max)))
-                if state["theta"] is not None:
-                    dang = abs((theta - (state["theta"] + state["omega"]) + 180.0) % 360.0 - 180.0)
-                    conf += 0.5 if dang <= ANGLE_GATE else -0.5
-                raw[i] = (hx, hy, float(conf))
-                if state["last"] is not None and i - state["last"] <= 3:
-                    state["omega"] = ((theta - state["theta"] + 180.0) % 360.0 - 180.0) / (i - state["last"])
-                state.update(theta=theta, r=far, last=i, miss=0)
-                found = True
+                score = hs_norm[b] + 0.4 * far / r_max + 0.3 * min(1.0, (far - near) / (0.4 * r_max))
+                is_att = near <= 1.5 * r_min
+                if is_att:
+                    score += 0.6
+                # シャフト線分と向きが合えば加点 (背景の動きとクラブを区別する決め手)
+                if any(abs((theta - L[0] + 180.0) % 360.0 - 180.0) <= 8.0 for L in lines):
+                    score += 0.8
+                    is_att = True
+                elif lines and state["theta"] is None:
+                    score -= 0.4   # シャフトが別の向きに見えているのに動きだけが違う方向 → 背景
+                cands.append((score, theta, (hx, hy), near, int(sel.sum()), "motion", is_att))
+        # --- (b) シャフト線分の先端 (静止中や動き差分が出ないとき)
+        for theta, far_pt, near, L in lines:
+            fx, fy = float(far_pt[0]), float(far_pt[1])
+            if L < 0.3 * r_max:
+                continue
+            score = 0.5 + 0.5 * min(1.0, L / (0.7 * r_max))
+            cands.append((score, theta, (fx, fy), near, 0, "shaft", True))
+        # --- 時間的連続性 (前フレームからの移動量の上限) と向きの予測で選ぶ
+        best = None
+        infos = []
+        pend_hit = None
+        for score, theta, (hx, hy), near, n_sel, kind, is_att in cands:
+            dmove, ok_move = continuity(hx, hy)
+            if not ok_move:
+                infos.append((-5.0, round(theta, 1), kind, "jump", round(dmove)))
+                continue
+            if state["theta"] is not None:
+                dang = abs((theta - (state["theta"] + state["omega"]) + 180.0) % 360.0 - 180.0)
+                score += 0.8 * np.exp(-(dang / ANGLE_GATE) ** 2) - (0.4 if dang > 2 * ANGLE_GATE else 0.0)
+            elif not is_att:
+                # 追跡開始前: 手元から伸びていない動きでは原則始めない (ギャラリー・服・影)。
+                # ただし遠くの大きな塊が 2 フレーム続けて同じ向き・同じ距離に出るなら (ヘッドだけが動き出した) 開始する
+                far_d = float(np.hypot(hx - wx, hy - wy))
+                weak = kind == "motion" and far_d >= 0.4 * r_max and n_sel >= 2.0 * head_d ** 2
+                pend = state.get("pending")
+                consistent = (weak and pend is not None and i - pend[0] <= 2
+                              and abs((theta - pend[1] + 180.0) % 360.0 - 180.0) <= 12.0
+                              and abs(far_d - pend[2]) <= 0.15 * r_max)
+                if not consistent:
+                    if weak and (pend_hit is None or far_d > pend_hit[2]):
+                        pend_hit = (i, theta, far_d)
+                    infos.append((-7.0, round(theta, 1), kind, "acq"))
+                    continue
+            infos.append((round(float(score), 2), round(theta, 1), kind, round(near, 1), n_sel))
+            if best is None or score > best[0]:
+                best = (score, theta, (hx, hy), near, n_sel, kind, is_att)
+        state["pending"] = pend_hit
+        trace[i] = sorted(infos, reverse=True, key=lambda c: c[0])[:4] + [("npx", int(len(xs)), "lines", len(lines))]
+        if best is not None and best[0] >= 0.5:
+            score, theta, (hx, hy), near, n_sel, kind, is_att = best
+            head = (hx, hy)
+            conf = 1.0 + 0.6 * min(1.0, n_sel / (2.0 * head_d ** 2)) + (0.6 if is_att else 0.0)
+            if state["theta"] is not None:
+                dang = abs((theta - (state["theta"] + state["omega"]) + 180.0) % 360.0 - 180.0)
+                conf += 0.5 if dang <= ANGLE_GATE else -0.5
+            raw[i] = (hx, hy, float(conf))
+            attached[i] = bool(is_att)
+            if state["last"] is not None and i - state["last"] <= 3:
+                state["omega"] = ((theta - state["theta"] + 180.0) % 360.0 - 180.0) / (i - state["last"])
+            state.update(theta=theta, last=i, miss=0)
+            found = True
         if debug_dir is not None and (found or dbg_tag == "slow"):
             dbg = cur.copy()
+            dbg[~ok] = (dbg[~ok] * 0.35).astype(np.uint8)
             dbg[mask > 0] = (0, 0, 255)
+            for theta, far_pt, near, L in lines:
+                cv2.line(dbg, (int(wx), int(wy)), (int(far_pt[0]), int(far_pt[1])), (255, 0, 255), 1)
             cv2.circle(dbg, (int(wx), int(wy)), int(r_min), (255, 255, 0), 1)
             cv2.circle(dbg, (int(wx), int(wy)), int(r_max), (255, 255, 0), 1)
-            cv2.line(dbg, (0, int(ground)), (aw, int(ground)), (0, 200, 200), 1)
             if head is not None:
                 cv2.circle(dbg, (int(head[0]), int(head[1])), 6, (0, 255, 0), 2)
             Path(debug_dir).mkdir(parents=True, exist_ok=True)
@@ -498,64 +620,61 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
             ci, cur = buf[gap_slow]
             found, dt = detect(ci, buf[gap_slow - gap][1], cur, buf[gap_slow + gap][1])
             t_detect += dt
-            if not found:   # 動きが小さい: 間隔を広げて再試行
+            if not found:
                 found, dt = detect(ci, buf[0][1], cur, buf[-1][1], dbg_tag="slow")
                 t_detect += dt
             if not found and state["theta"] is not None:
                 state["miss"] += 1
-                if state["miss"] >= MISS_RESET:   # 見失った: 追跡をリセットして再取得に戻る
-                    state.update(theta=None, omega=0.0, r=None, miss=0)
+                if state["miss"] >= MISS_RESET:
+                    state.update(theta=None, omega=0.0, miss=0)
                 else:
                     state["theta"] = (state["theta"] + state["omega"]) % 360.0
                     state["omega"] *= 0.8
         if i % 20 == 0:
             report(0.5 + 0.45 * i / T, "ヘッド探索")
 
-    # ---- 欠測の扱い: 短い欠測は PCHIP、先頭/末尾の静止区間は最寄りの観測位置を保持
-    report(0.97, "軌跡を整形")
+    # ---- 欠損は補間しない。信頼度を算出する
+    report(0.97, "信頼度を算出")
     ks = sorted(raw)
-    if len(ks) < 2:
-        raise ValueError("ヘッドを追跡できませんでした")
-    strong = [k for k in ks if raw[k][2] >= CONF_OK]
-    anchors = strong if len(strong) >= 4 else ks
-    span = list(range(anchors[0], anchors[-1] + 1))
-    sx = np.array([raw[k][0] for k in anchors])
-    sy = np.array([raw[k][1] for k in anchors])
-    try:
-        from scipy.interpolate import PchipInterpolator
-        xs = PchipInterpolator(anchors, sx)(span)
-        ys = PchipInterpolator(anchors, sy)(span)
-    except Exception:
-        xs = np.interp(span, anchors, sx)
-        ys = np.interp(span, anchors, sy)
-    conf_i = {}
-    for t, k in enumerate(span):
-        if k in raw and raw[k][2] >= CONF_OK:
-            xs[t], ys[t] = raw[k][0], raw[k][1]
-            conf_i[k] = raw[k][2]
-        else:
-            conf_i[k] = raw[k][2] if k in raw else 0.0
-    # 先頭 (アドレス) と末尾 (フィニッシュ) の静止区間: 位置を保持
-    head_xy = [(float(xs[t]), float(ys[t])) for t in range(len(span))]
-    lead = [(k, head_xy[0]) for k in range(0, span[0])]
-    tail = [(k, head_xy[-1]) for k in range(span[-1] + 1, T)]
-    seq = lead + list(zip(span, head_xy)) + tail
-    for k, _ in lead + tail:
-        conf_i[k] = HOLD_CONF
-
     inv = 1.0 / scale
-    points = [(int(round(x * inv)), int(round(y * inv)), frame_ids[k]) for k, (x, y) in seq]
-    conf = {frame_ids[k]: conf_i[k] for k, _ in seq}
-    wrist_out = {frame_ids[i]: (float(wrist[i][0] * inv), float(wrist[i][1] * inv))
-                 for i in range(T)}
+    points = [(int(round(raw[k][0] * inv)), int(round(raw[k][1] * inv)), frame_ids[k]) for k in ks]
+    conf = {frame_ids[k]: raw[k][2] for k in ks}
+    wrist_out = {frame_ids[i]: (float(wrist[i][0] * inv), float(wrist[i][1] * inv)) for i in range(T)}
+    quality = {"observed": len(ks), "frames": T}
+    if len(ks) >= 2:
+        span = ks[-1] - ks[0] + 1
+        rate = len(ks) / span
+        pairs = [(a, b) for a, b in zip(ks[:-1], ks[1:]) if b - a <= 3]
+        cont = (sum(1 for a, b in pairs
+                    if np.hypot(raw[b][0] - raw[a][0], raw[b][1] - raw[a][1]) <= max_step * (b - a)) / len(pairs)
+                if pairs else 0.0)
+        att = sum(1 for k in ks if attached.get(k)) / len(ks)
+        quality.update({"span": span, "rate": round(rate, 3), "continuity": round(cont, 3),
+                        "attached": round(att, 3)})
+        reasons = []
+        if len(ks) < RELIABLE_MIN_OBS:
+            reasons.append(f"観測 {len(ks)} フレーム (< {RELIABLE_MIN_OBS})")
+        if rate < RELIABLE_MIN_RATE:
+            reasons.append(f"観測率 {rate:.0%} (< {RELIABLE_MIN_RATE:.0%})")
+        if cont < RELIABLE_MIN_CONT:
+            reasons.append(f"連続性 {cont:.0%} (< {RELIABLE_MIN_CONT:.0%})")
+        if att < RELIABLE_MIN_ATT:
+            reasons.append(f"手元接続 {att:.0%} (< {RELIABLE_MIN_ATT:.0%})")
+        quality["reasons"] = reasons
+        reliable = not reasons
+    else:
+        quality.update({"span": 0, "rate": 0.0, "continuity": 0.0, "attached": 0.0,
+                        "reasons": ["ヘッドを観測できませんでした"]})
+        reliable = False
     res = ClubTrackResult(points=points, conf=conf, wrist=wrist_out,
                           body_h=body_h * inv, seconds=time.time() - t_start,
                           pose_seconds=t_pose, scale=scale,
-                          frames_total=T, frames_detected=len(raw))
+                          frames_total=T, frames_detected=len(ks), real_fps=real_fps,
+                          quality=quality, reliable=reliable)
     res.detect_seconds = t_detect
-    res.raw = {frame_ids[k]: v for k, v in raw.items()}   # 補間前の観測値 (診断用)
+    res.raw = {frame_ids[k]: v for k, v in raw.items()}
     res.trace = {frame_ids[k]: v for k, v in trace.items()}
-    # 骨格 33 点 (欠測補間済み、元解像度 px)。縦型書き出しの骨格線・クロップに使う
     res.landmarks = {frame_ids[i]: (arr[i] * inv).tolist() for i in range(T)}
+    log.info("軌道の信頼度: %s → %s", quality, "OK" if reliable else "不足")
     report(1.0, "完了")
     return res
