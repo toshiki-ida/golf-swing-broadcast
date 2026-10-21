@@ -12,7 +12,7 @@ categories:
 tune:
   rec_0611_131029.mp4: ok
   rec_0611_161853.mp4: ok
-  rec_0611_130035.mp4: trajectory   # 終盤ズームで身長代替値が膨らむ
+  rec_0611_130128.mp4: trajectory   # 2026-10-21 holdout から移動 (オーナー指定: 正面・ギャラリー・白ウェアで軌跡が背景に飛ぶ)。同じ場面の 130035 を代わりに holdout へ
   rec_0611_161732.mp4: trajectory   # 追跡率 19%、後ろの 2 人に引かれた疑い
   rec_0612_135231.mp4: trajectory   # 引きの画、人物 390px (59.94p)
   rec_0611_162742.mp4: trajectory   # 長尺・スイング 2 回 (切り出し後に再評価)
@@ -24,7 +24,7 @@ tune:
 
 holdout:
   rec_0611_165010.mp4: ok
-  rec_0611_130128.mp4: trajectory
+  rec_0611_130035.mp4: trajectory   # 2026-10-21 tune から移動 (130128 と入れ替え)
   rec_0611_160311.mp4: trajectory
   rec_0611_162834.mp4: trajectory
   rec_0611_151507.mp4: phase
