@@ -12,7 +12,7 @@
 #   - the freshly built exe can be quarantined right after the build (dist\GolfSwingBroadcast.exe disappears,
 #     a ~25 MB file appears in C:\ProgramData\Trend Micro\AMSP\quarantine). Restore it or rebuild; add dist\ to the
 #     exclusion list if it keeps happening.
-#   - run this script from cmd.exe or Git Bash (powershell -ExecutionPolicy Bypass -File toolselease.ps1);
+#   - run this script from cmd.exe or Git Bash (powershell -ExecutionPolicy Bypass -File tools\release.ps1);
 #     some PowerShell hosts cannot start the unsigned exe at all ("Access is denied").
 
 param(
