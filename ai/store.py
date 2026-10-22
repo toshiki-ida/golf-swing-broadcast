@@ -36,6 +36,9 @@ def save_club_track(dir_path, res, in_frame: int, source_path: str) -> Path:
         "seconds": round(float(res.seconds), 2),
         "landmarks": {str(rel(f)): [[round(float(x), 1), round(float(y), 1)] for x, y in lm]
                       for f, lm in getattr(res, "landmarks", {}).items()},
+        # 手首中点と手元接続フラグ (区間の品質指標の再計算・閾値調整用)
+        "wrist": {str(rel(f)): [round(float(x), 1), round(float(y), 1)] for f, (x, y) in getattr(res, "wrist", {}).items()},
+        "attached": [rel(f) for f, v in getattr(res, "attached", {}).items() if v],
     }
     p = Path(dir_path) / "club_track.json"
     p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")

@@ -73,6 +73,9 @@ pred = {
 }
 (out_dir / "club_tracker.pred.json").write_text(json.dumps(pred, ensure_ascii=False, indent=1),
                                                 encoding="utf-8")
+# 編集タブと同じ形式 (手首・骨格・接続フラグ入り) も残す。閾値の再計算 (tools/gate_tune.py) に使う
+from ai.store import save_club_track  # noqa: E402
+save_club_track(out_dir, res, 0, str(video))
 # 編集タブと同じ形式 (in_frame 基準の相対フレーム + 骨格) も残す → ai.sns_render の --traj に渡せる
 save_club_track(out_dir, res, in_f, str(video))
 
