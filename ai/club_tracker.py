@@ -459,6 +459,7 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
                interlaced: bool = False, upper_field_first: bool = True,
                model_path: Optional[Path] = None, realtime_factor: Optional[float] = None,
                use_detector: Optional[bool] = None, gate: Optional[dict] = None,
+               detector_model: Optional[Path] = None,
                progress: Optional[Callable[[float, str], None]] = None,
                debug_dir: Optional[Path] = None) -> ClubTrackResult:
     """クラブヘッド軌道を推定する。座標は元解像度のピクセル。
@@ -467,18 +468,21 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
     use_detector:    models/clubhead.onnx (ONNX Runtime CPU) をヘッド候補の提案に使う。None = あれば使う。
                      時間的連続性・欠損・信頼度の判定は検出器の有無によらず同じ。
     gate:            信頼度ゲートの閾値 (ai.config.gate_thresholds)。None = 既定 ← config/ai.json。
+    detector_model:  検出器の ONNX の場所。None = models/clubhead.onnx (評価で新旧モデルを比べるときに指定)。
     """
     gate = resolve_gate(gate)
     from ai import default_pose_model
     from ai.config import realtime_factor as _rt
     t_start = time.time()
     detector = None
+    res_detector_name = ""
     if use_detector is None or use_detector:
         try:
             from ai.club_detector import ClubDetector
-            det = ClubDetector()
+            det = ClubDetector(detector_model)
             if det.available():
                 detector = det
+                res_detector_name = det.path.stem
             elif use_detector:
                 log.warning("models/clubhead.onnx が無いため従来方式で動きます")
         except Exception as e:
@@ -831,7 +835,9 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
                           quality=quality, reliable=reliable)
     res.detect_seconds = t_detect
     res.detector_used = detector is not None
+    res.detector_name = res_detector_name
     quality["detector"] = detector is not None
+    quality["detector_model"] = res_detector_name
     quality["gate"] = dict(gate)
     res.gate = dict(gate)
     res.attached = {frame_ids[k]: bool(v) for k, v in attached.items()}

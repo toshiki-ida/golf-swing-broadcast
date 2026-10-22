@@ -55,7 +55,7 @@ pyinstaller GolfSwingBroadcast.spec --noconfirm        # → dist/GolfSwingBroad
 | `shuttle_pro.py` | ShuttlePRO v2 HID ドライバ(hidapi)。レポート形式自動検出、ジョグ/シャトル/ボタンをコールバック通知 |
 | `ai/` | AI 試作。`club_tracker.py` (骨格基点のクラブヘッド追跡)、`swing_analyzer.py` (swingcut 由来の局面・指標・撮影方向判定・rules.yaml コメント)、`sns_render.py` (縦型動画、軌道由来と骨格由来の局面を統合)、`edit_hook.py` (編集タブの AI 操作。app.py からの唯一の入口。書き出し時に `dataset.py` でラベルを蓄積)、`config.py` (settings.json の "ai" 既定値)、`store.py` (`analysis/{clip_id}/`)、`club_detector.py` (ONNX Runtime CPU のヘッド検出器。`models/clubhead.onnx` が無ければ無効)、`dataset.py` (書き出し時に承認済みヘッド座標を `<project_dir>/datasets/clubhead/<clip_id>/` に保存。holdout 除外) |
 | `config/rules.yaml` | フィードバックコメントのルール (DTL は swingcut と同じ、`angle: face_on` が正面用)。exe では exe 同階層の config/ を読む |
-| `tools/` | `label_club.py` (正解ラベル)、`eval_club.py` (誤差評価、`--all` で tests/real を一括、`--detector off|on|both` で検出器なし/ありを同じ表に)、`run_club_tracker.py` / `run_autotrace.py` (予測 JSON + 確認動画)、`import_labels.py` (tests/club_labels.json → datasets/clubhead)、`train_clubhead.py` (datasets/clubhead から検出器を学習し `models/clubhead.onnx` を書き出す。torch 入りの別 venv で実行) |
+| `tools/` | `label_club.py` (正解ラベル)、`eval_club.py` (誤差評価、`--all` で tests/real を一括、`--detector off|on|both` で検出器なし/ありを同じ表に)、`run_club_tracker.py` / `run_autotrace.py` (予測 JSON + 確認動画)、`import_labels.py` (tests/club_labels.json → datasets/clubhead)、`train_clubhead.py` (datasets/clubhead から検出器を学習。既定の出力は `models/clubhead_<日付>_<点数>.onnx` で現行は上書きしない。torch 入りの別 venv で実行)、`dataset_inventory.py` (ラベルの棚卸し・holdout 混入・異常検出)、`gate_tune.py` (ゲート閾値と目視判定の一致)、`retrain.ps1` + `retrain_report.py` (棚卸し → 学習 → holdout で従来/現行/新モデル比較 → レポート、を 1 本で) |
 | `docs/AI_INTEGRATION_DESIGN.md` / `docs/CLUB_TRACKING_EVAL.md` | AI 統合設計と、autotrace (YOLO) vs club_tracker の比較評価 |
 | `docs/HFR_double_speed_recording.md` | HFR 2x の設計メモ。**「通常モードは 2 枚中 1 枚を間引いて 29.97fps 録画」と書かれているが現行コードは `recording_frame_divisor=1`、通常モードは 59.94fps 全フレーム録画**。コードが正 |
 | `NOTION_DOC.md` / `README.md` | 利用者向け概要。行数表などは古い |
@@ -152,7 +152,10 @@ clips.json / playout.json / settings.json
   値の根拠は `docs/CLUB_TRACKING_EVAL.md` §10 と `tests/real/segment_review.yaml` (区間ごとの目視判定)。閾値を変えるときは
   `python tools/gate_tune.py --gate key=value ...` で目視判定との一致を見てから。SNS 動画には軌道の注記を入れない (編集タブの右パネルのみ)。
   検出器は **候補の提案だけ** で、連続性・欠損・区間・信頼度の判定は従来どおり。モデルが無ければ従来方式のまま。
-- 検出器を学習し直したら `tools/eval_club.py --all --split tune --tag det_N --detector both` で従来/検出器ありを同じ表に残す。
+- 再学習サイクルは `powershell -ExecutionPolicy Bypass -File toolsetrain.ps1` (Git Bash / cmd から)。棚卸し → 学習 (クリップ単位 8:2、撮影方向で層化)
+  → `eval_club.py --split holdout --detector both --model <新>` で従来 / 現行 / 新モデルを 1 つの表に → `build/retrain/<日時>/report.md`。
+  新モデルは `models/clubhead_<日付>_<点数>.onnx` に残り、`models/clubhead.onnx` の差し替えは人が判断してから (手順はレポート末尾)。
+  labels.json の `camera` (撮影方向) は棚卸しの層化に使う。無ければ unknown。
 
 ## ブランチ運用ルール
 

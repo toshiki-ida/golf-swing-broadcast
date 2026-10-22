@@ -40,25 +40,62 @@ NEG_RADIUS = 4   # 負例の損失を掛ける半径 (ヒートマップのセ�
 # ---------------------------------------------------------------- データ
 
 def load_records(use_weak: bool, root=DATASET_DIR, use_negatives: bool = True):
+    """labels.json を読む。holdout として excluded の付いたクリップは外す。同一フレームに座標の違う強ラベルが複数ある
+    場合は矛盾なので両方外し、同じ座標なら 1 つにまとめる (件数は stderr に出す)。各レコードに camera を付ける。"""
     recs = []
+    n_dup = n_conflict = 0
     for lab in sorted(Path(root).glob("*/labels.json")):
         meta = json.loads(lab.read_text(encoding="utf-8"))
+        if meta.get("excluded"):
+            print(f"[skip] {meta['clip_id']}: excluded={meta['excluded']}")
+            continue
+        cam = str(meta.get("camera") or "unknown")
+        seen = {}
         for r in meta["points"]:
             if (r.get("weak") and not use_weak) or not r.get("in_crop", True):
                 continue
             if r.get("negative") and not use_negatives:
                 continue
-            recs.append({"clip": meta["clip_id"], "img": lab.parent / r["image"], "cx": r["cx"], "cy": r["cy"],
-                         "crop_size": r.get("crop_size", 320), "crop": r["crop"], "weak": bool(r.get("weak")),
-                         "negative": bool(r.get("negative"))})
-    return recs
+            rec = {"clip": meta["clip_id"], "camera": cam, "img": lab.parent / r["image"], "cx": r["cx"], "cy": r["cy"],
+                   "crop_size": r.get("crop_size", 320), "crop": r["crop"], "weak": bool(r.get("weak")),
+                   "negative": bool(r.get("negative")), "frame": r.get("frame")}
+            if not rec["weak"] and not rec["negative"]:
+                key = rec["frame"]
+                if key in seen:
+                    other = seen[key]
+                    if abs(other["cx"] - rec["cx"]) <= 2 and abs(other["cy"] - rec["cy"]) <= 2:
+                        n_dup += 1
+                        continue
+                    other["conflict"] = True
+                    rec["conflict"] = True
+                    n_conflict += 1
+                seen[key] = rec
+            recs.append(rec)
+    out = [r for r in recs if not r.get("conflict")]
+    if n_dup or n_conflict:
+        print(f"[data] 同一フレームの重複 {n_dup} 点をまとめ、座標が矛盾する {n_conflict} 組 ({len(recs) - len(out)} 点) を除外")
+    return out
 
 
-def split_by_clip(recs, val_clips: int, seed: int = 0):
-    clips = sorted({r["clip"] for r in recs})
+def split_by_clip(recs, val_clips: int, seed: int = 0, val_ratio: float = 0.0):
+    """クリップ単位の分割。val_ratio > 0 なら撮影方向 (camera) ごとに比率で検証へ回す (各方向から最低 1 本、
+    方向が 1 本しかなければ学習側)。val_ratio == 0 なら従来どおり val_clips 本。"""
     rng = random.Random(seed)
-    rng.shuffle(clips)
-    val = set(clips[:val_clips]) if len(clips) > val_clips else set(clips[:1]) if len(clips) > 1 else set()
+    if val_ratio > 0:
+        by_cam = {}
+        for c in sorted({(r["clip"], r["camera"]) for r in recs}):
+            by_cam.setdefault(c[1], []).append(c[0])
+        val = set()
+        for cam, clips in sorted(by_cam.items()):
+            rng.shuffle(clips)
+            if len(clips) < 2:
+                continue
+            k = max(1, int(round(len(clips) * val_ratio)))
+            val.update(clips[:k])
+    else:
+        clips = sorted({r["clip"] for r in recs})
+        rng.shuffle(clips)
+        val = set(clips[:val_clips]) if len(clips) > val_clips else set(clips[:1]) if len(clips) > 1 else set()
     train = [r for r in recs if r["clip"] not in val]
     valid = [r for r in recs if r["clip"] in val]
     return train, valid, sorted(val)
@@ -181,10 +218,12 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--lr", type=float, default=2e-3)
     ap.add_argument("--val-clips", type=int, default=1)
+    ap.add_argument("--val-ratio", type=float, default=0.0, help="クリップ単位の検証比率 (撮影方向で層化)。0 = --val-clips を使う")
+    ap.add_argument("--name", default="", help="出力名。既定は clubhead_<日付>_<強ラベル数>.onnx (--out 指定時は無視)")
     ap.add_argument("--arch", default="tiny", choices=["tiny", "small"])
     ap.add_argument("--use-weak", action="store_true")
     ap.add_argument("--no-negatives", action="store_true", help="negative (人が削除した自動点) を学習に使わない")
-    ap.add_argument("--out", default=str(ROOT / "models" / "clubhead.onnx"))
+    ap.add_argument("--out", default="", help="ONNX の出力先。省略時は models/clubhead_<日付>_<点数>.onnx (現行の clubhead.onnx は上書きしない)")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     import torch
@@ -198,7 +237,15 @@ def main() -> int:
     if len(recs) - n_neg < 4:
         print(f"ラベルが足りません ({len(recs)} 点 in {a.dataset})。書き出しでラベルを貯めるか --dataset を確認してください")
         return 1
-    train, valid, val_clips = split_by_clip(recs, a.val_clips, a.seed)
+    train, valid, val_clips = split_by_clip(recs, a.val_clips, a.seed, a.val_ratio)
+    n_strong_total = sum(1 for r in recs if not r["negative"] and not r["weak"])
+    if not a.out:
+        stem = a.name or f"clubhead_{time.strftime('%Y%m%d')}_{n_strong_total}"
+        a.out = str(ROOT / "models" / f"{stem}.onnx")
+    cams = {}
+    for r in recs:
+        cams.setdefault(r["camera"], {"train": set(), "val": set()})["val" if r["clip"] in val_clips else "train"].add(r["clip"])
+    print("撮影方向ごとのクリップ数 (学習/検証): " + ", ".join(f"{c} {len(v['train'])}/{len(v['val'])}" for c, v in sorted(cams.items())))
     print(f"device={device} 学習 {len(train)} 点 (うち負例 {sum(1 for r in train if r['negative'])}) / "
           f"検証 {len(valid)} 点 (検証クリップ: {val_clips})  クリップ数 {len({r['clip'] for r in recs})}")
 
@@ -252,7 +299,9 @@ def main() -> int:
             "clips": sorted({r["clip"] for r in recs}), "use_weak": a.use_weak, "dataset": str(a.dataset),
             "val": final_val, "train_fit": final_train, "history": hist,
             "onnx": str(out), "onnx_mb": round(out.stat().st_size / 1e6, 2)}
-    out.with_name("clubhead_train.json").write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
+    info["cameras"] = {c: {"train": sorted(v["train"]), "val": sorted(v["val"])} for c, v in cams.items()}
+    info["n_strong_total"] = n_strong_total
+    out.with_suffix(".train.json").write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
     print(json.dumps({k: v for k, v in info.items() if k != "history"}, ensure_ascii=False, indent=1))
     return 0
 

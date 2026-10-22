@@ -6,8 +6,9 @@ tests/club_labels.json (tools/label_club.py で作成) と、各手法が出力�
     python tools/eval_club.py <予測JSON ...>
     python tools/eval_club.py build/club_eval/*/*.pred.json
     python tools/eval_club.py --all --split tune|holdout|all [--tag before|after_N|<任意>] [--no-run] [--interlaced]
-                              [--include-claude-labels] [--detector off|on|both]
+                              [--include-claude-labels] [--detector off|on|both] [--model <onnx> ...]
         --detector both (既定): models/clubhead.onnx があれば従来方式と検出器ありを両方実行し同じ表に並べる
+        --model <onnx>: 追加の検出器モデルでも実行して同じ表に並べる (複数可)。行名は "+det:<モデル名>"
 
 --all: tests/real/trimmed/ (無ければ tests/real/) の動画を ai/club_tracker.py で追跡し
        (build/club_eval/real/<名前>/)、追跡率・局面を全素材で集計、ラベルのある素材は誤差も評価して
@@ -140,11 +141,11 @@ def track_summary(video: Path, out_dir: Path) -> dict:
 
 def format_summary(rows: list) -> str:
     lines = ["=== 追跡率・局面検出 (全素材) ===",
-             f"{'素材':<28} {'動画f':>6} {'観測':>6} {'確信':>6} {'率':>6} {'欠測':>5} {'秒':>5}  "
+             f"{'素材':<44} {'動画f':>6} {'観測':>6} {'確信':>6} {'率':>6} {'欠測':>5} {'秒':>5}  "
              f"{'軌道 top/imp':<13} {'骨格 top/imp':<13} {'採用':<10} {'一致':<8} {'信頼':>3} {'連続':>5} {'ｽｲﾝｸﾞf':>7} {'撮影方向 (比, 信頼度)':<24} 警告"]
     for r in rows:
         if "error" in r:
-            lines.append(f"{r['name']:<28} {r['error']}")
+            lines.append(f"{r['name']:<44} {r['error']}")
             continue
         rate = f"{100 * r['observed'] / max(1, r.get('video_frames', r['frames'])):.0f}%"
         tp = r.get("traj_phases") or {}
@@ -160,7 +161,7 @@ def format_summary(rows: list) -> str:
         ags = ("".join("o" if ag[k] else "x" for k in ("top", "impact")) + f"(±{r.get('tol')})") if ag else "-"
         rel = "-" if r.get("reliable") is None else ("OK" if r["reliable"] else "NG")
         cont = "-" if r.get("cont") is None else f"{r['cont']:.0%}"
-        lines.append(f"{r['name']:<28} {r.get('video_frames', '?'):>6} {r['observed']:>6} {r['confident']:>6} {rate:>6} {r['weak']:>5} "
+        lines.append(f"{r['name']:<44} {r.get('video_frames', '?'):>6} {r['observed']:>6} {r['confident']:>6} {rate:>6} {r['weak']:>5} "
                      f"{(r.get('seconds') or 0):>5.0f}  {tps:<13} {sps:<13} {srcs:<10} {ags:<8} {rel:>3} {cont:>5} {str(r.get('swing_frames', '-')):>7} "
                      f"{r.get('camera', '-'):<24} {warn}")
     lines.append("観測 = 位置を観測できたフレーム数、確信 = 信頼度 1.5 以上、率 = 観測/動画フレーム、欠測 = 欠測区間の数。"
@@ -202,32 +203,40 @@ def run_all(args: list) -> int:
     print(f"対象: {len(videos)} 本 ({src_dir.name}, split={split}, ラベル {len(labels)} 件)")
     det_mode = args[args.index("--detector") + 1] if "--detector" in args else "both"
     det_available = (ROOT / "models" / "clubhead.onnx").exists()
-    modes = {"off": [False], "on": [True], "both": ([False, True] if det_available else [False])}[det_mode]
+    # modes: None = 従来方式, "" = 現行 models/clubhead.onnx, それ以外 = 指定モデルのパス
+    modes = {"off": [None], "on": [""], "both": ([None, ""] if det_available else [None])}[det_mode]
+    extra_models = [Path(args[i + 1]) for i, a in enumerate(args) if a == "--model" and i + 1 < len(args)]
+    for m in extra_models:
+        if not m.exists():
+            print(f"モデルがありません: {m}")
+            return 1
+        modes.append(str(m.resolve()))
     if det_mode != "off" and not det_available:
         print("models/clubhead.onnx がありません → 従来方式のみ")
     preds = []
     summary_rows = []   # 全素材の追跡率・局面・警告 (ラベルの有無によらず)
     for v in videos:
       for use_det in modes:
-        out_dir = ROOT / "build" / "club_eval" / "real" / (v.stem + ("_det" if use_det else ""))
+        suffix = "" if use_det is None else ("_det" if use_det == "" else "_det_" + Path(use_det).stem)
+        out_dir = ROOT / "build" / "club_eval" / "real" / (v.stem + suffix)
         pred = out_dir / "club_tracker.pred.json"
         lab = labels.get(v.name, {})
         inter = force_i or "_i" in v.stem.lower() or bool(lab.get("interlaced"))
         if not no_run or not pred.exists():
-            cmd = [sys.executable, str(ROOT / "tools" / "run_club_tracker.py"), str(v), str(out_dir),
-                   "--detector" if use_det else "--no-detector"]
+            cmd = [sys.executable, str(ROOT / "tools" / "run_club_tracker.py"), str(v), str(out_dir)]
+            cmd += ["--no-detector"] if use_det is None else (["--detector"] if use_det == "" else ["--model", use_det])
             if inter:
                 cmd.append("--interlaced")
-            print(f"[run ] {v.name}{' (interlaced)' if inter else ''}{' +det' if use_det else ''}", flush=True)
+            print(f"[run ] {v.name}{' (interlaced)' if inter else ''}{suffix.replace('_det', ' +det')}", flush=True)
             r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             tail = [ln for ln in r.stdout.splitlines() if ln.startswith("[club_tracker]")]
             print("       " + (tail[-2] if len(tail) >= 2 else (r.stdout[-300:] + r.stderr[-300:]).strip()), flush=True)
         row = track_summary(v, out_dir)
-        row["name"] = v.name + (" +det" if use_det else "")
+        row["name"] = v.name + (suffix.replace("_det_", " +det:").replace("_det", " +det") if suffix else "")
         summary_rows.append(row)
         if v.name in labels and pred.exists():
             preds.append(str(pred))
-        elif v.name not in labels and not use_det:
+        elif v.name not in labels and use_det is None:
             print(f"       ラベルなし → 追跡率と確認動画のみ ({out_dir / 'club_tracker_overlay.mp4'})", flush=True)
     summary_text = format_summary(summary_rows)
     print(summary_text)

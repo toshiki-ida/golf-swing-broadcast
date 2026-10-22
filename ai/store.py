@@ -104,6 +104,10 @@ def record_corrections(dir_path, swings) -> dict | None:
     for sw in swings:
         for x, y, f in getattr(sw, "points", []):
             cur[f] = (int(x), int(y))
+    # 「全区間を描く」で足した区間: 1 点でも残っていれば自動点として扱う (丸ごと消えたのは Undo か区間ごとの却下なので負例にしない)
+    for seg in auto.get("extra_segments", []):
+        if any(f in cur for _, _, f in seg):
+            auto_pts.update({f: (x, y) for x, y, f in seg})
     frames = {}
     for f, (x, y) in cur.items():
         if f in auto_pts:

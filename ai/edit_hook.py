@@ -212,13 +212,16 @@ class EditTools:
         gate = q.get("gate") or get_ai_settings(self.app.settings).get("gate", {})
         lines = [f"ゲート: 観測≥{gate.get('min_observed', '?')}f 率≥{gate.get('min_rate', 0):.0%} "
                  f"連続≥{gate.get('min_continuity', 0):.0%} 接続≥{gate.get('min_hand_connect_ratio', 0):.0%} "
-                 f"動き≥{gate.get('min_motion_bh', 0):.2f} 頭上≤{gate.get('max_on_head_ratio', 1):.0%}"]
+                 f"動き≥{gate.get('min_motion_bh', 0):.2f} 頭上≤{gate.get('max_on_head_ratio', 1):.0%} "
+                 f"距σ≤{gate.get('max_dist_std', 9):.2f} 距Δ≤{gate.get('max_dist_change', 9):.3f} "
+                 f"速比≥{gate.get('min_speed_ratio', 0):.1f} 手≥{gate.get('min_wrist_ratio', 0):.0%}"]
         in_f = int((track or {}).get("in_frame", 0))
         for i, sg in enumerate(q.get("segments") or []):
             a, b = sg.get("frames", (0, 0))
             a, b = int(a) - in_f, int(b) - in_f
             vals = (f"率{sg.get('rate', 0):.0%} 連続{sg.get('continuity', 0):.0%} 接続{sg.get('attached', 0):.0%} "
-                    f"動き{sg.get('motion_bh', 0):.2f} 頭上{sg.get('on_head', 0):.0%}")
+                    f"動き{sg.get('motion_bh', 0):.2f} 頭上{sg.get('on_head', 0):.0%} 距σ{sg.get('dist_std', 0):.2f} "
+                    f"距Δ{sg.get('dist_change', 0):.3f} 速比{min(sg.get('speed_ratio', 0), 99):.1f} 手{sg.get('wrist_motion', 0):.2f}")
             if sg.get("reliable"):
                 lines.append(f"区間{i + 1} F{a}-{b} 描画 | {vals}")
             else:
@@ -254,10 +257,19 @@ class EditTools:
         if total - cursor >= 2:
             undrawn.append((cursor, total))
         self._undrawn[clip.id] = undrawn
-        auto["segments"] = [[list(p) for p in sg] for sg in segs]
+        drawn_sets = [set(tuple(p) for p in sg) for sg in auto.get("segments", [])]
+        # ゲートで止めていた区間は extra_segments に記録 (corrections では「残っていれば自動点」として扱う)
+        auto["extra_segments"] = [[list(p) for p in sg] for sg in segs if set(sg) not in drawn_sets]
         auto["undrawn"] = [list(u) for u in undrawn]
         auto["gate_ignored"] = True
         ap.write_text(_j.dumps(auto, ensure_ascii=False), encoding="utf-8")
+        # 既に描いてある自動生成のスイング (手直し前のもの) は置き換える。手描きの点は残す
+        app = self.app
+        if getattr(app, "_edit_clip_id", None) == clip.id:
+            app._edit_push_undo()
+            keep = [sw for sw in app._edit_swings if set(tuple(p) for p in sw.points) not in drawn_sets]
+            app._edit_swings = keep or [app._make_default_trajectory(0)]
+            app._edit_swing_idx = 0
         self._apply_trajectory(clip, segs, undrawn, style, None, 0)
         self._set_status(f"全 {len(segs)} 区間を描きました (ゲート無視)。確認して不要な区間は Delete で消してください", "#E0B040")
 
@@ -384,7 +396,8 @@ class EditTools:
         if editing:
             swings = app._edit_swings
             edit_in, edit_out = app._edit_in, app._edit_out
-            app._edit_push_undo()
+            if res is not None:          # draw_all_segments は呼ぶ前に push 済み
+                app._edit_push_undo()
         else:
             swings, edit_in, edit_out = app.clip_manager.load_trajectory(clip.id)
         first_idx = None
