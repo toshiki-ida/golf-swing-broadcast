@@ -149,7 +149,8 @@ class EditTools:
             if res is None:
                 print(f"[AI] ラベル収集: {clip.name} は holdout のため除外 (または点が 2 点未満)")
             else:
-                print(f"[AI] ラベル収集: {clip.name} → strong {res['n_strong']} / weak {res['n_weak']} {res['sources']} → {res['dir']}")
+                print(f"[AI] ラベル収集: {clip.name} → strong {res['n_strong']} / weak {res['n_weak']} / "
+                      f"negative {res.get('n_negative', 0)} {res['sources']} → {res['dir']}")
             return res
         except Exception as e:
             print(f"[AI] ラベル収集に失敗: {e}")
@@ -376,7 +377,7 @@ class EditTools:
                 trajectory_note=("軌道: 信頼度不足" if unreliable else ("軌道: 一部区間のみ" if partial else None)),
                 progress=lambda r, m: self._set_status(f"{m} {r * 100:.0f}%"))
             ds = self._collect_dataset(clip, swings, "縦型") if swings else None
-            dsn = f"  ラベル保存 strong {ds['n_strong']} / weak {ds['n_weak']}" if ds else ""
+            dsn = f"  ラベル保存 strong {ds['n_strong']} / weak {ds['n_weak']} / neg {ds.get('n_negative', 0)}" if ds else ""
             self._set_status(f"完了: {out_path.name} ({rep['frames']}f, {rep['seconds']:.0f}秒){dsn}"
                              f"\n{out_dir}", "#88CC88")
 

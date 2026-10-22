@@ -6,6 +6,8 @@
     <プロジェクトフォルダ>/datasets/clubhead を指定する (複数ある場合は 1 つのフォルダにまとめてから)
 
 - 学習データ: datasets/clubhead/*/labels.json の strong 点 (manual / auto_confirmed)。weak (interpolated) は既定で使わない (--use-weak で含める)
+- 負例: negative (自動生成されたあと人が削除した点)。その座標の周り (半径 NEG_RADIUS セル) だけヒートマップを 0 に寄せる
+  (切り出しの他の場所は本当のヘッドかもしれないので損失を掛けない)。--no-negatives で外す
 - 分割: クリップ単位 (同じクリップのフレームは train / val のどちらか一方だけ)。--val-clips 本を検証に回す
 - モデル: 自前の小さな CNN (約 0.3M パラメータ、入力 256、出力ヒートマップ 64x64)。
           ライセンスはこのリポジトリと同じ (外部モデルの重みを使わない)。データが増えたら YOLOX-Nano (Apache-2.0) に
@@ -32,19 +34,23 @@ from ai.dataset import DATASET_DIR  # noqa: E402
 from ai.club_detector import INPUT, STRIDE, ClubDetector  # noqa: E402
 
 HM = INPUT // STRIDE
+NEG_RADIUS = 4   # 負例の損失を掛ける半径 (ヒートマップのセル数)
 
 
 # ---------------------------------------------------------------- データ
 
-def load_records(use_weak: bool, root=DATASET_DIR):
+def load_records(use_weak: bool, root=DATASET_DIR, use_negatives: bool = True):
     recs = []
     for lab in sorted(Path(root).glob("*/labels.json")):
         meta = json.loads(lab.read_text(encoding="utf-8"))
         for r in meta["points"]:
             if (r.get("weak") and not use_weak) or not r.get("in_crop", True):
                 continue
+            if r.get("negative") and not use_negatives:
+                continue
             recs.append({"clip": meta["clip_id"], "img": lab.parent / r["image"], "cx": r["cx"], "cy": r["cy"],
-                         "crop_size": r.get("crop_size", 320), "crop": r["crop"], "weak": bool(r.get("weak"))})
+                         "crop_size": r.get("crop_size", 320), "crop": r["crop"], "weak": bool(r.get("weak")),
+                         "negative": bool(r.get("negative"))})
     return recs
 
 
@@ -78,13 +84,20 @@ def make_sample(rec, augment: bool):
     x = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
     x = np.transpose(x, (2, 0, 1))
     hm = np.zeros((HM, HM), np.float32)
+    mask = np.ones((HM, HM), np.float32)
     # 中心は整数画素に丸める (ピークが正確に 1 になり focal loss の正例として数えられる。CenterNet と同じ)
     gx, gy = int(round(cx / STRIDE)), int(round(cy / STRIDE))
-    if 0 <= gx < HM and 0 <= gy < HM:
+    if rec.get("negative"):
+        # 負例: 目標は 0、損失はその座標の周りだけ
+        mask[:] = 0.0
+        if 0 <= gx < HM and 0 <= gy < HM:
+            yy, xx = np.mgrid[0:HM, 0:HM]
+            mask = (((xx - gx) ** 2 + (yy - gy) ** 2) <= NEG_RADIUS ** 2).astype(np.float32)
+    elif 0 <= gx < HM and 0 <= gy < HM:
         yy, xx = np.mgrid[0:HM, 0:HM]
         hm = np.exp(-((xx - gx) ** 2 + (yy - gy) ** 2) / (2 * 1.5 ** 2)).astype(np.float32)
         hm[gy, gx] = 1.0
-    return x, hm[None], (cx, cy)
+    return x, hm[None], (cx, cy), mask[None]
 
 
 # ---------------------------------------------------------------- モデル
@@ -116,13 +129,15 @@ def init_head_bias(model, prior: float = 0.01):
     nn.init.constant_(last.bias, -math.log((1 - prior) / prior))
 
 
-def focal_loss(pred, gt):
+def focal_loss(pred, gt, mask=None):
     import torch
     pred = pred.clamp(1e-4, 1 - 1e-4)
     pos = gt.eq(1).float()
     neg = 1 - pos
-    pos_loss = (torch.log(pred) * (1 - pred) ** 2 * pos).sum()
-    neg_loss = (torch.log(1 - pred) * pred ** 2 * (1 - gt) ** 4 * neg).sum()
+    if mask is None:
+        mask = torch.ones_like(gt)
+    pos_loss = (torch.log(pred) * (1 - pred) ** 2 * pos * mask).sum()
+    neg_loss = (torch.log(1 - pred) * pred ** 2 * (1 - gt) ** 4 * neg * mask).sum()
     npos = pos.sum().clamp(min=1)
     return -(pos_loss + neg_loss) / npos
 
@@ -135,7 +150,9 @@ def evaluate(model, recs, device):
     model.eval()
     with torch.no_grad():
         for r in recs:
-            x, _, (cx, cy) = make_sample(r, augment=False)
+            if r.get("negative"):
+                continue
+            x, _, (cx, cy), _ = make_sample(r, augment=False)
             hm = model(torch.from_numpy(x[None]).to(device))[0, 0].cpu().numpy()
             pk = ClubDetector.peaks(hm, 0, 0, INPUT)
             if not pk:
@@ -166,6 +183,7 @@ def main() -> int:
     ap.add_argument("--val-clips", type=int, default=1)
     ap.add_argument("--arch", default="tiny", choices=["tiny", "small"])
     ap.add_argument("--use-weak", action="store_true")
+    ap.add_argument("--no-negatives", action="store_true", help="negative (人が削除した自動点) を学習に使わない")
     ap.add_argument("--out", default=str(ROOT / "models" / "clubhead.onnx"))
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
@@ -175,13 +193,14 @@ def main() -> int:
     random.seed(a.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    recs = load_records(a.use_weak, a.dataset)
-    if len(recs) < 4:
+    recs = load_records(a.use_weak, a.dataset, use_negatives=not a.no_negatives)
+    n_neg = sum(1 for r in recs if r["negative"])
+    if len(recs) - n_neg < 4:
         print(f"ラベルが足りません ({len(recs)} 点 in {a.dataset})。書き出しでラベルを貯めるか --dataset を確認してください")
         return 1
     train, valid, val_clips = split_by_clip(recs, a.val_clips, a.seed)
-    print(f"device={device} 学習 {len(train)} 点 / 検証 {len(valid)} 点 (検証クリップ: {val_clips})  "
-          f"クリップ数 {len({r['clip'] for r in recs})}")
+    print(f"device={device} 学習 {len(train)} 点 (うち負例 {sum(1 for r in train if r['negative'])}) / "
+          f"検証 {len(valid)} 点 (検証クリップ: {val_clips})  クリップ数 {len({r['clip'] for r in recs})}")
 
     steps_per_epoch = max(1, (len(train) + a.batch - 1) // a.batch)
     epochs = max(a.epochs, (a.min_steps + steps_per_epoch - 1) // steps_per_epoch)
@@ -201,10 +220,11 @@ def main() -> int:
         tot = 0.0
         for i in range(0, len(train), a.batch):
             batch = train[i:i + a.batch]
-            xs, hms = zip(*[make_sample(r, augment=True)[:2] for r in batch])
-            x = torch.from_numpy(np.stack(xs)).to(device)
-            y = torch.from_numpy(np.stack(hms)).to(device)
-            loss = focal_loss(model(x), y)
+            samples = [make_sample(r, augment=True) for r in batch]
+            x = torch.from_numpy(np.stack([smp[0] for smp in samples])).to(device)
+            y = torch.from_numpy(np.stack([smp[1] for smp in samples])).to(device)
+            m = torch.from_numpy(np.stack([smp[3] for smp in samples])).to(device)
+            loss = focal_loss(model(x), y, m)
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -228,6 +248,7 @@ def main() -> int:
     info = {"trained": time.strftime("%Y-%m-%d %H:%M:%S"), "arch": a.arch, "params": n_params,
             "input": INPUT, "stride": STRIDE, "epochs": a.epochs, "device": device, "seconds": round(secs, 1),
             "n_train": len(train), "n_val": len(valid), "val_clips": val_clips,
+            "n_negative": n_neg, "use_negatives": not a.no_negatives,
             "clips": sorted({r["clip"] for r in recs}), "use_weak": a.use_weak, "dataset": str(a.dataset),
             "val": final_val, "train_fit": final_train, "history": hist,
             "onnx": str(out), "onnx_mb": round(out.stat().st_size / 1e6, 2)}

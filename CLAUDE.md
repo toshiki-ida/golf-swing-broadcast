@@ -116,6 +116,14 @@ clips.json / playout.json / settings.json
 - キーボードショートカットは `bind_all("<Key>")` 1 本で、`tab_contexts`(収録/クリップ/編集/送出)に
   登録されたタブでしか発火しない。ShuttlePRO のボタンは **送出タブ表示中のみ** 動作、ジョグ/シャトルもタブ名で分岐。
   → 新しいタブを足しても、これらの dict に加えない限り既存操作には影響しない。
+  既定キー (`KEYBOARD_ACTIONS`、設定タブで変更可): 共通 `A/D` ±1F, `W/S` ±5F, `F2/F3/F4/F6` ステップ 1/2/5/10F。
+  クリップ `I/O` IN/OUT。編集 `Space` 再生, `I/O` IN/OUT, `Home` ズームリセット, `Delete` 現フレームの点を削除,
+  `Shift+Delete` 範囲削除の開始/確定 (`Escape` で取消), `Ctrl+Z` / `Ctrl+Shift+Z` Undo/Redo (on_key 内で直接処理)。
+  送出 `Space` PLAY/PAUSE, `Enter` PLAY, `Esc` CUE, `N/P` 次/前, `1-4` 速度。収録 `F9` REC/STOP。
+  Shift 付きと Escape の扱いは `on_key` の編集タブ分岐にあり、キー表 (`_key_map`) は keysym だけで修飾キーを持たない。
+- 編集タブの点削除 (`_edit_apply_deletion`) は消した点を挟んでスイングを分割する (補間しない)。Undo スナップショットは
+  スイング一覧のディープコピー (本数が変わるため)。人が削除した自動点は `corrections.json` の `deleted` →
+  `ai/dataset.py` で negative として保存され、`tools/train_clubhead.py` が負例 (その座標の周りだけ 0 に寄せる) に使う。
 - 軌道の `points` のフレーム番号は **clip.in_frame 基準の相対値**(playout/編集書き出しとも `frame - in_frame` で描画)。
 - `os.environ["OPENCV_FFMPEG_THREAD_COUNT"] = "1"` を cv2 import 前に設定している(mp4v マルチスレッドデコードのクラッシュ対策)。外さない。
 - ログは `print` 中心。`playout` ロガーだけ DEBUG。

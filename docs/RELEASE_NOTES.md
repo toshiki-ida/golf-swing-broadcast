@@ -26,6 +26,9 @@ feature/ai-analysis の現場 PC (UltraStudio 4K Mini) 持ち込み版。PR #1 �
 - **検出モード (実験的)**: `_internal\models\clubhead.onnx` が同梱されていれば、学習ベースのクラブヘッド検出器の候補を追跡に加える。
   現時点のモデルは 12 点で学習した仮のもので精度は未検証。候補の提案だけで、連続性・欠損・信頼度の判定は従来どおり。
   従来方式に戻すときは settings.json の `"ai": {"club_detector": "off"}`
+- **点の削除 (編集タブ)**: `Delete` で現在フレームの点を削除 (フレーム送り・ジョグと組み合わせて連続削除)、`Shift+Delete` 2 回で
+  範囲削除、`Ctrl+Z` で復帰。消した区間は補間せず軌道が途切れる。タイムライン下段に点の位置、現在フレームの点は白で強調。
+  人が削除した自動点は書き出し時に誤検出 (negative) として学習データに記録される。操作は README「編集タブの操作」
 - **同梱の MSVC ランタイムを System32 の最新版に差し替え** (旧版 14.16 が混入すると onnxruntime がアクセス違反で落ちる。
   `release.ps1` の同梱確認でバージョンを検査する)
 - 追跡のチューニング記録: `docs/CLUB_TRACKING_EVAL.md` §8〜9、検出器: `docs/CLUBHEAD_DETECTOR_PLAN.md` §8。holdout 未実行、実収録素材の正解ラベル未作成

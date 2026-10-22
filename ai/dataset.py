@@ -3,6 +3,8 @@
 保存する点:
   - 制御点のうち、人が置いた点 (manual) と、自動生成後に人が修正しなかった点 (auto_confirmed)
   - スプライン補間で埋めた点 (interpolated) は weak として別扱い (既定では学習に使わない)
+  - 自動生成されたあと人が削除した点 (negative): その座標は「ヘッドではない」。学習では負例 (その位置のヒートマップを 0 に
+    寄せる。切り出し内の他の場所は本当のヘッドかもしれないので損失を掛けない)
 
 各点: frame (clip.in_frame 基準の相対フレーム), x, y (元解像度 px), source, 画像サイズ、
       切り出し (手首中心・身長代替値 ×2.4 の正方形) の位置と、切り出し内の座標。
@@ -156,6 +158,9 @@ def collect_clip_labels(clip_id: str, source_path, in_frame: int, swings: list, 
     strong = [{"frame": f, "x": int(x), "y": int(y), "source": source_of(f)} for x, y, f in pts_all]
     weak = [{"frame": f, "x": x, "y": y, "source": "interpolated"}
             for x, y, f in _sample_interpolated(swings, real_fps)]
+    # 人が削除した自動点 = 誤検出。同じフレームに人が置き直した点があってもその座標は負例として有効
+    negatives = [{"frame": int(f), "x": int(x), "y": int(y), "source": "negative"}
+                 for x, y, f in (corrections or {}).get("deleted", [])]
 
     out_dir = (Path(out_root) if out_root else DATASET_DIR) / clip_id
     if out_dir.exists():
@@ -182,7 +187,7 @@ def collect_clip_labels(clip_id: str, source_path, in_frame: int, swings: list, 
         return (label_xy[0], label_xy[1]), bh or H * 0.45
 
     records = []
-    for rec in strong + weak:
+    for rec in strong + weak + negatives:
         f = rec["frame"]
         abs_f = in_frame + int(f)
         if abs_f < 0 or abs_f >= n_total:
@@ -204,7 +209,7 @@ def collect_clip_labels(clip_id: str, source_path, in_frame: int, swings: list, 
         inside = 0 <= cx < CROP_SIZE and 0 <= cy < CROP_SIZE
         records.append({**rec, "abs_frame": abs_f, "image": f"frames/{name}", "crop": [x0, y0, side],
                         "crop_size": CROP_SIZE, "cx": round(cx, 1), "cy": round(cy, 1), "in_crop": inside,
-                        "weak": rec["source"] == "interpolated"})
+                        "weak": rec["source"] == "interpolated", "negative": rec["source"] == "negative"})
     cap.release()
     if pose is not None:
         pose.close()
@@ -213,12 +218,15 @@ def collect_clip_labels(clip_id: str, source_path, in_frame: int, swings: list, 
         "clip_id": clip_id, "source_path": str(source_path), "source_stem": Path(str(source_path)).stem,
         "width": W, "height": H, "in_frame": int(in_frame), "real_fps": float(real_fps),
         "body_h": bh, "labeler": labeler, "note": note, "saved": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "n_strong": sum(1 for r in records if not r["weak"]), "n_weak": sum(1 for r in records if r["weak"]),
+        "n_strong": sum(1 for r in records if not r["weak"] and not r["negative"]),
+        "n_weak": sum(1 for r in records if r["weak"]),
+        "n_negative": sum(1 for r in records if r["negative"]),
         "points": records,
     }
     (out_dir / "labels.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
-    return {"dir": str(out_dir), "n_strong": meta["n_strong"], "n_weak": meta["n_weak"],
-            "sources": {s: sum(1 for r in records if r["source"] == s) for s in ("manual", "auto_confirmed", "interpolated")}}
+    return {"dir": str(out_dir), "n_strong": meta["n_strong"], "n_weak": meta["n_weak"], "n_negative": meta["n_negative"],
+            "sources": {s: sum(1 for r in records if r["source"] == s)
+                        for s in ("manual", "auto_confirmed", "interpolated", "negative")}}
 
 
 def load_all(strong_only: bool = True, root=None) -> list:
@@ -227,7 +235,7 @@ def load_all(strong_only: bool = True, root=None) -> list:
     for lab in sorted((Path(root) if root else DATASET_DIR).glob("*/labels.json")):
         meta = json.loads(lab.read_text(encoding="utf-8"))
         for r in meta["points"]:
-            if strong_only and r.get("weak"):
+            if strong_only and (r.get("weak") or r.get("negative")):
                 continue
             if not r.get("in_crop", True):
                 continue
@@ -239,7 +247,8 @@ def summary(root=None) -> dict:
     clips = {}
     for lab in sorted((Path(root) if root else DATASET_DIR).glob("*/labels.json")):
         meta = json.loads(lab.read_text(encoding="utf-8"))
-        clips[meta["clip_id"]] = {"strong": meta["n_strong"], "weak": meta["n_weak"], "labeler": meta.get("labeler"),
+        clips[meta["clip_id"]] = {"strong": meta["n_strong"], "weak": meta["n_weak"],
+                                  "negative": meta.get("n_negative", 0), "labeler": meta.get("labeler"),
                                   "source_stem": meta.get("source_stem")}
     return {"clips": clips, "n_clips": len(clips), "n_strong": sum(c["strong"] for c in clips.values()),
-            "n_weak": sum(c["weak"] for c in clips.values())}
+            "n_weak": sum(c["weak"] for c in clips.values()), "n_negative": sum(c["negative"] for c in clips.values())}

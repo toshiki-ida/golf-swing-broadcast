@@ -18,6 +18,7 @@ DeckLink入出力、録画、In/Out編集、軌道描画、送出を統合管理
 
 import argparse
 import collections
+import copy
 import datetime
 import json
 import logging
@@ -108,6 +109,7 @@ KEYBOARD_ACTIONS = [
     ("edit_set_in",     "IN点設定 (編集)",  "i",       "編集"),
     ("edit_set_out",    "OUT点設定 (編集)", "o",       "編集"),
     ("zoom_reset",      "ズームリセット",   "Home",    "編集"),
+    ("edit_del_point",  "現フレームの点を削除 (Shift+で範囲削除)", "Delete", "編集"),
     # 送出
     ("po_play_pause",   "PLAY/PAUSE",       "space",   "送出"),
     ("po_play",         "PLAY",             "Return",  "送出"),
@@ -1827,7 +1829,7 @@ class GolfBroadcastApp(ctk.CTk):
         # シークバーと同じカラム (column=1) に配置して位置を揃える
         self._edit_in = 0
         self._edit_out = 0
-        self._io_canvas = Canvas(tl_frame, height=28, bg="#2b2b2b", highlightthickness=0)
+        self._io_canvas = Canvas(tl_frame, height=44, bg="#2b2b2b", highlightthickness=0)
         self._io_canvas.grid(row=1, column=1, sticky="ew", pady=(0, 0))
         self._io_canvas.bind("<Configure>", self._io_redraw)
         self._io_canvas.bind("<Button-1>", self._io_press)
@@ -1996,6 +1998,24 @@ class GolfBroadcastApp(ctk.CTk):
         self.edit_fade_slider.set(0)
         self.edit_fade_slider.pack(fill="x", padx=8, pady=(0, 8))
 
+        # 点の削除 (フレーム単位 / 範囲)
+        del_sec = ctk.CTkFrame(edit_scroll)
+        del_sec.pack(fill="x", padx=10, pady=5)
+        ctk.CTkLabel(del_sec, text="点の削除").pack(anchor="w", padx=8, pady=(5, 0))
+        del_row = ctk.CTkFrame(del_sec, fg_color="transparent")
+        del_row.pack(fill="x", padx=8, pady=2)
+        ctk.CTkButton(del_row, text="この点を削除 (Del)", width=120,
+                       fg_color="#5a3a00", hover_color="#7a5000",
+                       command=self._edit_delete_point_at_frame).pack(side="left", padx=2)
+        self.edit_del_range_btn = ctk.CTkButton(
+            del_row, text="範囲削除 開始 (Shift+Del)", width=120,
+            fg_color="#5a1a1a", hover_color="#7a2a2a",
+            command=self._edit_del_range_step)
+        self.edit_del_range_btn.pack(side="left", padx=2)
+        self.edit_del_label = ctk.CTkLabel(del_sec, text="", font=("", 10), text_color="#aaa",
+                                           justify="left", wraplength=240)
+        self.edit_del_label.pack(anchor="w", padx=8, pady=(0, 6))
+
         # スイング情報
         self.edit_swing_label = ctk.CTkLabel(edit_scroll, text="Swing 1 (0 pts)")
         self.edit_swing_label.pack(padx=10, pady=5)
@@ -2034,6 +2054,7 @@ class GolfBroadcastApp(ctk.CTk):
         self._edit_undo_stack = []         # Undo スナップショットスタック
         self._edit_redo_stack = []         # Redo スナップショットスタック
         self._UNDO_MAX = 50
+        self._edit_del_range_start = None  # 範囲削除の開始フレーム (None=選択していない)
 
         # PanedWindow に左右を追加
         self.edit_paned.add(left, minsize=400, stretch="always")
@@ -2173,6 +2194,7 @@ class GolfBroadcastApp(ctk.CTk):
         self._edit_clip_id = clip_id
         self._edit_undo_stack.clear()
         self._edit_redo_stack.clear()
+        self._edit_del_range_start = None
         self._load_edit_clip()
         self._refresh_edit_clips_list()
 
@@ -2442,9 +2464,21 @@ class GolfBroadcastApp(ctk.CTk):
                     cx_out - hr, cy_out - hr, cx_out + hr, cy_out + hr,
                     fill=fill_out, outline="white", width=1, tags="handles")
 
+        # 現在フレームの点を白い二重丸で強調 (全スイング)
+        cur_hit = self._edit_point_at_frame(cur)
+        for si, pi in cur_hit:
+            pt = self._edit_swings[si].points[pi]
+            pcx, pcy = self._edit_video_to_canvas(pt[0], pt[1])
+            r = max(6, int(MARKER_RADIUS * eff_scale)) + 4
+            self.edit_canvas.create_oval(pcx - r, pcy - r, pcx + r, pcy + r,
+                                         outline="#ffffff", width=2, tags="handles")
+            self.edit_canvas.create_oval(pcx - r - 3, pcy - r - 3, pcx + r + 3, pcy + r + 3,
+                                         outline="#000000", width=1, tags="handles")
+
         zoom_txt = f" ({self._edit_zoom:.0f}x)" if self._edit_zoom > 1.0 else ""
+        dot = " ●" if cur_hit else " ○"
         self.edit_frame_label.configure(
-            text=f"{self._edit_frame_no} / {self._edit_total - 1}{zoom_txt}")
+            text=f"{self._edit_frame_no} / {self._edit_total - 1}{zoom_txt}{dot}")
         self._edit_slider_updating = True
         self.edit_slider.set(self._edit_frame_no)
         self._edit_slider_updating = False
@@ -2452,7 +2486,9 @@ class GolfBroadcastApp(ctk.CTk):
         swing = self._edit_current_swing
         pts = len(swing.points) if swing else 0
         self.edit_swing_label.configure(
-            text=f"Swing {self._edit_swing_idx + 1} ({pts} pts)")
+            text=f"Swing {self._edit_swing_idx + 1} ({pts} pts) / 全 {len(self._edit_swings)} 本")
+        self._edit_update_del_label()
+        self._io_redraw()
 
     def _edit_canvas_to_video(self, cx, cy):
         cw = self.edit_canvas.winfo_width()
@@ -2864,6 +2900,27 @@ class GolfBroadcastApp(ctk.CTk):
                          fill="#ff6a4a", outline="#fff", tags="out_marker")
         c.create_text(x_out, y_bar + 15, text=f"OUT:{self._edit_out}", fill="#aaa",
                        font=("", 8), anchor="n")
+        # --- 点の有無 (下段): スイングごとの色で目盛り、現在フレームは白い縦線、現在点は白で強調 ---
+        y0, y1 = 31, 40
+        c.create_line(pad, y1 + 1, cw - pad, y1 + 1, fill="#444", width=1)
+        cur = self._edit_frame_no
+        if self._edit_del_range_start is not None:
+            xa = self._io_frame_to_x(min(self._edit_del_range_start, cur))
+            xb = self._io_frame_to_x(max(self._edit_del_range_start, cur))
+            c.create_rectangle(xa, y0 - 2, xb + 1, y1 + 2, fill="#5a1a1a", outline="#ff6a6a", width=1)
+        has_cur = False
+        for swing in self._edit_swings:
+            col = getattr(swing, "color_start_hex", "#FFFF00")
+            for pt in swing.points:
+                x = self._io_frame_to_x(pt[2])
+                if pt[2] == cur:
+                    has_cur = True
+                    continue
+                c.create_line(x, y0, x, y1, fill=col, width=1)
+        xc = self._io_frame_to_x(cur)
+        c.create_line(xc, y_bar - 3, xc, y1 + 2, fill="#ffffff", width=1)
+        if has_cur:
+            c.create_rectangle(xc - 3, y0 - 2, xc + 3, y1 + 2, fill="#ffffff", outline="#000")
 
     def _io_press(self, event):
         """マーカーのドラッグ開始: 近い方のマーカーを掴む"""
@@ -3143,6 +3200,120 @@ class GolfBroadcastApp(ctk.CTk):
             swing.handles.clear()
             self._edit_update_display()
 
+    # ----- 点の削除 (フレーム単位 / 範囲) -----
+
+    def _edit_del_keysym(self):
+        sc = self.settings.data.get("keyboard_shortcuts", {})
+        return (sc.get("edit_del_point") or DEFAULT_KEYBOARD_SHORTCUTS["edit_del_point"]).lower()
+
+    def _edit_point_at_frame(self, frame):
+        """そのフレームに置かれた点を [(swing_idx, point_idx), ...] で返す (全スイング)"""
+        hits = []
+        for si, swing in enumerate(self._edit_swings):
+            for pi, pt in enumerate(swing.points):
+                if pt[2] == frame:
+                    hits.append((si, pi))
+        return hits
+
+    def _edit_nearest_point_frame(self, frame):
+        frames = [pt[2] for sw in self._edit_swings for pt in sw.points]
+        return min(frames, key=lambda f: abs(f - frame)) if frames else None
+
+    def _edit_delete_point_at_frame(self):
+        """現在フレームの点を削除 (Delete キー / ボタン)。フレーム送りと組み合わせて連続して消せる"""
+        if not self._edit_swings:
+            return
+        cur = self._edit_frame_no
+        if not self._edit_point_at_frame(cur):
+            near = self._edit_nearest_point_frame(cur)
+            self._edit_set_del_label(
+                f"F{cur} に点はありません" + (f" (最寄り: F{near})" if near is not None else ""), "#E0B040")
+            return
+        self._edit_push_undo()
+        n = self._edit_apply_deletion({cur})
+        self._edit_set_del_label(f"F{cur} の点を削除 ({n} 点)。Ctrl+Z で戻せます", "#88CC88")
+        self._edit_update_display()
+
+    def _edit_del_range_step(self):
+        """範囲削除: 1 回目で開始フレームを記憶、2 回目で現在フレームまでの点をまとめて削除"""
+        if not self._edit_swings:
+            return
+        cur = self._edit_frame_no
+        if self._edit_del_range_start is None:
+            self._edit_del_range_start = cur
+            self.edit_del_range_btn.configure(text="範囲削除 ここまで (Shift+Del)")
+            self._edit_set_del_label(f"範囲削除: F{cur} から … 終点のフレームでもう一度 (Escape で取消)", "#FF9A9A")
+            self._io_redraw()
+            return
+        a, b = sorted((self._edit_del_range_start, cur))
+        self._edit_del_range_start = None
+        self.edit_del_range_btn.configure(text="範囲削除 開始 (Shift+Del)")
+        frames = {pt[2] for sw in self._edit_swings for pt in sw.points if a <= pt[2] <= b}
+        if not frames:
+            self._edit_set_del_label(f"F{a}〜F{b} に点はありません", "#E0B040")
+            self._edit_update_display()
+            return
+        self._edit_push_undo()
+        n = self._edit_apply_deletion(frames)
+        self._edit_set_del_label(f"F{a}〜F{b} の点を削除 ({n} 点)。Ctrl+Z で戻せます", "#88CC88")
+        self._edit_update_display()
+
+    def _edit_del_range_cancel(self):
+        self._edit_del_range_start = None
+        if hasattr(self, "edit_del_range_btn"):
+            self.edit_del_range_btn.configure(text="範囲削除 開始 (Shift+Del)")
+        self._edit_set_del_label("範囲削除を取り消しました", "#aaa")
+        self._edit_update_display()
+
+    def _edit_apply_deletion(self, frames):
+        """frames (set) に置かれた点を全スイングから取り除く。消した点の前後は補間せず、そこでスイングを分割する。
+        戻り値: 消した点の数"""
+        frames = set(frames)
+        new_swings = []
+        removed = 0
+        for swing in self._edit_swings:
+            self._edit_ensure_handles(swing)
+            paired = sorted(zip(swing.points, swing.handles), key=lambda x: x[0][2])
+            # 削除点を挟んで前後に分割
+            groups = [[]]
+            for pt, h in paired:
+                if pt[2] in frames:
+                    removed += 1
+                    if groups[-1]:
+                        groups.append([])
+                    continue
+                groups[-1].append((pt, h))
+            groups = [g for g in groups if g]
+            if not groups:
+                continue
+            for gi, g in enumerate(groups):
+                sw = swing if gi == 0 else copy.deepcopy(swing)
+                sw.points = [pt for pt, _ in g]
+                sw.handles = [h for _, h in g]
+                new_swings.append(sw)
+        if not new_swings:
+            new_swings = [self._make_default_trajectory(0)]
+        self._edit_swings = new_swings
+        self._edit_swing_idx = max(0, min(self._edit_swing_idx, len(new_swings) - 1))
+        self._edit_spline_cache.clear()
+        self._edit_handle_point = None
+        self._edit_dragging = None
+        self._edit_update_color_buttons()
+        return removed
+
+    def _edit_set_del_label(self, text, color="#aaa"):
+        self._edit_del_msg = (text, color)
+        if hasattr(self, "edit_del_label"):
+            self.edit_del_label.configure(text=text, text_color=color)
+
+    def _edit_update_del_label(self):
+        """範囲選択中は現在の範囲を常に表示"""
+        if self._edit_del_range_start is not None and hasattr(self, "edit_del_label"):
+            a, b = sorted((self._edit_del_range_start, self._edit_frame_no))
+            n = sum(1 for sw in self._edit_swings for pt in sw.points if a <= pt[2] <= b)
+            self.edit_del_label.configure(
+                text=f"範囲削除: F{a}〜F{b} ({n} 点) … Shift+Del で確定 / Escape で取消", text_color="#FF9A9A")
+
     # ----- Undo / Redo (スナップショット方式) -----
 
     def _edit_push_undo(self):
@@ -3153,21 +3324,18 @@ class GolfBroadcastApp(ctk.CTk):
         self._edit_redo_stack.clear()
 
     def _edit_snapshot(self):
-        """全スイングの points/handles のディープコピーを返す"""
-        snapshot = []
-        for swing in self._edit_swings:
-            snapshot.append((
-                list(swing.points),
-                [h if h is None else tuple(h) for h in swing.handles],
-            ))
-        return snapshot
+        """全スイングのディープコピー (点・ハンドル・スタイル) を返す。点削除でスイングが分割されて本数が変わるので
+        スイング単位ではなくリストごと保存する"""
+        return [copy.deepcopy(swing) for swing in self._edit_swings]
 
     def _edit_restore_snapshot(self, snapshot):
-        """スナップショットから points/handles を復元"""
-        for i, (pts, hds) in enumerate(snapshot):
-            if i < len(self._edit_swings):
-                self._edit_swings[i].points = list(pts)
-                self._edit_swings[i].handles = list(hds)
+        """スナップショットからスイング一覧を復元"""
+        self._edit_swings = [copy.deepcopy(swing) for swing in snapshot]
+        if not self._edit_swings:
+            self._edit_swings = [self._make_default_trajectory(0)]
+        self._edit_swing_idx = max(0, min(self._edit_swing_idx, len(self._edit_swings) - 1))
+        self._edit_spline_cache.clear()
+        self._edit_update_color_buttons()
 
     def _edit_undo(self):
         if not self._edit_undo_stack:
@@ -4986,6 +5154,7 @@ class GolfBroadcastApp(ctk.CTk):
             "edit_set_in":     lambda: self._edit_set_in(),
             "edit_set_out":    lambda: self._edit_set_out(),
             "zoom_reset":      lambda: self._edit_zoom_reset(),
+            "edit_del_point":  lambda: self._edit_delete_point_at_frame(),
             "po_play_pause":   lambda: self._playout_toggle_play(),
             "po_play":         lambda: self._playout_play_with_btn(),
             "po_cue_top":      lambda: self._playout_cue_top(),
@@ -5018,6 +5187,14 @@ class GolfBroadcastApp(ctk.CTk):
                 else:
                     self._edit_undo()
                 return
+            if context == "編集":
+                # Shift+<点削除キー>: 範囲削除の開始 → もう一度で確定。Escape で取消
+                if shift and key == self._edit_del_keysym():
+                    self._edit_del_range_step()
+                    return
+                if key == "escape" and self._edit_del_range_start is not None:
+                    self._edit_del_range_cancel()
+                    return
 
             # タブ固有のショートカットを先にチェック
             tab_map = self._key_map.get(context, {})
