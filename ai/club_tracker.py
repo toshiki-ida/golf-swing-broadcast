@@ -93,6 +93,112 @@ RELIABLE_MIN_RATE = 0.35    # 信頼度ゲート: スイング区間の観測率
 RELIABLE_MIN_CONT = 0.70    # 信頼度ゲート: 連続する観測の移動量が上限内だった割合
 RELIABLE_MIN_OBS = 10       # 信頼度ゲート: 観測フレーム数
 RELIABLE_MIN_ATT = 0.10     # 信頼度ゲート: 手元から伸びるシャフトに繋がっていた観測の割合 (130128 は 2%、描けた素材は 12〜47%)
+HEAD_NEAR_RATIO = 0.25      # 「頭に乗っている」と見なす、鼻・耳からの距離 (身長代替値比)
+DEFAULT_GATE = {            # 信頼度ゲートの既定 (2026-10-22 tune の目視判定で決定、docs/CLUB_TRACKING_EVAL.md §10)。
+    "min_observed": 6,                # 実際の値は ai.config.gate_thresholds (config/ai.json, settings.json) で上書き
+    "min_rate": RELIABLE_MIN_RATE, "min_continuity": RELIABLE_MIN_CONT,
+    "min_hand_connect_ratio": 0.0,    # 手元接続率は使わない (正しい区間でも 0% が多い)
+    "min_motion_bh": 0.3,             # 静止した物 (脚・カメラマンの手) を追った区間を止める
+    "max_on_head_ratio": 0.3,         # 選手の帽子・頭を追った区間を止める
+    "max_dist_std": 0.19,             # 手首距離のばらつき: 観客・背景を追うと大きい
+    "max_dist_change": 0.07,          # 手首距離の 1 フレーム変化: 同上
+    "min_speed_ratio": 1.0,           # ヘッドが手より遅い区間 (観客) を止める
+    "min_wrist_ratio": 0.05,          # 手が止まったままヘッドだけが 2 身長以上動く区間 (観客) を止める
+}
+WRIST_RATIO_MIN_MOTION = 2.0   # min_wrist_ratio は区間の道のりがこれ以上 (身長比) のときだけ判定する
+
+
+def wrist_features(pts, wrist: dict, body_h: float) -> dict:
+    """観測点と手首中点の関係。クラブは手に固定されているので、手首との距離は滑らかにしか変わらず、
+    ヘッドは平均して手より速く動き、手が止まっているのにヘッドだけが長く動くことはない。
+      dist_std     : 手首距離 (身長比) の標準偏差。背景や他人を追うと大きい
+      dist_change  : 手首距離の 1 フレームあたりの変化 (身長比) の平均
+      speed_ratio  : ヘッド速度 / 手首速度 の平均比
+      wrist_motion : 手首がたどった道のり (身長比)
+    """
+    bh = max(float(body_h), 1.0)
+    ds, dd, hv, wv = [], [], [], []
+    prev = None
+    for x, y, f in pts:
+        w = wrist.get(f)
+        if w is None:
+            continue
+        d = float(np.hypot(x - w[0], y - w[1])) / bh
+        ds.append(d)
+        if prev is not None and f - prev[2] <= 3:
+            n = f - prev[2]
+            dd.append(abs(d - prev[3]) / n)
+            hv.append(float(np.hypot(x - prev[0], y - prev[1])) / n / bh)
+            wv.append(float(np.hypot(w[0] - prev[4][0], w[1] - prev[4][1])) / n / bh)
+        prev = (x, y, f, d, w)
+    return {"dist_mean": round(float(np.mean(ds)), 3) if ds else 0.0,
+            "dist_std": round(float(np.std(ds)), 3) if ds else 0.0,
+            "dist_change": round(float(np.mean(dd)), 4) if dd else 0.0,
+            "speed_ratio": round(float(np.mean(hv) / max(float(np.mean(wv)), 1e-4)), 2) if wv else 0.0,
+            "wrist_motion": round(float(np.sum(wv)), 3) if wv else 0.0}
+
+
+def resolve_gate(gate: Optional[dict] = None) -> dict:
+    """既定 ← config/ai.json ← settings.json (呼び出し側が渡す gate) の順に閾値を決める。"""
+    base = dict(DEFAULT_GATE)
+    try:
+        from ai.config import gate_thresholds
+        base.update({k: v for k, v in gate_thresholds(None).items() if k in base})
+    except Exception:
+        pass
+    if gate:
+        base.update({k: v for k, v in gate.items() if k in base})
+    return base
+
+
+def motion_bh(pts, body_h: float) -> float:
+    """点列がたどった道のり (身長代替値比)。静止した物を追っていると小さい。"""
+    if len(pts) < 2:
+        return 0.0
+    path = sum(float(np.hypot(b[0] - a[0], b[1] - a[1])) for a, b in zip(pts[:-1], pts[1:]))
+    return path / max(float(body_h), 1.0)
+
+
+def on_head_ratio(pts, landmarks: dict, body_h: float) -> float:
+    """観測点が選手の頭 (鼻 0・耳 7/8) から HEAD_NEAR_RATIO×身長以内にあった割合。帽子や顔を追っていると大きい。"""
+    if not pts or not landmarks:
+        return 0.0
+    r = HEAD_NEAR_RATIO * max(float(body_h), 1.0)
+    n = 0
+    for x, y, f in pts:
+        lm = landmarks.get(f)
+        if lm is None or len(lm) < 9:
+            continue
+        if min(np.hypot(x - lm[i][0], y - lm[i][1]) for i in (0, 7, 8)) <= r:
+            n += 1
+    return n / len(pts)
+
+
+def gate_reasons(q: dict, gate: dict) -> list:
+    """品質 q が閾値 gate を満たさない理由 (空なら通過)。表示用に閾値も入れる。"""
+    reasons = []
+    if q.get("observed", 0) < gate["min_observed"]:
+        reasons.append(f"観測 {q.get('observed', 0)}f < {gate['min_observed']}f")
+    if q.get("rate", 0.0) < gate["min_rate"]:
+        reasons.append(f"観測率 {q.get('rate', 0.0):.0%} < {gate['min_rate']:.0%}")
+    if q.get("continuity", 0.0) < gate["min_continuity"]:
+        reasons.append(f"連続性 {q.get('continuity', 0.0):.0%} < {gate['min_continuity']:.0%}")
+    if q.get("attached", 0.0) < gate["min_hand_connect_ratio"]:
+        reasons.append(f"手元接続 {q.get('attached', 0.0):.0%} < {gate['min_hand_connect_ratio']:.0%}")
+    if q.get("motion_bh", 0.0) < gate["min_motion_bh"]:
+        reasons.append(f"動き {q.get('motion_bh', 0.0):.2f} < {gate['min_motion_bh']:.2f} 身長")
+    if q.get("on_head", 0.0) > gate["max_on_head_ratio"]:
+        reasons.append(f"頭上 {q.get('on_head', 0.0):.0%} > {gate['max_on_head_ratio']:.0%}")
+    if q.get("dist_std", 0.0) > gate.get("max_dist_std", 9.0):
+        reasons.append(f"手首距離ばらつき {q.get('dist_std', 0.0):.2f} > {gate['max_dist_std']:.2f}")
+    if q.get("dist_change", 0.0) > gate.get("max_dist_change", 9.0):
+        reasons.append(f"手首距離変化 {q.get('dist_change', 0.0):.3f} > {gate['max_dist_change']:.3f}")
+    if q.get("speed_ratio", 0.0) < gate.get("min_speed_ratio", 0.0) and q.get("wrist_motion", 0.0) > 0:
+        reasons.append(f"速度比 {q.get('speed_ratio', 0.0):.2f} < {gate['min_speed_ratio']:.2f}")
+    mot = q.get("motion_bh", 0.0)
+    if mot >= WRIST_RATIO_MIN_MOTION and q.get("wrist_motion", 0.0) / max(mot, 1e-6) < gate.get("min_wrist_ratio", 0.0):
+        reasons.append(f"手が止まったままヘッドが {mot:.1f} 身長分動いた (手 {q.get('wrist_motion', 0.0):.2f})")
+    return reasons
 MAX_POSES = 4               # 同時に検出する人数の上限 (キャディ・カメラマンを含めて選手を選ぶため)
 TRACK_ASSOC = 1.0           # 腰中点の距離 (胴体長比) がこれ未満なら同じ人物トラック
 BODY_H_WINDOW = 0.4         # 身長代替値を決めるのに使うクリップ前半の割合 (アドレス付近。終盤のズームを除外)
@@ -127,9 +233,13 @@ class ClubTrackResult:
             out.append(cur)
         return out
 
-    def segment_quality(self, max_gap_sec: float = GAP_MAX_SEC, min_pts: int = 4) -> list:
-        """区間ごとの品質。[(points, quality, reliable), ...]。区間内の観測率・連続性・手元接続率で判定。"""
+    def segment_quality(self, max_gap_sec: float = GAP_MAX_SEC, min_pts: int = 4, gate: Optional[dict] = None) -> list:
+        """区間ごとの品質。[(points, quality, reliable), ...]。
+        区間内の観測率・連続性・手元接続率・動き・頭上率を閾値 (gate、省略時は self.gate か既定) で判定。"""
+        gate = gate or getattr(self, "gate", None) or resolve_gate()
         max_step = MAX_HEAD_SPEED_BH * self.body_h / max(self.real_fps, 1.0)
+        att_map = getattr(self, "attached", {})
+        lms = getattr(self, "landmarks", {}) or {}
         out = []
         for seg in self.segments(max_gap_sec, min_pts):
             fs = [p[2] for p in seg]
@@ -138,20 +248,14 @@ class ClubTrackResult:
             pairs = [(a, b) for a, b in zip(seg[:-1], seg[1:]) if b[2] - a[2] <= 3]
             cont = (sum(1 for a, b in pairs if np.hypot(b[0] - a[0], b[1] - a[1]) <= max_step * (b[2] - a[2]))
                     / len(pairs)) if pairs else 0.0
-            att_map = getattr(self, "attached", {})
             att = sum(1 for p in seg if att_map.get(p[2])) / len(seg)
-            reasons = []
-            if len(seg) < RELIABLE_MIN_OBS:
-                reasons.append(f"観測 {len(seg)}f")
-            if rate < RELIABLE_MIN_RATE:
-                reasons.append(f"観測率 {rate:.0%}")
-            if cont < RELIABLE_MIN_CONT:
-                reasons.append(f"連続性 {cont:.0%}")
-            if att < RELIABLE_MIN_ATT:
-                reasons.append(f"手元接続 {att:.0%}")
             q = {"frames": (fs[0], fs[-1]), "observed": len(seg), "span": span, "rate": round(rate, 3),
-                 "continuity": round(cont, 3), "attached": round(att, 3), "reasons": reasons}
-            out.append((seg, q, not reasons))
+                 "continuity": round(cont, 3), "attached": round(att, 3),
+                 "motion_bh": round(motion_bh(seg, self.body_h), 3),
+                 "on_head": round(on_head_ratio(seg, lms, self.body_h), 3),
+                 **wrist_features(seg, self.wrist or {}, self.body_h)}
+            q["reasons"] = gate_reasons(q, gate)
+            out.append((seg, q, not q["reasons"]))
         return out
 
     def confident_points(self, min_conf: float = CONF_OK, max_pts: int = 18,
@@ -354,7 +458,7 @@ def _estimate_body_h(arr: np.ndarray) -> float:
 def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
                interlaced: bool = False, upper_field_first: bool = True,
                model_path: Optional[Path] = None, realtime_factor: Optional[float] = None,
-               use_detector: Optional[bool] = None,
+               use_detector: Optional[bool] = None, gate: Optional[dict] = None,
                progress: Optional[Callable[[float, str], None]] = None,
                debug_dir: Optional[Path] = None) -> ClubTrackResult:
     """クラブヘッド軌道を推定する。座標は元解像度のピクセル。
@@ -362,7 +466,9 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
     realtime_factor: 素材 1 フレームが実時間の何フレーム分か (HFR 2x = 4)。省略時は fps から推定。
     use_detector:    models/clubhead.onnx (ONNX Runtime CPU) をヘッド候補の提案に使う。None = あれば使う。
                      時間的連続性・欠損・信頼度の判定は検出器の有無によらず同じ。
+    gate:            信頼度ゲートの閾値 (ai.config.gate_thresholds)。None = 既定 ← config/ai.json。
     """
+    gate = resolve_gate(gate)
     from ai import default_pose_model
     from ai.config import realtime_factor as _rt
     t_start = time.time()
@@ -705,17 +811,13 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
                     if np.hypot(raw[b][0] - raw[a][0], raw[b][1] - raw[a][1]) <= max_step * (b - a)) / len(pairs)
                 if pairs else 0.0)
         att = sum(1 for k in ks if attached.get(k)) / len(ks)
+        pts_a = [(raw[k][0], raw[k][1], k) for k in ks]
         quality.update({"span": span, "rate": round(rate, 3), "continuity": round(cont, 3),
-                        "attached": round(att, 3)})
-        reasons = []
-        if len(ks) < RELIABLE_MIN_OBS:
-            reasons.append(f"観測 {len(ks)} フレーム (< {RELIABLE_MIN_OBS})")
-        if rate < RELIABLE_MIN_RATE:
-            reasons.append(f"観測率 {rate:.0%} (< {RELIABLE_MIN_RATE:.0%})")
-        if cont < RELIABLE_MIN_CONT:
-            reasons.append(f"連続性 {cont:.0%} (< {RELIABLE_MIN_CONT:.0%})")
-        if att < RELIABLE_MIN_ATT:
-            reasons.append(f"手元接続 {att:.0%} (< {RELIABLE_MIN_ATT:.0%})")
+                        "attached": round(att, 3),
+                        "motion_bh": round(motion_bh(pts_a, body_h), 3),
+                        "on_head": round(on_head_ratio(pts_a, {k: arr[k] for k in ks}, body_h), 3),
+                        **wrist_features(pts_a, {k: (wrist[k][0], wrist[k][1]) for k in ks}, body_h)})
+        reasons = gate_reasons(quality, gate)
         quality["reasons"] = reasons
         reliable = not reasons
     else:
@@ -730,8 +832,11 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
     res.detect_seconds = t_detect
     res.detector_used = detector is not None
     quality["detector"] = detector is not None
+    quality["gate"] = dict(gate)
+    res.gate = dict(gate)
     res.attached = {frame_ids[k]: bool(v) for k, v in attached.items()}
-    seg_q = res.segment_quality()
+    res.landmarks = {frame_ids[i]: (arr[i] * inv).tolist() for i in range(T)}
+    seg_q = res.segment_quality(gate=gate)
     quality["segments"] = [{**q, "reliable": ok} for _, q, ok in seg_q]
     if seg_q and any(ok for _, _, ok in seg_q):
         res.reliable = True          # 信頼できる区間が 1 つでもあれば、その区間だけ描く
@@ -739,7 +844,6 @@ def track_club(video_path, in_frame: int = 0, out_frame: int = -1, *,
     res.quality = quality
     res.raw = {frame_ids[k]: v for k, v in raw.items()}
     res.trace = {frame_ids[k]: v for k, v in trace.items()}
-    res.landmarks = {frame_ids[i]: (arr[i] * inv).tolist() for i in range(T)}
     log.info("軌道の信頼度: %s → %s", quality, "OK" if reliable else "不足")
     report(1.0, "完了")
     return res

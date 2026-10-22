@@ -475,8 +475,9 @@ def render_sns(video_path, out_path, *, in_frame: int = 0, out_frame: int = -1,
     landmarks = landmarks or {}
     if not swings and not landmarks:
         raise ValueError("軌道も骨格もありません")
-    if not swings and trajectory_note is None:
-        trajectory_note = "軌道: 信頼度不足"
+    # 軌道の注記 (「信頼度不足」「一部区間のみ」) は動画に入れない。描ける区間があれば描き、無ければ何も描かない。
+    # 状態は編集タブの右パネルにだけ出す (trajectory_note は互換のため受け取るが使わない)
+    trajectory_note = None
 
     # --- 局面: 軌道由来 + 骨格由来 → 統合
     report(0.02, "局面を解析")

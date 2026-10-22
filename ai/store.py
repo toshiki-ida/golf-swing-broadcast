@@ -74,13 +74,17 @@ def save_clip_ai_settings(dir_path, **kw) -> None:
     (Path(dir_path) / "settings.json").write_text(json.dumps(d, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-def save_auto_snapshot(dir_path, segments: list, undrawn: list) -> None:
-    """自動生成した制御点 (区間ごと) と未描画区間を残す。corrections の突き合わせに使う。"""
+def save_auto_snapshot(dir_path, segments: list, undrawn: list, all_segments: list | None = None,
+                       segment_quality: list | None = None) -> None:
+    """自動生成した制御点 (描いた区間) と未描画区間を残す。corrections の突き合わせに使う。
+    all_segments: ゲートで止めた区間も含む全区間の制御点 (「全区間を描く」用)、segment_quality: 各区間の指標。"""
     import time as _t
     (Path(dir_path) / "auto_points.json").write_text(json.dumps({
         "created": _t.strftime("%Y-%m-%d %H:%M:%S"),
         "segments": [[[int(x), int(y), f] for x, y, f in seg] for seg in segments],
         "undrawn": [[a, b] for a, b in undrawn],
+        "all_segments": [[[int(x), int(y), f] for x, y, f in seg] for seg in (all_segments or [])],
+        "segment_quality": segment_quality or [],
     }, ensure_ascii=False), encoding="utf-8")
 
 

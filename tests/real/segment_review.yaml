@@ -1,0 +1,77 @@
+# 信頼度ゲートの閾値を決めるための、区間ごとの目視判定 (2026-10-22, Claude がコンタクトシートで判定)。
+# 判定の元: build/club_eval/real/<stem>[_det]/club_tracker_overlay.mp4 から各区間の 5 フレーム (等間隔) を切り出した画像。
+# good = ヘッドに沿っている (描いてよい) / bad = 背景・人物・静止物を追っている (描いてはいけない) / mixed = 一部だけ正しい (描かない側に倒す)
+# frames は tools/run_club_tracker.py の出力 (trim 済み素材の絶対フレーム)。正解ラベル (オーナー) が付いたらそちらを優先する。
+# tools/gate_tune.py がこのファイルと club_track.json を突き合わせて閾値ごとの一致を出す。
+
+rec_0611_131029_trim:
+  - {frames: [6, 73], verdict: good, note: 全体を通してヘッド。接続 47%}
+rec_0611_131029_trim_det:
+  - {frames: [6, 73], verdict: good}
+rec_0611_161853_trim:
+  - {frames: [207, 317], verdict: good, note: 従来からの通過区間 (接続 18%)}
+rec_0611_161853_trim_det:
+  - {frames: [207, 317], verdict: good}
+rec_0611_141938_trim:
+  - {frames: [70, 239], verdict: good}
+rec_0611_141938_trim_det:
+  - {frames: [70, 239], verdict: good}
+rec_0611_164140_trim:
+  - {frames: [110, 252], verdict: good}
+rec_0611_164140_trim_det:
+  - {frames: [110, 265], verdict: good}
+rec_0611_164617_trim:
+  - {frames: [12, 262], verdict: good}
+  - {frames: [278, 289], verdict: good, note: フィニッシュ付近の短い区間}
+rec_0611_164617_trim_det:
+  - {frames: [12, 289], verdict: good, note: f12 アドレスのヘッド → f81 バックスイング → f150 トップ → f220 フォロー → f289 フィニッシュ}
+
+rec_0611_130128_trim:
+  - {frames: [54, 57], verdict: bad, note: 4 フレームのみ}
+  - {frames: [106, 137], verdict: bad, note: 選手の帽子 → キャディバッグ}
+  - {frames: [177, 284], verdict: bad, note: 選手の頭 → 後ろの観客}
+rec_0611_130128_trim_det:
+  - {frames: [11, 14], verdict: bad, note: 選手の帽子}
+  - {frames: [54, 145], verdict: bad, note: f77/f100 選手の帽子、f122 キャディバッグ。接続 4%}
+  - {frames: [175, 284], verdict: bad, note: f175-230 選手の頭、f257 観客。接続 0%}
+
+rec_0611_161732_trim:
+  - {frames: [347, 376], verdict: good, note: 正面やや後方。f347-376 シャフト先端のヘッドに沿う。接続 12%}
+rec_0611_161732_trim_det:
+  - {frames: [268, 277], verdict: bad, note: カメラマンの帽子。観測 4f}
+  - {frames: [290, 321], verdict: bad, note: カメラマンの手元で静止。接続 0%}
+  - {frames: [337, 376], verdict: mixed, note: f337 カメラマンの帽子、f347 以降はヘッド。接続 8%}
+
+rec_0612_135231_trim:
+  - {frames: [99, 123], verdict: good, note: トップ付近のヘッド。接続 38%}
+  - {frames: [166, 193], verdict: good, note: フォローで水平になったシャフトの先端。接続 0% だがヘッド}
+  - {frames: [217, 223], verdict: good, note: フィニッシュ手前。観測 7f で現行は不通過}
+rec_0612_135231_trim_det:
+  - {frames: [89, 121], verdict: good}
+  - {frames: [129, 147], verdict: good, note: トップ〜切り返し。f134/f142 で白いシャフトの先端}
+  - {frames: [157, 193], verdict: good, note: f166 水平シャフトの先端。f175 以降はフィニッシュへ向かうヘッド。接続 0%}
+  - {frames: [214, 223], verdict: good, note: f221/f223 で薄いシャフトが点まで伸びている。接続 0%}
+
+rec_0611_162742_trim:
+  - {frames: [318, 359], verdict: good, note: インパクト前後のヘッド (f345 で目視確認済み)。接続 0%}
+rec_0611_162742_trim_det:
+  - {frames: [6, 99], verdict: bad, note: アドレス中、選手の右脚 (腰の高さ) で静止。ヘッドはボール位置}
+  - {frames: [131, 137], verdict: bad, note: 同上}
+  - {frames: [152, 169], verdict: bad, note: 同上}
+  - {frames: [318, 359], verdict: good, note: インパクト前後のヘッド。接続 0%}
+
+rec_0611_162655_trim:
+  - {frames: [139, 179], verdict: good, note: テークバック。接続 23%}
+  - {frames: [196, 203], verdict: good, note: トップのヘッド。観測 8f で現行は不通過}
+  - {frames: [226, 321], verdict: mixed, note: f226 選手の帽子、f250 観客、f274 シャフト、f297 観客。接続 8%}
+rec_0611_162655_trim_det:
+  - {frames: [139, 179], verdict: good}
+  - {frames: [196, 203], verdict: good, note: トップのヘッド。観測 8f}
+  - {frames: [226, 321], verdict: mixed, note: 同上}
+
+rec_0612_123119_trim:
+  - {frames: [7, 43], verdict: mixed, note: f7 アドレスのヘッド、f21 以降は観客や選手の脚。接続 30% でも後半は誤り}
+  - {frames: [71, 169], verdict: bad, note: 観客・選手の頭。接続 7%}
+rec_0612_123119_trim_det:
+  - {frames: [7, 63], verdict: mixed, note: f7 ヘッド、f35 観客の顔、f49/f63 選手の脚。接続 10% で現行は通過 (誤)}
+  - {frames: [71, 169], verdict: bad, note: f96/f144 観客、f120 選手の頭。接続 7%}
