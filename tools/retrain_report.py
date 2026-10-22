@@ -46,7 +46,15 @@ def arg(args, key, default=None):
 def main() -> int:
     args = sys.argv[1:]
     inv = json.loads(Path(arg(args, "--inventory")).read_text(encoding="utf-8")) if arg(args, "--inventory") else {}
-    inv_txt = Path(arg(args, "--inventory-txt")).read_text(encoding="utf-8") if arg(args, "--inventory-txt") else ""
+    inv_txt = ""
+    if arg(args, "--inventory-txt"):
+        raw = Path(arg(args, "--inventory-txt")).read_bytes()
+        for enc in ("utf-8-sig", "utf-16", "cp932"):
+            try:
+                inv_txt = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
     train = json.loads(Path(arg(args, "--train")).read_text(encoding="utf-8")) if arg(args, "--train") else {}
     result = Path(arg(args, "--result")) if arg(args, "--result") else None
     out = Path(arg(args, "--out", "build/retrain/report.md"))

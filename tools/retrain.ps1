@@ -39,8 +39,10 @@ function Step($msg) { Write-Host ("`n=== " + $msg) -ForegroundColor Cyan }
 Step "1. inventory ($Dataset)"
 $invTxt = Join-Path $work "inventory.txt"
 $invJson = Join-Path $work "inventory.json"
-& $py tools\dataset_inventory.py --dataset $Dataset --json $invJson --exclude-holdout | Tee-Object -FilePath $invTxt
-if ($LASTEXITCODE -ne 0) { throw "inventory failed" }
+# written by python as UTF-8 (Tee-Object would write UTF-16, which the report step cannot read)
+cmd.exe /c ('"' + $py + '" tools\dataset_inventory.py --dataset "' + $Dataset + '" --json "' + $invJson + '" --exclude-holdout > "' + $invTxt + '" 2>&1')
+if ($LASTEXITCODE -ne 0) { Get-Content $invTxt -Encoding UTF8 -Tail 20; throw "inventory failed" }
+Get-Content $invTxt -Encoding UTF8
 $inv = Get-Content $invJson -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($inv.n_strong_usable -lt 20) { throw "not enough usable strong labels ($($inv.n_strong_usable)); collect more before retraining" }
 
