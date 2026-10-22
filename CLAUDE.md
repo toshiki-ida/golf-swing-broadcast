@@ -148,6 +148,9 @@ clips.json / playout.json / settings.json
 - 学習: `..\golf-autotrace\.venv\Scripts\python.exe tools/train_clubhead.py` (CUDA)。クリップ単位で train/val を分け、
   結果は `models/clubhead_train.json` に残る (件数・検証 px 誤差・PCK)。
 - `ai/club_tracker.track_club(use_detector=None)` は `models/clubhead.onnx` があれば検出器の候補を足す (settings.json の `ai.club_detector` を `off` で無効)。
+- **信頼度ゲートの閾値** は `ai.config.AI_DEFAULTS["gate"]` ← `config/ai.json` (exe 同階層が同梱より優先) ← settings.json `ai.gate` の順。
+  値の根拠は `docs/CLUB_TRACKING_EVAL.md` §10 と `tests/real/segment_review.yaml` (区間ごとの目視判定)。閾値を変えるときは
+  `python tools/gate_tune.py --gate key=value ...` で目視判定との一致を見てから。SNS 動画には軌道の注記を入れない (編集タブの右パネルのみ)。
   検出器は **候補の提案だけ** で、連続性・欠損・区間・信頼度の判定は従来どおり。モデルが無ければ従来方式のまま。
 - 検出器を学習し直したら `tools/eval_club.py --all --split tune --tag det_N --detector both` で従来/検出器ありを同じ表に残す。
 
