@@ -43,7 +43,7 @@ def load_records(use_weak: bool, root=DATASET_DIR, use_negatives: bool = True):
     """labels.json を読む。holdout として excluded の付いたクリップは外す。同一フレームに座標の違う強ラベルが複数ある
     場合は矛盾なので両方外し、同じ座標なら 1 つにまとめる (件数は stderr に出す)。各レコードに camera を付ける。"""
     recs = []
-    n_dup = n_conflict = 0
+    n_dup = n_conflict = n_missing = 0
     for lab in sorted(Path(root).glob("*/labels.json")):
         meta = json.loads(lab.read_text(encoding="utf-8"))
         if meta.get("excluded"):
@@ -55,6 +55,9 @@ def load_records(use_weak: bool, root=DATASET_DIR, use_negatives: bool = True):
             if (r.get("weak") and not use_weak) or not r.get("in_crop", True):
                 continue
             if r.get("negative") and not use_negatives:
+                continue
+            if not (lab.parent / r["image"]).exists():
+                n_missing += 1
                 continue
             rec = {"clip": meta["clip_id"], "camera": cam, "img": lab.parent / r["image"], "cx": r["cx"], "cy": r["cy"],
                    "crop_size": r.get("crop_size", 320), "crop": r["crop"], "weak": bool(r.get("weak")),
@@ -72,8 +75,9 @@ def load_records(use_weak: bool, root=DATASET_DIR, use_negatives: bool = True):
                 seen[key] = rec
             recs.append(rec)
     out = [r for r in recs if not r.get("conflict")]
-    if n_dup or n_conflict:
-        print(f"[data] 同一フレームの重複 {n_dup} 点をまとめ、座標が矛盾する {n_conflict} 組 ({len(recs) - len(out)} 点) を除外")
+    if n_dup or n_conflict or n_missing:
+        print(f"[data] 同一フレームの重複 {n_dup} 点をまとめ、座標が矛盾する {n_conflict} 組 ({len(recs) - len(out)} 点) を除外、"
+              f"画像が無い {n_missing} 点を除外")
     return out
 
 
@@ -220,6 +224,8 @@ def main() -> int:
     ap.add_argument("--val-clips", type=int, default=1)
     ap.add_argument("--val-ratio", type=float, default=0.0, help="クリップ単位の検証比率 (撮影方向で層化)。0 = --val-clips を使う")
     ap.add_argument("--name", default="", help="出力名。既定は clubhead_<日付>_<強ラベル数>.onnx (--out 指定時は無視)")
+    ap.add_argument("--train-fraction", type=float, default=1.0,
+                    help="学習曲線用: 学習側クリップのうちこの割合だけ使う (撮影方向ごとに丸め、各方向 1 本以上)。検証は同じ")
     ap.add_argument("--arch", default="tiny", choices=["tiny", "small"])
     ap.add_argument("--use-weak", action="store_true")
     ap.add_argument("--no-negatives", action="store_true", help="negative (人が削除した自動点) を学習に使わない")
@@ -238,9 +244,23 @@ def main() -> int:
         print(f"ラベルが足りません ({len(recs)} 点 in {a.dataset})。書き出しでラベルを貯めるか --dataset を確認してください")
         return 1
     train, valid, val_clips = split_by_clip(recs, a.val_clips, a.seed, a.val_ratio)
+    if a.train_fraction < 1.0:
+        rng = random.Random(a.seed + 1)
+        keep = set()
+        by_cam = {}
+        for c, cam in sorted({(r["clip"], r["camera"]) for r in train}):
+            by_cam.setdefault(cam, []).append(c)
+        for cam, cl in sorted(by_cam.items()):
+            rng.shuffle(cl)
+            keep.update(cl[:max(1, int(round(len(cl) * a.train_fraction)))])
+        train = [r for r in train if r["clip"] in keep]
+        print(f"学習曲線: 学習クリップを {a.train_fraction:.0%} に間引き → {len(keep)} 本 / {len(train)} 点")
     n_strong_total = sum(1 for r in recs if not r["negative"] and not r["weak"])
+    n_strong_train = sum(1 for r in train if not r["negative"] and not r["weak"])
     if not a.out:
         stem = a.name or f"clubhead_{time.strftime('%Y%m%d')}_{n_strong_total}"
+        if a.train_fraction < 1.0:
+            stem += f"_f{int(round(a.train_fraction * 100))}"
         a.out = str(ROOT / "models" / f"{stem}.onnx")
     cams = {}
     for r in recs:
@@ -301,6 +321,9 @@ def main() -> int:
             "onnx": str(out), "onnx_mb": round(out.stat().st_size / 1e6, 2)}
     info["cameras"] = {c: {"train": sorted(v["train"]), "val": sorted(v["val"])} for c, v in cams.items()}
     info["n_strong_total"] = n_strong_total
+    info["n_strong_train"] = n_strong_train
+    info["train_fraction"] = a.train_fraction
+    info["train_clips"] = sorted({r["clip"] for r in train})
     out.with_suffix(".train.json").write_text(json.dumps(info, ensure_ascii=False, indent=1), encoding="utf-8")
     print(json.dumps({k: v for k, v in info.items() if k != "history"}, ensure_ascii=False, indent=1))
     return 0

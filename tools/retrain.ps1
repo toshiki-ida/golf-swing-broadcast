@@ -21,8 +21,12 @@ param(
     [string]$TorchPython = "..\golf-autotrace\.venv\Scripts\python.exe",
     [string]$Split = "holdout",
     [string]$Name = "",
+    [string]$Previous = "",
+    [switch]$Curve,
     [switch]$SkipEval
 )
+# -Previous <inventory.json> : show the delta against a previous inventory
+# -Curve                     : also train with 25/50/75% of the training clips (learning curve) and evaluate all models
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
@@ -40,7 +44,9 @@ Step "1. inventory ($Dataset)"
 $invTxt = Join-Path $work "inventory.txt"
 $invJson = Join-Path $work "inventory.json"
 # written by python as UTF-8 (Tee-Object would write UTF-16, which the report step cannot read)
-cmd.exe /c ('"' + $py + '" tools\dataset_inventory.py --dataset "' + $Dataset + '" --json "' + $invJson + '" --exclude-holdout > "' + $invTxt + '" 2>&1')
+$invArgs = ' tools\dataset_inventory.py --dataset "' + $Dataset + '" --json "' + $invJson + '" --exclude-holdout --estimate-camera'
+if ($Previous -and (Test-Path $Previous)) { $invArgs += ' --previous "' + (Resolve-Path $Previous).Path + '"' }
+cmd.exe /c ('"' + $py + '"' + $invArgs + ' > "' + $invTxt + '" 2>&1')
 if ($LASTEXITCODE -ne 0) { Get-Content $invTxt -Encoding UTF8 -Tail 20; throw "inventory failed" }
 Get-Content $invTxt -Encoding UTF8
 $inv = Get-Content $invJson -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -49,18 +55,28 @@ if ($inv.n_strong_usable -lt 20) { throw "not enough usable strong labels ($($in
 # ---------------------------------------------------------------- 2. train
 Step "2. train (val-ratio $ValRatio, epochs $Epochs)"
 $trainLog = Join-Path $work "train.log"
-$before = Get-ChildItem models -Filter "clubhead_*.onnx" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
-$targs = @("tools\train_clubhead.py", "--dataset", $Dataset, "--val-ratio", "$ValRatio", "--epochs", "$Epochs")
-if ($Name) { $targs += @("--name", $Name) }
-cmd.exe /c ('"' + $TorchPython + '" ' + ($targs -join ' ') + ' > "' + $trainLog + '" 2>&1')
-if ($LASTEXITCODE -ne 0) { Get-Content $trainLog -Tail 20; throw "training failed (see $trainLog)" }
-$after = Get-ChildItem models -Filter "clubhead_*.onnx" | Where-Object { $before -notcontains $_.FullName } | Sort-Object LastWriteTime | Select-Object -Last 1
-if (-not $after) { $after = Get-ChildItem models -Filter "clubhead_*.onnx" | Sort-Object LastWriteTime | Select-Object -Last 1 }
-if (-not $after) { throw "no model produced" }
-$model = $after.FullName
-$trainJson = [IO.Path]::ChangeExtension($model, ".train.json")
+$fractions = @(1.0)
+if ($Curve) { $fractions = @(0.25, 0.5, 0.75, 1.0) }
+$models = @()
+$trainJsons = @()
+foreach ($frac in $fractions) {
+    $before = Get-ChildItem models -Filter "clubhead_*.onnx" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+    $log = Join-Path $work ("train_f" + [int]($frac * 100) + ".log")
+    $targs = @("tools\train_clubhead.py", "--dataset", $Dataset, "--val-ratio", "$ValRatio", "--epochs", "$Epochs", "--train-fraction", "$frac")
+    if ($Name) { $targs += @("--name", $Name) }
+    Write-Host ("  training with " + [int]($frac * 100) + "% of the training clips ...")
+    cmd.exe /c ('"' + $TorchPython + '" ' + ($targs -join ' ') + ' > "' + $log + '" 2>&1')
+    if ($LASTEXITCODE -ne 0) { Get-Content $log -Tail 20; throw "training failed (see $log)" }
+    $after = Get-ChildItem models -Filter "clubhead_*.onnx" | Where-Object { $before -notcontains $_.FullName } | Sort-Object LastWriteTime | Select-Object -Last 1
+    if (-not $after) { throw "no model produced for fraction $frac" }
+    $models += $after.FullName
+    $trainJsons += [IO.Path]::ChangeExtension($after.FullName, ".train.json")
+    Get-Content $log | Select-String -Pattern "^epoch|device=|fraction" | Select-Object -Last 3 | ForEach-Object { Write-Host ("  " + $_.Line.Substring(0, [Math]::Min(160, $_.Line.Length))) }
+}
+$model = $models[-1]
+$trainJson = $trainJsons[-1]
+$trainLog = Join-Path $work "train_f100.log"
 Write-Host "model: $model"
-Get-Content $trainLog | Select-String -Pattern "^epoch|device=|pck" | ForEach-Object { Write-Host ("  " + $_.Line.Substring(0, [Math]::Min(160, $_.Line.Length))) }
 
 # ---------------------------------------------------------------- 3. evaluate
 $resultMd = $null
@@ -68,7 +84,8 @@ if (-not $SkipEval) {
     Step "3. evaluate on $Split : legacy / current clubhead.onnx / $($after.BaseName)"
     $evalLog = Join-Path $work "eval.log"
     $tag = "retrain_" + $stamp
-    cmd.exe /c ('"' + $py + '" tools\eval_club.py --all --split ' + $Split + ' --tag ' + $tag + ' --detector both --model "' + $model + '" > "' + $evalLog + '" 2>&1')
+    $modelArgs = ($models | ForEach-Object { '--model "' + $_ + '"' }) -join ' '
+    cmd.exe /c ('"' + $py + '" tools\eval_club.py --all --split ' + $Split + ' --tag ' + $tag + ' --detector both ' + $modelArgs + ' --no-run > "' + $evalLog + '" 2>&1')
     if ($LASTEXITCODE -ne 0) { Get-Content $evalLog -Tail 20; throw "evaluation failed (see $evalLog)" }
     $resultMd = Get-ChildItem tests\real\results -Filter ("*_" + $tag + "_*.md") | Sort-Object LastWriteTime | Select-Object -Last 1
     Write-Host ("result: " + $resultMd.FullName)
@@ -77,7 +94,8 @@ if (-not $SkipEval) {
 # ---------------------------------------------------------------- 4. report
 Step "4. report"
 $report = Join-Path $work "report.md"
-$rargs = @("tools\retrain_report.py", "--inventory", $invJson, "--inventory-txt", $invTxt, "--train", $trainJson, "--out", $report)
+$rargs = @("tools\retrain_report.py", "--inventory", $invJson, "--inventory-txt", $invTxt, "--out", $report)
+foreach ($tj in $trainJsons) { $rargs += @("--train", $tj) }
 if ($resultMd) { $rargs += @("--result", $resultMd.FullName) }
 & $py @rargs
 if ($LASTEXITCODE -ne 0) { throw "report failed" }

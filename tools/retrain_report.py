@@ -55,7 +55,10 @@ def main() -> int:
                 break
             except UnicodeDecodeError:
                 continue
-    train = json.loads(Path(arg(args, "--train")).read_text(encoding="utf-8")) if arg(args, "--train") else {}
+    train_paths = [Path(args[i + 1]) for i, a_ in enumerate(args) if a_ == "--train" and i + 1 < len(args)]
+    trains = [json.loads(p.read_text(encoding="utf-8")) for p in train_paths if p.exists()]
+    trains.sort(key=lambda t: (t.get("train_fraction", 1.0), t.get("n_strong_train", 0)))
+    train = trains[-1] if trains else {}
     result = Path(arg(args, "--result")) if arg(args, "--result") else None
     out = Path(arg(args, "--out", "build/retrain/report.md"))
     modes = parse_result(result) if result and result.exists() else {}
@@ -98,6 +101,20 @@ def main() -> int:
             L.append("\n| epoch | loss | 検証 平均px | 中央値px | PCK@15 | PCK@30 |\n|---|---|---|---|---|---|")
             for h in hist:
                 L.append(f"| {h['epoch']} | {h['loss']} | {h.get('mean_px')} | {h.get('median_px')} | {h.get('pck15')} | {h.get('pck30')} |")
+    if inv.get("delta"):
+        d = inv["delta"]
+        L.append("\n### 前回からの増分\n")
+        L.append(f"- クリップ +{len(d['clips_added'])} 本、点 +{d['points']}、強ラベル {d.get('n_strong_prev')} → {inv['n_strong_usable']}")
+        L.append("- 由来: " + ", ".join(f"{k} +{v}" for k, v in d["sources"].items()))
+        L.append("- 撮影方向: " + ", ".join(f"{k} {d['cameras_prev'].get(k, 0)} → {inv['cameras'].get(k, 0)}"
+                                         for k in sorted(set(inv["cameras"]) | set(d["cameras_prev"]))))
+    if len(trains) > 1:
+        L.append("\n## 2b. 学習曲線 (学習クリップの割合を変えて学習、検証クリップは同じ)\n")
+        L.append("| 割合 | 学習クリップ | 学習点 | 検証 中央値 px | 検証 PCK@15 | 検証 PCK@30 | 検出率 | モデル |\n|---|---|---|---|---|---|---|---|")
+        for t in trains:
+            v = t.get("val") or {}
+            L.append(f"| {t.get('train_fraction', 1.0):.0%} | {len(t.get('train_clips', []))} | {t.get('n_strong_train')} | "
+                     f"{v.get('median_px')} | {v.get('pck15')} | {v.get('pck30')} | {v.get('detected')}/{v.get('n')} | `{Path(t.get('onnx', '')).stem}` |")
     # ---- 3. holdout
     L.append("\n## 3. holdout での比較 (tools/eval_club.py)\n")
     if modes:
