@@ -90,6 +90,9 @@ class TrajectoryData:
     # (dx1,dy1) = 入射ハンドル (前の点からの接線方向), (dx2,dy2) = 出射ハンドル (次の点への接線方向)
     # None の場合はハンドルなし (自動スプライン)
     handles: list = field(default_factory=list)
+    # 各点の由来: "observed" (自動追跡の観測) / "estimated" (観測が無く推定で埋めた) / "manual" (人が置いた・動かした)。
+    # points と同じ長さ。空なら全部 manual 扱い (古いファイル)。推定点は編集タブで別表示、学習データには入れない。
+    sources: list = field(default_factory=list)
 
 
 class ClipManager:
@@ -271,6 +274,7 @@ class ClipManager:
                 "fade_frames": getattr(swing, "fade_frames", 0),
                 "alpha": getattr(swing, "alpha", 0.85),
                 "handles": getattr(swing, "handles", []),
+                "sources": list(getattr(swing, "sources", []) or []),
             })
         data = {
             "swings": swing_data,
@@ -329,6 +333,7 @@ class ClipManager:
                     fade_frames=d.get("fade_frames", 0),
                     alpha=d.get("alpha", 0.85),
                     handles=handles,
+                    sources=list(d.get("sources", []) or []),
                 )
                 swings.append(td)
             return swings, edit_in, edit_out

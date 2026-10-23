@@ -52,6 +52,12 @@ Get-Content $invTxt -Encoding UTF8
 $inv = Get-Content $invJson -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($inv.n_strong_usable -lt 20) { throw "not enough usable strong labels ($($inv.n_strong_usable)); collect more before retraining" }
 
+# ---------------------------------------------------------------- 1b. trajectory prior (template for filling unobserved spans)
+Step "1b. trajectory prior (models	rajectory_prior_<angle>.json)"
+cmd.exe /c ('"' + $py + '" toolsuild_prior.py --dataset "' + $Dataset + '" > "' + (Join-Path $work "prior.txt") + '" 2>&1')
+if ($LASTEXITCODE -ne 0) { Get-Content (Join-Path $work "prior.txt") -Encoding UTF8 -Tail 10; throw "build_prior failed" }
+Get-Content (Join-Path $work "prior.txt") -Encoding UTF8 | Select-String -Pattern "^(face_on|dtl|unknown)" | ForEach-Object { Write-Host ("  " + $_.Line) }
+
 # ---------------------------------------------------------------- 2. train
 Step "2. train (val-ratio $ValRatio, epochs $Epochs)"
 $trainLog = Join-Path $work "train.log"

@@ -75,8 +75,28 @@ pred = {
     "note": "CPU mediapipe",
     "trace": {str(f): v for f, v in res.trace.items()},
 }
-(out_dir / "club_tracker.pred.json").write_text(json.dumps(pred, ensure_ascii=False, indent=1),
-                                                encoding="utf-8")
+# 観測の無い区間を推定で埋めた軌道 (--no-fill で省略)。評価は tools/eval_prior.py
+if "--no-fill" not in args:
+    try:
+        from ai.trajectory_prior import fill_trajectory, load_prior, swing_frame_range, estimate_camera_from_landmarks
+        _cap = cv2.VideoCapture(str(video))
+        _W, _H = int(_cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        _cap.release()
+        _obs = {int(f): (x, y) for seg, q, ok in res.segment_quality() if ok for x, y, f in seg}
+        _angle = estimate_camera_from_landmarks(res.landmarks, _W, _H, res.real_fps)
+        _prior = load_prior(_angle) if _angle in ("dtl", "face_on") else None
+        _rng = swing_frame_range(res.landmarks, _W, _H, res.real_fps) or ((min(_obs), max(_obs)) if _obs else None)
+        if _rng is not None:
+            if _obs:
+                _rng = (min(_rng[0], min(_obs)), max(_rng[1], max(_obs)))
+            _filled = fill_trajectory(_obs, res.wrist, res.body_h, res.real_fps, list(range(_rng[0], _rng[1] + 1)), prior=_prior)
+            pred["filled"] = [[round(x, 1), round(y, 1), f, s] for x, y, f, s in _filled]
+            pred["fill_info"] = {"angle": _angle, "prior": bool(_prior), "range": list(_rng),
+                                 "estimated": sum(1 for p in _filled if p[3] == "estimated")}
+            (out_dir / "club_tracker.pred.json").write_text(json.dumps(pred, ensure_ascii=False, indent=1), encoding="utf-8")
+            print(f"[club_tracker] fill: {pred['fill_info']}")
+    except Exception as _e:
+        print(f"[club_tracker] fill failed: {_e}")
 # 編集タブと同じ形式 (手首・骨格・接続フラグ入り) も残す。閾値の再計算 (tools/gate_tune.py) に使う
 from ai.store import save_club_track  # noqa: E402
 save_club_track(out_dir, res, 0, str(video))

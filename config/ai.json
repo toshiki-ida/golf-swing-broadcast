@@ -22,5 +22,7 @@
     "max_dist_change": 0.07,
     "min_speed_ratio": 1.0,
     "min_wrist_ratio": 0.05
-  }
+  },
+  "_trajectory_fill": "prior = 観測の無い区間を推定で埋める (既定) / off = 推定区間は描かない",
+  "trajectory_fill": "prior"
 }

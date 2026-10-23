@@ -22,6 +22,8 @@ from clip_manager import TrajectoryData
 from ai import ai_available
 from ai.config import get_ai_settings, realtime_factor
 from ai.dataset import collect_clip_labels, dataset_dir
+from ai.trajectory_prior import (fill_trajectory, control_points, load_prior, swing_frame_range,
+                                 estimate_camera_from_landmarks)
 from ai.store import (analysis_dir, load_club_track, landmarks_from_track, save_club_track,
                       load_clip_ai_settings, save_clip_ai_settings, save_auto_snapshot, record_corrections)
 
@@ -73,6 +75,7 @@ class EditTools:
                                    wraplength=200, justify="left")
         self.status.pack(anchor="w", padx=8, pady=(2, 6))
         self._undrawn: dict = {}      # clip_id -> [(a, b), ...] 未描画区間 (in_frame 基準の相対フレーム)
+        self._estimated: dict = {}    # clip_id -> [(a, b), ...] 推定で埋めた区間
         self._undrawn_idx = 0
         self._wrap_save_trajectory()
         self._wrap_edit_export()
@@ -192,7 +195,16 @@ class EditTools:
                     import json as _j
                     ap = analysis_dir(app.project_dir, clip_id) / "auto_points.json"
                     if ap.exists():
-                        self._undrawn[clip_id] = [tuple(u) for u in _j.loads(ap.read_text(encoding="utf-8")).get("undrawn", [])]
+                        auto = _j.loads(ap.read_text(encoding="utf-8"))
+                        self._undrawn[clip_id] = [tuple(u) for u in auto.get("undrawn", [])]
+                        spans, cur = [], None
+                        for f in sorted(auto.get("estimated", [])):
+                            if cur and f == cur[1] + 1:
+                                cur[1] = f
+                            else:
+                                cur = [f, f]
+                                spans.append(cur)
+                        self._estimated[clip_id] = [(a, b) for a, b in spans]
                 self._show_undrawn(clip_id)
                 if hasattr(self, "camera_seg"):
                     self.camera_seg.set(self.camera_angle_for(clip_id))
@@ -276,6 +288,14 @@ class EditTools:
     def _show_undrawn(self, clip_id):
         self._show_gate(clip_id)
         spans = self._undrawn.get(clip_id) or []
+        est = self._estimated.get(clip_id) or []
+        if not spans and est:
+            txt = "推定で補った区間 (中抜きの点。確認して直す): " + " ".join(f"F{a}-{b}" for a, b in est[:6])
+            if len(est) > 6:
+                txt += f" 他 {len(est) - 6}"
+            self.undrawn_label.configure(text=txt, text_color="#9ECBFF")
+            return
+        self.undrawn_label.configure(text_color="#E0B040")
         if not spans:
             self.undrawn_label.configure(text="")
             return
@@ -288,9 +308,9 @@ class EditTools:
         """未描画区間の先頭フレームへ順番に移動する (編集タブのスライダーと表示を更新)"""
         app = self.app
         cid = getattr(app, "_edit_clip_id", None)
-        spans = self._undrawn.get(cid) or []
+        spans = self._undrawn.get(cid) or self._estimated.get(cid) or []
         if not spans:
-            self._set_status("未描画区間はありません")
+            self._set_status("未描画・推定の区間はありません")
             return
         a, b = spans[self._undrawn_idx % len(spans)]
         self._undrawn_idx += 1
@@ -305,12 +325,17 @@ class EditTools:
         if not cid or not app._edit_swings:
             return
         app._edit_push_undo()
-        pts = sorted({p for sw in app._edit_swings for p in sw.points}, key=lambda q: q[2])
+        src_of = {}
+        for sw in app._edit_swings:
+            srcs = getattr(sw, "sources", None) or []
+            for i, p in enumerate(sw.points):
+                src_of.setdefault(tuple(p), srcs[i] if i < len(srcs) else "manual")
+        pts = sorted({tuple(p) for sw in app._edit_swings for p in sw.points}, key=lambda q: q[2])
         base = app._edit_swings[0]
         merged = TrajectoryData(points=pts, color_start_hex=base.color_start_hex, color_end_hex=base.color_end_hex,
                                 thickness=base.thickness, blur=getattr(base, "blur", 0),
                                 fade_frames=getattr(base, "fade_frames", 0), alpha=getattr(base, "alpha", 0.85),
-                                handles=[None] * len(pts))
+                                handles=[None] * len(pts), sources=[src_of.get(p, "manual") for p in pts])
         app._edit_swings = [merged]
         app._edit_swing_idx = 0
         app._edit_spline_cache.clear()
@@ -346,6 +371,8 @@ class EditTools:
         cfg = get_ai_settings(app.settings)
         use_det = None if cfg.get("club_detector", "auto") == "auto" else False
         gate = cfg.get("gate")
+        use_fill = cfg.get("trajectory_fill", "prior") == "prior"
+        cam_setting = self.camera_angle_for(clip.id)
 
         def worker():
             from ai.club_tracker import track_club
@@ -383,13 +410,66 @@ class EditTools:
                 return
             segs = [[(int(x), int(y), f - in_f) for x, y, f in res.confident_points(points=seg)] for seg, _ in good]
             segs = [sg for sg in segs if len(sg) >= 2]
+            sources = None
+            est_frames = []
+            if use_fill:
+                try:
+                    filled_segs, sources, est_frames, est_spans, fill_info = self._fill_with_prior(
+                        res, in_f, clip, seg_q, segs, cam_setting)
+                    if filled_segs:
+                        segs = filled_segs
+                        undrawn = []
+                        self._estimated[clip.id] = est_spans
+                        print(f"[AI] 推定で補完: {fill_info}")
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    print(f"[AI] 推定補完に失敗 ({e})。観測区間だけ描きます")
             self._undrawn[clip.id] = undrawn
-            save_auto_snapshot(adir, segs, undrawn, all_segments=all_segs, segment_quality=seg_quality)
-            app.after(0, lambda: self._apply_trajectory(clip, segs, undrawn, style, res, len(bad)))
+            save_auto_snapshot(adir, segs, undrawn, all_segments=all_segs, segment_quality=seg_quality,
+                               estimated=est_frames)
+            app.after(0, lambda: self._apply_trajectory(clip, segs, undrawn, style, res, len(bad), sources=sources))
 
         self._start(worker, "軌道生成")
 
-    def _apply_trajectory(self, clip, segs, weak, style, res, n_bad=0):
+    def _fill_with_prior(self, res, in_f, clip, seg_q, segs, cam_setting):
+        """観測 (信頼できる区間) の無いフレームを推定で埋め、1 本の制御点列にする。
+        戻り値: (segs, sources, estimated_frames, estimated_spans, info)。推定できなければ ([], None, [], [], reason)"""
+        W, H = int(getattr(clip, "width", 1920) or 1920), int(getattr(clip, "height", 1080) or 1080)
+        observed = {f - in_f: (x, y) for seg, q, ok in seg_q if ok for x, y, f in seg}
+        wrist = {f - in_f: w for f, w in (res.wrist or {}).items()}
+        lm_rel = {f - in_f: lm for f, lm in (getattr(res, "landmarks", {}) or {}).items()}
+        angle = cam_setting if cam_setting in ("dtl", "face_on") else estimate_camera_from_landmarks(lm_rel, W, H, res.real_fps)
+        prior = load_prior(angle) if angle in ("dtl", "face_on") else None
+        rng = swing_frame_range(lm_rel, W, H, res.real_fps)
+        if rng is None and observed:
+            rng = (min(observed), max(observed))
+        if rng is None:
+            return [], None, [], [], "骨格の局面も観測も無い"
+        if observed:
+            rng = (min(rng[0], min(observed)), max(rng[1], max(observed)))
+        frames = list(range(int(rng[0]), int(rng[1]) + 1))
+        filled = fill_trajectory(observed, wrist, res.body_h, res.real_fps, frames, prior=prior)
+        if not filled or not any(s == "estimated" for _, _, _, s in filled):
+            return [], None, [], [], "推定が必要な区間なし" if filled else "手首が取れない"
+        obs_ctrl = [(x, y, f) for sg in segs for x, y, f in sg]
+        ctrl = control_points(filled, res.real_fps, observed_ctrl=obs_ctrl)
+        if len(ctrl) < 2:
+            return [], None, [], [], "制御点が足りない"
+        est_frames = [f for x, y, f, s in filled if s == "estimated"]
+        spans, cur = [], None
+        for f in sorted(est_frames):
+            if cur and f == cur[1] + 1:
+                cur[1] = f
+            else:
+                cur = [f, f]
+                spans.append(cur)
+        spans = [(a, b) for a, b in spans]
+        info = (f"{angle} prior={'あり' if prior else 'なし(物理のみ)'} 観測 {sum(1 for p in filled if p[3] == 'observed')}f / "
+                f"推定 {len(est_frames)}f 区間 {spans[:5]}")
+        return [[(x, y, f) for x, y, f, s in ctrl]], [[s for x, y, f, s in ctrl]], est_frames, spans, info
+
+    def _apply_trajectory(self, clip, segs, weak, style, res, n_bad=0, sources=None):
         """GUI スレッド: 生成した制御点 (区間ごと) を軌道として保存し、編集タブに反映する。"""
         app = self.app
         editing = getattr(app, "_edit_clip_id", None) == clip.id
@@ -401,14 +481,15 @@ class EditTools:
         else:
             swings, edit_in, edit_out = app.clip_manager.load_trajectory(clip.id)
         first_idx = None
-        for sg in segs:
+        for si_, sg in enumerate(segs):
+            src = list(sources[si_]) if sources and si_ < len(sources) else ["observed"] * len(sg)
             new_swing = TrajectoryData(
                 points=sg,
                 color_start_hex=style.get("color_start_hex", "#FFFF00"),
                 color_end_hex=style.get("color_end_hex", "#FF0000"),
                 thickness=style.get("thickness", 3), blur=style.get("blur", 0),
                 fade_frames=style.get("fade_frames", 0), alpha=style.get("alpha", 0.85),
-                handles=[None] * len(sg))
+                handles=[None] * len(sg), sources=src)
             # 空のスイングがあればそこに入れ、無ければ新しいスイングとして追加 (手描きは消さない)
             idx = next((i for i, s_ in enumerate(swings) if len(s_.points) < 2), None)
             if idx is None:
@@ -433,8 +514,10 @@ class EditTools:
         if res is None:
             return
         q = res.quality
+        n_est = sum(1 for s_ in (sources or []) for v in s_ if v == "estimated")
         msg = (f"完了 ({res.seconds:.0f}秒): 描画 {len(segs)} 区間 / 制御点 {sum(len(s_) for s_ in segs)} 点"
-               f" (観測 {q.get('observed')}/{q.get('frames')}f)")
+               + (f" (うち推定 {n_est} 点)" if n_est else "")
+               + f" (観測 {q.get('observed')}/{q.get('frames')}f)")
         if n_bad:
             msg += f" / 信頼度不足で非描画 {n_bad} 区間"
         if weak:

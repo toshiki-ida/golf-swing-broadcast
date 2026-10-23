@@ -75,7 +75,7 @@ def save_clip_ai_settings(dir_path, **kw) -> None:
 
 
 def save_auto_snapshot(dir_path, segments: list, undrawn: list, all_segments: list | None = None,
-                       segment_quality: list | None = None) -> None:
+                       segment_quality: list | None = None, estimated: list | None = None) -> None:
     """自動生成した制御点 (描いた区間) と未描画区間を残す。corrections の突き合わせに使う。
     all_segments: ゲートで止めた区間も含む全区間の制御点 (「全区間を描く」用)、segment_quality: 各区間の指標。"""
     import time as _t
@@ -85,6 +85,7 @@ def save_auto_snapshot(dir_path, segments: list, undrawn: list, all_segments: li
         "undrawn": [[a, b] for a, b in undrawn],
         "all_segments": [[[int(x), int(y), f] for x, y, f in seg] for seg in (all_segments or [])],
         "segment_quality": segment_quality or [],
+        "estimated": [int(f) for f in (estimated or [])],   # 推定で置いた制御点のフレーム (負例には使わない)
     }, ensure_ascii=False), encoding="utf-8")
 
 
@@ -99,17 +100,26 @@ def record_corrections(dir_path, swings) -> dict | None:
     if not ap.exists():
         return None
     auto = json.loads(ap.read_text(encoding="utf-8"))
-    auto_pts = {f: (x, y) for seg in auto.get("segments", []) for x, y, f in seg}
+    est_auto = set(auto.get("estimated", []))
+    # 推定点は検出ではないので、消されても負例にしない (auto 参照から外す)
+    auto_pts = {f: (x, y) for seg in auto.get("segments", []) for x, y, f in seg if f not in est_auto}
     cur = {}
+    cur_src = {}
     for sw in swings:
-        for x, y, f in getattr(sw, "points", []):
+        srcs = getattr(sw, "sources", None) or []
+        for i, (x, y, f) in enumerate(getattr(sw, "points", [])):
             cur[f] = (int(x), int(y))
+            if i < len(srcs):
+                cur_src[f] = srcs[i]
     # 「全区間を描く」で足した区間: 1 点でも残っていれば自動点として扱う (丸ごと消えたのは Undo か区間ごとの却下なので負例にしない)
     for seg in auto.get("extra_segments", []):
         if any(f in cur for _, _, f in seg):
             auto_pts.update({f: (x, y) for x, y, f in seg})
     frames = {}
     for f, (x, y) in cur.items():
+        if cur_src.get(f) == "estimated":
+            frames[str(f)] = {"x": x, "y": y, "source": "estimated", "auto_xy": None}   # 推定のまま = 未承認
+            continue
         if f in auto_pts:
             ax, ay = auto_pts[f]
             src = "auto" if (abs(ax - x) <= 1 and abs(ay - y) <= 1) else "moved"

@@ -20,6 +20,9 @@ AI_DEFAULTS = {
     # クラブヘッド検出器 (models/clubhead.onnx, ONNX Runtime) をヘッド候補の提案に使うか。
     #   auto: モデルが同梱されていれば使う / off: 使わない (従来方式のみ)
     "club_detector": "auto",
+    # 観測が無い (信頼度が低い) 区間の扱い: "prior" = 手首の軌跡と過去の承認済み軌道 (models/trajectory_prior_<angle>.json) から
+    # 推定して埋める (テンプレートが無ければ物理制約だけで補間) / "off" = 推定区間は描かない (従来)
+    "trajectory_fill": "prior",
     # 信頼度ゲート (区間ごとに判定。全部満たした区間だけ自動で描く)。
     # 優先順位: ここの既定 < config/ai.json (exe 同階層 → 同梱) < settings.json の "ai"。現場では config/ai.json を編集する。
     # 値の根拠: docs/CLUB_TRACKING_EVAL.md §10 (tune 11 本の区間ごとの目視判定、tests/real/segment_review.yaml)

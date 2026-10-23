@@ -2402,16 +2402,28 @@ class GolfBroadcastApp(ctk.CTk):
                                     eff_alpha, blur=scaled_blur,
                                     color_pos_start=vis_cps, color_pos_end=vis_cpe)
             if swing.points:
-                visible_pts = [
-                    (int((p[0] - src_x0) * eff_scale),
-                     int((p[1] - src_y0) * eff_scale), p[2])
-                    for p in swing.points if p[2] <= cur]
+                srcs = getattr(swing, "sources", None) or []
+                visible_pts, est_pts = [], []
+                for pi, p in enumerate(swing.points):
+                    if p[2] > cur:
+                        continue
+                    sp = (int((p[0] - src_x0) * eff_scale), int((p[1] - src_y0) * eff_scale), p[2])
+                    if pi < len(srcs) and srcs[pi] == "estimated":
+                        est_pts.append(sp)          # 推定点: 中抜きの点線風マーカーで区別
+                    else:
+                        visible_pts.append(sp)
                 if visible_pts:
                     draw_markers(resized, visible_pts,
                                  hex_to_bgr(swing.color_start_hex),
                                  hex_to_bgr(swing.color_end_hex),
                                  max(1, int(MARKER_RADIUS * eff_scale)),
                                  color_pos_start=_g_cps, color_pos_end=_g_cpe)
+                if est_pts:
+                    r_est = max(2, int(MARKER_RADIUS * eff_scale))
+                    c_est = hex_to_bgr(swing.color_end_hex)
+                    for (ex, ey, _f) in est_pts:
+                        cv2.circle(resized, (ex, ey), r_est, c_est, 1, cv2.LINE_AA)
+                        cv2.circle(resized, (ex, ey), r_est + 2, (255, 255, 255), 1, cv2.LINE_AA)
 
         img_cx = int(cw / 2 - (self._edit_pan_vx - (src_x0 + src_x1) / 2) * eff_scale)
         img_cy = int(ch / 2 - (self._edit_pan_vy - (src_y0 + src_y1) / 2) * eff_scale)
@@ -2513,14 +2525,17 @@ class GolfBroadcastApp(ctk.CTk):
             return
         self._edit_push_undo()
         vx, vy = self._edit_canvas_to_video(event.x, event.y)
+        self._edit_ensure_sources(swing)
         swing.points.append((vx, vy, self._edit_frame_no))
-        # ハンドルも同期 (新規ポイントは None)
+        # ハンドル・由来も同期 (新規ポイントは None / manual)
         self._edit_ensure_handles(swing)
-        # points と handles をペアでフレーム順ソート
-        paired = list(zip(swing.points, swing.handles))
+        self._edit_ensure_sources(swing, fill="manual")
+        # points / handles / sources を組でフレーム順ソート
+        paired = list(zip(swing.points, swing.handles, swing.sources))
         paired.sort(key=lambda x: x[0][2])
-        swing.points[:] = [p for p, h in paired]
-        swing.handles[:] = [h for p, h in paired]
+        swing.points[:] = [p for p, h, s_ in paired]
+        swing.handles[:] = [h for p, h, s_ in paired]
+        swing.sources[:] = [s_ for p, h, s_ in paired]
         print(f"  Point: ({vx}, {vy}) @ frame {self._edit_frame_no}")
         self._edit_update_display()
 
@@ -2700,6 +2715,15 @@ class GolfBroadcastApp(ctk.CTk):
         while len(swing.handles) > len(swing.points):
             swing.handles.pop()
 
+    def _edit_ensure_sources(self, swing, fill="manual"):
+        """由来リスト (observed / estimated / manual) をポイント数に合わせる。足りない分は fill"""
+        if not hasattr(swing, "sources") or swing.sources is None:
+            swing.sources = []
+        while len(swing.sources) < len(swing.points):
+            swing.sources.append(fill)
+        while len(swing.sources) > len(swing.points):
+            swing.sources.pop()
+
     def _edit_init_handle(self, swing, pi):
         """ポイントにデフォルトハンドルを設定 (splprep接線ベース)
         既存のスプライン曲線の接線を流用し、曲線形状を保つ"""
@@ -2795,6 +2819,9 @@ class GolfBroadcastApp(ctk.CTk):
         vx, vy = self._edit_canvas_to_video(event.x, event.y)
         old = self._edit_swings[si].points[pi]
         self._edit_swings[si].points[pi] = (vx, vy, old[2])
+        # 人が動かした点は由来を manual にする (推定点を直した → 学習データに入る)
+        self._edit_ensure_sources(self._edit_swings[si])
+        self._edit_swings[si].sources[pi] = "manual"
         self._edit_throttled_update()
 
     def _edit_right_release(self, event):
@@ -3273,23 +3300,25 @@ class GolfBroadcastApp(ctk.CTk):
         removed = 0
         for swing in self._edit_swings:
             self._edit_ensure_handles(swing)
-            paired = sorted(zip(swing.points, swing.handles), key=lambda x: x[0][2])
+            self._edit_ensure_sources(swing)
+            paired = sorted(zip(swing.points, swing.handles, swing.sources), key=lambda x: x[0][2])
             # 削除点を挟んで前後に分割
             groups = [[]]
-            for pt, h in paired:
+            for pt, h, s_ in paired:
                 if pt[2] in frames:
                     removed += 1
                     if groups[-1]:
                         groups.append([])
                     continue
-                groups[-1].append((pt, h))
+                groups[-1].append((pt, h, s_))
             groups = [g for g in groups if g]
             if not groups:
                 continue
             for gi, g in enumerate(groups):
                 sw = swing if gi == 0 else copy.deepcopy(swing)
-                sw.points = [pt for pt, _ in g]
-                sw.handles = [h for _, h in g]
+                sw.points = [pt for pt, _, _ in g]
+                sw.handles = [h for _, h, _ in g]
+                sw.sources = [s_ for _, _, s_ in g]
                 new_swings.append(sw)
         if not new_swings:
             new_swings = [self._make_default_trajectory(0)]

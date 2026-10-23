@@ -139,7 +139,7 @@ def _sample_interpolated(swings, real_fps: float):
 def collect_clip_labels(clip_id: str, source_path, in_frame: int, swings: list, *,
                         corrections: dict | None, landmarks: dict | None, body_h: float | None,
                         real_fps: float, labeler: str = "operator", note: str = "",
-                        out_root=None) -> dict | None:
+                        out_root=None, estimated_frames=None) -> dict | None:
     """書き出し時に呼ぶ。承認済みラベルを <out_root>/<clip_id>/ に保存して要約を返す (holdout なら None)。
     out_root 省略時は開発用の既定 (DATASET_DIR)。アプリは dataset_dir(project_dir) を渡す。"""
     if is_holdout(source_path):
@@ -149,13 +149,24 @@ def collect_clip_labels(clip_id: str, source_path, in_frame: int, swings: list, 
         return None
     corr = (corrections or {}).get("frames", {})
 
+    # 推定で埋めたまま (人が位置を直していない) 点は学習データに入れない
+    est = set(int(f) for f in (estimated_frames or []))
+    for sw in swings:
+        srcs = getattr(sw, "sources", None) or []
+        for i, p in enumerate(sw.points):
+            if i < len(srcs) and srcs[i] == "estimated":
+                est.add(int(p[2]))
+    for f, c in corr.items():
+        if c.get("source") == "estimated":
+            est.add(int(f))
+
     def source_of(f):
         c = corr.get(str(f))
         if c is None:
             return "manual"              # 自動生成の記録が無い点 = 人が置いた点
         return {"auto": "auto_confirmed", "moved": "manual", "manual": "manual"}.get(c["source"], "manual")
 
-    strong = [{"frame": f, "x": int(x), "y": int(y), "source": source_of(f)} for x, y, f in pts_all]
+    strong = [{"frame": f, "x": int(x), "y": int(y), "source": source_of(f)} for x, y, f in pts_all if int(f) not in est]
     weak = [{"frame": f, "x": x, "y": y, "source": "interpolated"}
             for x, y, f in _sample_interpolated(swings, real_fps)]
     # 人が削除した自動点 = 誤検出。同じフレームに人が置き直した点があってもその座標は負例として有効
@@ -209,7 +220,8 @@ def collect_clip_labels(clip_id: str, source_path, in_frame: int, swings: list, 
         inside = 0 <= cx < CROP_SIZE and 0 <= cy < CROP_SIZE
         records.append({**rec, "abs_frame": abs_f, "image": f"frames/{name}", "crop": [x0, y0, side],
                         "crop_size": CROP_SIZE, "cx": round(cx, 1), "cy": round(cy, 1), "in_crop": inside,
-                        "weak": rec["source"] == "interpolated", "negative": rec["source"] == "negative"})
+                        "weak": rec["source"] == "interpolated", "negative": rec["source"] == "negative",
+                        "wrist": [round(float(center[0]), 1), round(float(center[1]), 1)]})
     cap.release()
     if pose is not None:
         pose.close()
@@ -221,6 +233,7 @@ def collect_clip_labels(clip_id: str, source_path, in_frame: int, swings: list, 
         "n_strong": sum(1 for r in records if not r["weak"] and not r["negative"]),
         "n_weak": sum(1 for r in records if r["weak"]),
         "n_negative": sum(1 for r in records if r["negative"]),
+        "n_estimated_skipped": len(est),
         "points": records,
     }
     (out_dir / "labels.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
