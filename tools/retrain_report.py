@@ -139,7 +139,7 @@ def main() -> int:
         L.append("\n正解ラベル (px 誤差) は結果ファイルの「誤差」節を参照 (ラベルが無い素材は観測率・ゲートのみ)。")
         # ---- 4. 推奨の目安
         L.append("\n## 4. 判断材料 (機械的な目安)\n")
-        new_mode = next((m for m in modes if new_name and new_name in m), None)
+        new_mode = next((m for m in modes if new_name and m == "+det:" + new_name), None)   # 100% のモデル (学習曲線の f25 等は除く)
         cur_mode = "+det" if "+det" in modes else None
         if new_mode and cur_mode:
             nr, nk, nm = summary[new_mode]
