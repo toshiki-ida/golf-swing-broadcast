@@ -78,6 +78,9 @@ $clubOnnx = Join-Path $dist "_internal\models\clubhead.onnx"
 $hasDetector = Test-Path $clubOnnx
 if ($hasDetector) { Write-Host "  ok  _internal\models\clubhead.onnx (detector bundled)" }
 else { Write-Host "  --  _internal\models\clubhead.onnx not present (detector disabled, legacy tracking)" -ForegroundColor Yellow }
+$priors = Get-ChildItem (Join-Path $dist "_internal\models") -Filter "trajectory_prior_*.json" -ErrorAction SilentlyContinue
+if ($priors) { foreach ($pr in $priors) { Write-Host ("  ok  _internal\models\" + $pr.Name + " (trajectory prior)") } }
+else { Write-Host "  --  no trajectory_prior_*.json (estimation falls back to physics only)" -ForegroundColor Yellow }
 $exeFolderMb = [math]::Round((Get-ChildItem $dist -Recurse | Measure-Object Length -Sum).Sum / 1MB)
 
 # ---------------------------------------------------------------- 2. selftest (frozen exe)
