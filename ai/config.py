@@ -48,7 +48,9 @@ AI_DEFAULTS = {
         "pre_frames": 6,        # アドレスの何フレーム前から入れるか (30fps 換算)
         "audio_mode": "mute",   # mute / bgm / source
         "bgm_path": "",         # audio_mode=bgm のときの BGM ファイル
-        "layout": "auto",       # auto / crop / pad  (横位置素材を縦にする方法)
+        "layout": "auto",       # 横位置素材を 9:16 にする方法。auto = 軌道全体 (観測+推定+手直し) と骨格とボールが収まれば固定クロップ、
+                                #   収まらなければ pad (縮小してぼかし背景の上に置く)。pan = 収まらなければ枠を軌道に合わせてゆっくり動かす。
+                                #   crop = 収まらなくても固定枠 (はみ出す)。pad = 常に縮小
         "crf": 18,
         "hw_encode": True,
     },

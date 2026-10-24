@@ -55,7 +55,10 @@ OUT_W, OUT_H, FPS = 1080, 1920, 30
 SAFE_TOP = int(OUT_H * 0.15)      # SNS の UI に被らない領域 (上 15% / 下 20% には文字を置かない)
 SAFE_BOTTOM = int(OUT_H * 0.80)
 MAX_ZOOM = 1.6
-CONTENT_MARGIN = 0.06
+CONTENT_MARGIN = 0.05             # 枠の中で内容の外側に取る余白 (枠の幅・高さに対する比、上下左右)
+PAN_TAU_SEC = 0.45                # 動的クロップ (pan) の枠移動の時定数 (大きいほどゆっくり)
+PAN_LOOKAHEAD_SEC = 0.35          # pan の目標位置を決めるときに先読みする時間 (ヘッドが枠から出る前に動き出す)
+PAN_MAX_SPEED = 0.8               # pan の枠移動の上限 (ソース幅 / 秒)
 SPLINE_RES = 600
 PHASE_TOL_SEC = 0.05              # 軌道由来と骨格由来の局面差の許容 (実時間 50 ms。59.94p で 3f、HFR 2x で 6f)
 AUDIO_SR = 48000
@@ -206,42 +209,154 @@ def fuse_phases(traj: dict, skel: Optional[dict], warnings: list, real_fps: floa
 
 # ---------------------------------------------------------------- レイアウト
 
+def swing_curve_points(swings):
+    """描かれるスプライン全体の点 (観測 + 推定 + 手直し後の制御点を通る曲線)。制御点だけだと曲線のふくらみ分が外に出る。"""
+    pts = []
+    for s in swings:
+        if len(s.points) >= 2:
+            try:
+                spl = TimedSpline(s.points, SPLINE_RES, handles=getattr(s, "handles", None) or None)
+                pts.extend((float(c[0]), float(c[1])) for c in spl._curve)
+                continue
+            except Exception:
+                pass
+        pts.extend((float(p[0]), float(p[1])) for p in s.points)
+    return pts
+
+
+def content_bbox(swings, landmarks, W, H, ball=None, frames=None):
+    """枠に収めたい内容の外接矩形 (ソース座標、フレーム外にはみ出していてもそのまま)。
+    軌道の全点 (スプライン全体) + 骨格 (frames を渡せばその範囲のフレームだけ) + ボール。"""
+    xs, ys = [], []
+    for x, y in swing_curve_points(swings):
+        xs.append(x)
+        ys.append(y)
+    for f, lm in (landmarks or {}).items():
+        if frames is not None and f not in frames:
+            continue
+        xs.extend(p[0] for p in lm)
+        ys.extend(p[1] for p in lm)
+    if ball:
+        bx, by, br = ball[0], ball[1], (ball[2] if len(ball) > 2 else 0)
+        xs += [bx - br, bx + br]
+        ys += [by - br, by + br]
+    if not xs:
+        return (W * 0.4, H * 0.3, W * 0.6, H * 0.7)
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
 def compute_layout(W, H, bbox, mode="auto"):
-    """(kind, rect)。kind='crop' なら rect=(x0, y0, w, h) の固定クロップ、'pad' なら全体を縮小して置く。"""
+    """(kind, rect, fits)。
+    kind='crop': rect=(x0, y0, w, h) の固定クロップ / 'pad': 全体を縮小して置く / 'pan': rect=(w, h) の枠を軌道に合わせて動かす。
+    fits: 内容 (bbox) に上下左右 CONTENT_MARGIN の余白を付けたものが 9:16 の固定枠 (高さは最大でソース高) に収まるか。
+    mode: auto (収まれば crop、収まらなければ pad) / crop (収まらなくても固定枠) / pan (収まらなければ動的クロップ) / pad。"""
     x0, y0, x1, y1 = bbox
     bw, bh = max(1.0, x1 - x0), max(1.0, y1 - y0)
     need_w = bw / (1 - 2 * CONTENT_MARGIN)
     need_h = bh / (1 - 2 * CONTENT_MARGIN)
     crop_h = min(max(need_h, need_w * OUT_H / OUT_W, H / MAX_ZOOM), H)
     crop_w = crop_h * OUT_W / OUT_H
-    fits = crop_w <= W + 1e-6
+    fits = (need_w <= crop_w + 1e-6) and (need_h <= crop_h + 1e-6) and (crop_w <= W + 1e-6)
     if mode == "pad" or (mode == "auto" and not fits):
-        return "pad", None
+        # pad: 内容 (余白込み) がちょうど収まる領域を切り出して 1080 幅 (または 1920 高) に縮小し、ぼかした背景の上に置く。
+        # ソース全体を縮小するより被写体が大きく映る
+        pw, ph = min(W, max(need_w, crop_w)), min(H, max(need_h, H / MAX_ZOOM))
+        cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+        px = float(np.clip(cx - pw / 2, 0, W - pw))
+        py = float(np.clip(cy - ph / 2, 0, H - ph))
+        return "pad", (int(round(px)), int(round(py)), int(round(pw)), int(round(ph))), fits
+    if mode == "pan" and not fits:
+        return "pan", (int(round(min(crop_w, W))), int(round(crop_h))), fits
     crop_w = min(crop_w, W)
     cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
     rx = float(np.clip(cx - crop_w / 2, 0, W - crop_w))
     ry = float(np.clip(cy - crop_h / 2, 0, H - crop_h))
-    return "crop", (int(round(rx)), int(round(ry)), int(round(crop_w)), int(round(crop_h)))
+    return "crop", (int(round(rx)), int(round(ry)), int(round(crop_w)), int(round(crop_h))), fits
 
 
-def make_transform(W, H, kind, rect):
-    """ソースフレーム → 1080x1920 の変換 (tf) と、ソース座標 → 出力座標 (map_pt) を返す。"""
-    if kind == "crop":
-        x0, y0, w, h = rect
-        sx, sy = OUT_W / w, OUT_H / h
+def pan_rects(W, H, size, frames, head_xy, body_xy, real_fps):
+    """動的クロップの枠位置 {frame: (x0, y0, w, h)}。
+    各フレームの目標 = 先読み窓 (±PAN_LOOKAHEAD_SEC) 内のヘッド位置と体の中心を全部含む範囲の中心。
+    それを前後方向の指数平滑 (時定数 PAN_TAU_SEC、位相遅れ無し) で滑らかにし、移動速度を PAN_MAX_SPEED に制限する。"""
+    w, h = size
+    frames = sorted(frames)
+    if not frames:
+        return {}
+    la = max(1, int(round(PAN_LOOKAHEAD_SEC * real_fps)))
+    tx, ty = [], []
+    for f in frames:
+        xs, ys = [], []
+        for g in range(f - la // 3, f + la + 1):
+            if g in head_xy:
+                xs.append(head_xy[g][0])
+                ys.append(head_xy[g][1])
+        if f in body_xy:
+            xs.append(body_xy[f][0])
+            ys.append(body_xy[f][1])
+        if not xs:
+            xs, ys = [W / 2], [H / 2]
+        tx.append((min(xs) + max(xs)) / 2)
+        ty.append((min(ys) + max(ys)) / 2)
+    tx, ty = np.array(tx, dtype=np.float64), np.array(ty, dtype=np.float64)
 
-        def tf(frame):
+    def smooth(v):
+        a = 1.0 - np.exp(-1.0 / max(PAN_TAU_SEC * real_fps, 1.0))
+        fwd = v.copy()
+        for i in range(1, len(v)):
+            fwd[i] = fwd[i - 1] + a * (v[i] - fwd[i - 1])
+        bwd = v.copy()
+        for i in range(len(v) - 2, -1, -1):
+            bwd[i] = bwd[i + 1] + a * (v[i] - bwd[i + 1])
+        out = (fwd + bwd) / 2
+        vmax = PAN_MAX_SPEED * W / max(real_fps, 1.0)
+        for i in range(1, len(out)):
+            d = out[i] - out[i - 1]
+            if abs(d) > vmax:
+                out[i] = out[i - 1] + np.sign(d) * vmax
+        return out
+    cx, cy = smooth(tx), smooth(ty)
+    rects = {}
+    for i, f in enumerate(frames):
+        rx = float(np.clip(cx[i] - w / 2, 0, max(0, W - w)))
+        ry = float(np.clip(cy[i] - h / 2, 0, max(0, H - h)))
+        rects[f] = (int(round(rx)), int(round(ry)), int(w), int(h))
+    return rects
+
+
+class Layout:
+    """ソースフレーム → 1080x1920 の変換。kind='crop'/'pad' は固定、'pan' はフレームごとに枠が動く。"""
+
+    def __init__(self, W, H, kind, rect, rects=None):
+        self.W, self.H, self.kind, self.rect = W, H, kind, rect
+        self.rects = rects or {}
+        # pad: rect の領域 (無ければソース全体) を縦横比を保って収まる大きさに縮小し、中央に置く
+        self._pad_rect = tuple(rect) if (kind == "pad" and rect) else (0, 0, W, H)
+        px, py, pw, ph = self._pad_rect
+        self._pad_s = min(OUT_W / max(pw, 1), OUT_H / max(ph, 1))
+        self._pad_fg_w = max(1, int(round(pw * self._pad_s)))
+        self._pad_fg_h = max(1, int(round(ph * self._pad_s)))
+        self._pad_ox = (OUT_W - self._pad_fg_w) // 2
+        self._pad_oy = (OUT_H - self._pad_fg_h) // 2
+
+    def rect_for(self, src):
+        """固定クロップ / pan の枠 (x0, y0, w, h)。pad は None (tf / map_pt が別扱い)。"""
+        if self.kind == "crop":
+            return self.rect
+        if self.kind == "pan":
+            if src in self.rects:
+                return self.rects[src]
+            if self.rects:
+                near = min(self.rects, key=lambda k: abs(k - src))
+                return self.rects[near]
+            return (0, 0, self.W, self.H)
+        return None
+
+    def tf(self, frame, src=None):
+        r = self.rect_for(src)
+        if r is not None:
+            x0, y0, w, h = r
             return cv2.resize(frame[y0:y0 + h, x0:x0 + w], (OUT_W, OUT_H), interpolation=cv2.INTER_LANCZOS4)
-
-        def map_pt(p):
-            return (p[0] - x0) * sx, (p[1] - y0) * sy
-        return tf, map_pt
-
-    fg_h = int(round(H * OUT_W / W))
-    s = OUT_W / W
-    oy = (OUT_H - fg_h) // 2
-
-    def tf(frame):
+        W, H = self.W, self.H
         sc = max(OUT_W / W, OUT_H / H)
         bw, bh = int(W * sc) + 1, int(H * sc) + 1
         bg = cv2.resize(frame, (bw, bh), interpolation=cv2.INTER_LINEAR)
@@ -249,12 +364,61 @@ def make_transform(W, H, kind, rect):
         bg = bg[by:by + OUT_H, bx:bx + OUT_W]
         bg = cv2.GaussianBlur(bg, (0, 0), 25)
         bg = cv2.convertScaleAbs(bg, alpha=0.45, beta=0)
-        bg[oy:oy + fg_h] = cv2.resize(frame, (OUT_W, fg_h), interpolation=cv2.INTER_LANCZOS4)
+        px, py, pw, ph = self._pad_rect
+        fg = cv2.resize(frame[py:py + ph, px:px + pw], (self._pad_fg_w, self._pad_fg_h), interpolation=cv2.INTER_LANCZOS4)
+        bg[self._pad_oy:self._pad_oy + self._pad_fg_h, self._pad_ox:self._pad_ox + self._pad_fg_w] = fg
         return bg
 
-    def map_pt(p):
-        return p[0] * s, p[1] * s + oy
-    return tf, map_pt
+    def map_pt(self, p, src=None):
+        r = self.rect_for(src)
+        if r is not None:
+            x0, y0, w, h = r
+            return (p[0] - x0) * OUT_W / w, (p[1] - y0) * OUT_H / h
+        px, py, _, _ = self._pad_rect
+        return (p[0] - px) * self._pad_s + self._pad_ox, (p[1] - py) * self._pad_s + self._pad_oy
+
+    def pad_region(self):
+        """pad のときに表示されるソース領域 (x0, y0, w, h)。プレビュー用"""
+        return self._pad_rect if self.kind == "pad" else None
+
+    def inside(self, p, src=None, tol=2.0):
+        x, y = self.map_pt(p, src)
+        return -tol <= x < OUT_W + tol and -tol <= y < OUT_H + tol
+
+
+def make_transform(W, H, kind, rect):
+    """後方互換: 固定レイアウトの (tf, map_pt)。"""
+    lay = Layout(W, H, kind, rect)
+    return (lambda frame: lay.tf(frame)), (lambda p: lay.map_pt(p))
+
+
+def plan_layout(W, H, swings, landmarks, mode, *, ball=None, frames=None, real_fps=30.0, dense_points=None):
+    """内容の外接矩形 → レイアウト種別 → (Layout, info)。pan のときはフレームごとの枠も作る。
+    frames: 書き出しに使うソースフレーム (相対) の集合。骨格と pan の対象をこれに限る。"""
+    bbox = content_bbox(swings, landmarks, W, H, ball=ball, frames=frames)
+    kind, rect, fits = compute_layout(W, H, bbox, mode)
+    rects = None
+    if kind == "pan":
+        head_xy = {}
+        if dense_points:
+            for x, y, f in dense_points:
+                head_xy[int(f)] = (float(x), float(y))
+        else:
+            for s in swings:
+                if len(s.points) >= 2:
+                    spl = TimedSpline(s.points, SPLINE_RES, handles=getattr(s, "handles", None) or None)
+                    for c, cf in zip(spl._curve, getattr(spl, "_curve_frames", [])):
+                        head_xy[int(round(cf))] = (float(c[0]), float(c[1]))
+                for p in s.points:
+                    head_xy.setdefault(int(p[2]), (float(p[0]), float(p[1])))
+        body_xy = {}
+        for f, lm in (landmarks or {}).items():
+            if len(lm) > 24:
+                body_xy[f] = ((lm[23][0] + lm[24][0]) / 2, (lm[11][1] + lm[12][1] + lm[23][1] + lm[24][1]) / 4)
+        fr = sorted(frames) if frames else sorted(set(head_xy) | set(body_xy))
+        rects = pan_rects(W, H, rect, fr, head_xy, body_xy, real_fps)
+    info = {"bbox": [round(v, 1) for v in bbox], "fits": fits, "kind": kind, "rect": rect, "mode": mode}
+    return Layout(W, H, kind, rect, rects), info
 
 
 # ---------------------------------------------------------------- 描画
@@ -514,18 +678,6 @@ def render_sns(video_path, out_path, *, in_frame: int = 0, out_frame: int = -1,
     if tracks is not None and angle == "face_on":
         head_ref_x = float(tracks[NOSE][frame_to_idx.get(addr - in_frame, 0)][0])
 
-    # --- レイアウト: 軌道 + 骨格の範囲から固定クロップ
-    xs = [p[0] for s in swings for p in s.points]
-    ys = [p[1] for s in swings for p in s.points]
-    if not xs:
-        xs, ys = [W * 0.5], [H * 0.5]
-    for lm in landmarks.values():
-        xs.extend(p[0] for p in lm)
-        ys.extend(p[1] for p in lm)
-    m = 0.04
-    bbox = (max(0, min(xs) - m * W), max(0, min(ys) - m * H), min(W, max(xs) + m * W), min(H, max(ys) + m * H))
-    kind, rect = compute_layout(W, H, bbox, opt.get("layout", "auto"))
-    tf, map_pt = make_transform(W, H, kind, rect)
     drawer = SwingDrawer(swings)
     skel_thick = max(1, drawer.thickness - 1)
     reader = FrameReader(video_path)
@@ -561,6 +713,22 @@ def render_sns(video_path, out_path, *, in_frame: int = 0, out_frame: int = -1,
         k += 1
     total_frames = len(plan) + summary_n
     total_sec = total_frames / FPS
+
+    # --- レイアウト: 軌道の全点 (スプライン全体) + 書き出し範囲の骨格 + ボール の外接矩形から決める
+    used_frames = {src - in_frame for src, _, _ in plan}
+    ball_xy = None
+    try:
+        b = (analysis or {}).get("impact", {}).get("ball")
+        if b:
+            ball_xy = (float(b[0]), float(b[1]), float(b[2]) if len(b) > 2 else 0.0)
+    except Exception:
+        ball_xy = None
+    layout, layout_info = plan_layout(W, H, swings, landmarks, opt.get("layout", "auto"), ball=ball_xy,
+                                      frames=used_frames, real_fps=real_fps, dense_points=dense_points)
+    kind, rect = layout.kind, layout.rect
+    log.info("layout: %s", layout_info)
+    if kind == "crop" and not layout_info["fits"]:
+        warnings.append("9:16 の固定枠に収まらない内容を crop 設定で書き出しています (はみ出します)")
 
     back_s = max(0.0, (top - addr) / real_fps)
     down_s = max(0.0, (imp - top) / real_fps)
@@ -605,7 +773,7 @@ def render_sns(video_path, out_path, *, in_frame: int = 0, out_frame: int = -1,
                     if section in ("slow", "freeze") and use_skel and rel in landmarks:
                         draw_skeleton(fr, landmarks[rel], skel_thick)
                     drawer.draw(fr, rel)
-                    big = tf(fr)
+                    big = layout.tf(fr, rel)
                     note_items = [(trajectory_note, (60, SAFE_TOP + 60), 40, "lm", (255, 160, 120))] if trajectory_note else []
                     if section == "normal" and note_items:
                         big = draw_texts(big, note_items)
@@ -614,7 +782,8 @@ def render_sns(video_path, out_path, *, in_frame: int = 0, out_frame: int = -1,
                                                *note_items, *legend_items(angle if use_skel else "")])
                     elif section == "freeze":
                         if tracks is not None and angle in ("dtl", "face_on"):
-                            big = draw_guides(big, tracks, frame_to_idx.get(rel, 0), angle, map_pt, head_ref_x)
+                            big = draw_guides(big, tracks, frame_to_idx.get(rel, 0), angle,
+                                              lambda p, _r=rel: layout.map_pt(p, _r), head_ref_x)
                         big = dark_band(big, SAFE_TOP + 110, SAFE_TOP + 300, 0.5)
                         txt = [(names[label], (OUT_W // 2, SAFE_TOP + 170), 72, "mm", WHITE)]
                         mt = phase_metric_text(analysis, label, angle)
@@ -631,7 +800,7 @@ def render_sns(video_path, out_path, *, in_frame: int = 0, out_frame: int = -1,
 
             if summary_n:
                 base = reader.get(addr)
-                card = cv2.convertScaleAbs(tf(base.copy()), alpha=0.30, beta=0)
+                card = cv2.convertScaleAbs(layout.tf(base.copy(), addr - in_frame), alpha=0.30, beta=0)
                 card = draw_texts(card, summary_items(analysis, angle, back_s, down_s, tempo,
                                                       (fin - addr) / real_fps, comments))
                 stills["summary"] = str(stills_dir / "summary_card.png")
@@ -648,9 +817,35 @@ def render_sns(video_path, out_path, *, in_frame: int = 0, out_frame: int = -1,
     if rc != 0 or not tmp.exists():
         raise RuntimeError(f"ffmpeg がエラー終了 (exit {rc})。ログ: {log_path}")
     tmp.replace(out_path)
+    # --- はみ出し検査: 各ソースフレームで描かれている軌道 (そのフレームまでの曲線) が出力枠に入っているか
+    # 「軌跡 (そのフレームまでの曲線全体)」と「ヘッド (曲線の先端)」を分けて数える。pan は枠が動くので軌跡の後ろ側が
+    # 枠から出るのは仕様。ヘッドが出ていれば layout によらず警告する。
+    outside_frames, outside_pts, checked, head_out = 0, 0, 0, 0
+    for src in sorted(used_frames):
+        bad = 0
+        for it in drawer.items:
+            curve = it["spline"].get_curve_at_frame(src) or []
+            for c in curve:
+                checked += 1
+                if not layout.inside(c, src):
+                    bad += 1
+            if curve and not layout.inside(curve[-1], src):
+                head_out += 1
+        if bad:
+            outside_frames += 1
+            outside_pts += bad
+    rep_outside = {"frames": outside_frames, "points": outside_pts, "checked": checked, "head_frames": head_out}
+    if head_out or (outside_pts and kind != "pan"):
+        msg = (f"軌道が出力枠からはみ出しています: 軌跡 {outside_frames} フレーム / {outside_pts} 点, "
+               f"ヘッド {head_out} フレーム (layout={kind})")
+        log.warning(msg)
+        warnings.append(msg)
+    elif outside_pts:
+        log.info("pan: 枠が動くため軌跡の後ろ側が %d フレームで枠外 (ヘッドは常に枠内)", outside_frames)
     report(1.0, "完了")
     rep = {"out_path": str(out_path), "frames": n_out, "seconds": time.time() - t_start,
-           "layout": kind, "rect": rect, "phases": phases, "phase_source": phase_src,
+           "layout": kind, "rect": rect, "layout_info": layout_info, "trajectory_outside": rep_outside,
+           "phases": phases, "phase_source": phase_src,
            "trajectory_phases": traj_phases, "skeleton_phases": skel_phases, "real_fps": real_fps,
            "skeleton": use_skel, "summary": bool(summary_n), "tempo": tempo,
            "camera": analysis["camera"] if analysis else None,
@@ -691,7 +886,7 @@ def main(argv=None):
     ap.add_argument("--camera", default="auto", choices=["auto", "dtl", "face_on"])
     ap.add_argument("--no-skeleton", action="store_true")
     ap.add_argument("--no-summary", action="store_true")
-    ap.add_argument("--layout", default="auto", choices=["auto", "crop", "pad"])
+    ap.add_argument("--layout", default="auto", choices=["auto", "crop", "pan", "pad"])
     ap.add_argument("--audio", default="mute", choices=["mute", "bgm", "source"])
     ap.add_argument("--bgm", default="")
     ap.add_argument("--stills", default=None, help="静止画 (top/impact/summary) の出力先")

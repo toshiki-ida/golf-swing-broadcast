@@ -63,6 +63,16 @@ class EditTools:
         self.draw_all_btn = ctk.CTkButton(sec, text="全区間を描く (ゲート無視)", height=24, font=("", 11),
                                           fg_color="#4A4A2A", hover_color="#6A6A3A", command=self.draw_all_segments)
         self.draw_all_btn.pack(fill="x", padx=8, pady=(2, 0))
+        # 縦型 (SNS) 書き出し時の 9:16 枠のプレビュー (編集キャンバスに半透明の枠線)
+        row3 = ctk.CTkFrame(sec, fg_color="transparent")
+        row3.pack(fill="x", padx=8, pady=(4, 0))
+        self.frame_preview_var = ctk.BooleanVar(value=True)
+        ctk.CTkCheckBox(row3, text="SNS 9:16 の枠を表示", variable=self.frame_preview_var, font=("", 11),
+                        command=self._refresh_frame_preview).pack(side="left")
+        self.frame_label = ctk.CTkLabel(sec, text="", font=("", 10), text_color="#E0B040", wraplength=240, justify="left")
+        self.frame_label.pack(anchor="w", padx=8, pady=(0, 0))
+        self._layout_cache = {}
+        self._lm_cache = {}
         row2 = ctk.CTkFrame(sec, fg_color="transparent")
         row2.pack(fill="x", padx=8, pady=(2, 0))
         self.jump_btn = ctk.CTkButton(row2, text="次の未描画区間へ", width=120, height=24, font=("", 11),
@@ -80,6 +90,7 @@ class EditTools:
         self._wrap_save_trajectory()
         self._wrap_edit_export()
         self._wrap_select_clip()
+        self._wrap_update_display()
         if not ai_available():
             self.trace_btn.configure(state="disabled")
             self.sns_btn.configure(state="disabled")
@@ -181,6 +192,95 @@ class EditTools:
         app._do_edit_export = wrapped
         app._ai_export_wrapped = True
 
+    # ---------------------------------------------------------------- SNS 枠のプレビュー
+    def _wrap_update_display(self):
+        app = self.app
+        if getattr(app, "_ai_display_wrapped", False) or not hasattr(app, "_edit_update_display"):
+            return
+        orig = app._edit_update_display
+
+        def wrapped(*a, _orig=orig, **k):
+            _orig(*a, **k)
+            try:
+                self._draw_frame_preview()
+            except Exception as e:
+                print(f"[AI] SNS 枠プレビューに失敗: {e}")
+
+        app._edit_update_display = wrapped
+        app._ai_display_wrapped = True
+
+    def _refresh_frame_preview(self):
+        self._layout_cache.clear()
+        if hasattr(self.app, "_edit_update_display"):
+            self.app._edit_update_display()
+
+    def _landmarks_for(self, clip_id):
+        if clip_id not in self._lm_cache:
+            try:
+                self._lm_cache[clip_id] = landmarks_from_track(load_club_track(analysis_dir(self.app.project_dir, clip_id)))
+            except Exception:
+                self._lm_cache[clip_id] = {}
+        return self._lm_cache[clip_id]
+
+    def _current_layout(self):
+        """編集中の軌道 (観測 + 推定 + 手直し) と骨格から、縦型書き出しの枠 (Layout, info) を計算 (点が変わらなければキャッシュ)"""
+        app = self.app
+        cid = getattr(app, "_edit_clip_id", None)
+        clip = app.clip_manager.get_clip(cid) if cid else None
+        if clip is None or not getattr(app, "_edit_swings", None):
+            return None, None
+        lm = self._landmarks_for(cid)
+        if not any(len(sw.points) >= 2 for sw in app._edit_swings) and not lm:
+            return None, None            # 軌道も骨格も無ければ枠は決められない
+        cfg = get_ai_settings(app.settings)
+        mode = cfg.get("sns", {}).get("layout", "auto")
+        key = (cid, mode, tuple((tuple(p) for sw in app._edit_swings for p in sw.points)),
+               tuple((tuple(h) if h else None) for sw in app._edit_swings for h in (getattr(sw, "handles", None) or [])))
+        if self._layout_cache.get("key") == key:
+            return self._layout_cache["layout"], self._layout_cache["info"]
+        from ai.sns_render import plan_layout
+        W, H = int(getattr(clip, "width", 1920) or 1920), int(getattr(clip, "height", 1080) or 1080)
+        real_fps = clip.fps * realtime_factor(clip.fps, cfg["source_kind"])
+        layout, info = plan_layout(W, H, [sw for sw in app._edit_swings if len(sw.points) >= 2], lm, mode, real_fps=real_fps)
+        self._layout_cache = {"key": key, "layout": layout, "info": info}
+        return layout, info
+
+    def _draw_frame_preview(self):
+        app = self.app
+        if not getattr(self, "frame_preview_var", None) or not self.frame_preview_var.get():
+            self.frame_label.configure(text="")
+            return
+        layout, info = self._current_layout()
+        if layout is None:
+            self.frame_label.configure(text="")
+            return
+        c = app.edit_canvas
+        cur = getattr(app, "_edit_frame_no", 0)
+        kind = layout.kind
+        r = layout.rect_for(cur)
+        clip = app.clip_manager.get_clip(app._edit_clip_id)
+        W, H = int(getattr(clip, "width", 1920) or 1920), int(getattr(clip, "height", 1080) or 1080)
+        if r is None:
+            r = layout.pad_region() or (0, 0, W, H)
+            color, title = "#FFB347", "SNS: この範囲を縮小して表示 (pad)"
+        else:
+            color = "#00E5FF" if info.get("fits") else "#FF6A6A"
+            title = f"SNS 9:16 ({kind})"
+        x0, y0 = app._edit_video_to_canvas(r[0], r[1])
+        x1, y1 = app._edit_video_to_canvas(r[0] + r[2], r[1] + r[3])
+        c.create_rectangle(x0, y0, x1, y1, outline=color, width=2, dash=(8, 5), stipple="gray25", tags="handles")
+        c.create_text(x0 + 6, y0 + 6, text=title, anchor="nw", fill=color, font=("Meiryo UI", 10, "bold"), tags="handles")
+        warn = ""
+        if not info.get("fits"):
+            if kind == "crop":
+                warn = "⚠ 9:16 に収まりません (crop 設定のままだとはみ出します)"
+            elif kind == "pan":
+                warn = "9:16 に収まらないため、枠を軌道に合わせて動かします (pan)"
+            else:
+                warn = "9:16 に収まらないため、縮小して全体を表示します (pad)"
+            c.create_text(x0 + 6, y1 - 6, text=warn, anchor="sw", fill="#FFB347", font=("Meiryo UI", 10, "bold"), tags="handles")
+        self.frame_label.configure(text=warn, text_color="#FF6A6A" if (kind == "crop" and not info.get("fits")) else "#E0B040")
+
     def _wrap_select_clip(self):
         """クリップ選択時に、保存済みの区間指標・未描画区間・撮影方向を右パネルへ反映する"""
         app = self.app
@@ -189,6 +289,8 @@ class EditTools:
         orig = app._edit_select_clip
 
         def wrapped(clip_id, _orig=orig):
+            self._layout_cache.clear()
+            self._lm_cache.pop(clip_id, None)
             _orig(clip_id)
             try:
                 if clip_id not in self._undrawn:
@@ -510,6 +612,8 @@ class EditTools:
             app._edit_update_color_buttons()
             app._edit_update_display()
         app._clips_tab_dirty = app._edit_tab_dirty = True
+        self._layout_cache.clear()
+        self._lm_cache.pop(clip.id, None)
         self._show_undrawn(clip.id)
         if res is None:
             return

@@ -125,6 +125,9 @@ clips.json / playout.json / settings.json
   スイング一覧のディープコピー (本数が変わるため)。人が削除した自動点は `corrections.json` の `deleted` →
   `ai/dataset.py` で negative として保存され、`tools/train_clubhead.py` が負例 (その座標の周りだけ 0 に寄せる) に使う。
 - 軌道の `points` のフレーム番号は **clip.in_frame 基準の相対値**(playout/編集書き出しとも `frame - in_frame` で描画)。
+- 縦型 (SNS) の枠は `ai/sns_render.plan_layout` (軌道のスプライン全体 + 書き出し範囲の骨格 + ボールの外接矩形、余白 5%) →
+  `compute_layout` (crop / pad / pan、`fits` は内容が 9:16 固定枠に収まるか) → `Layout` (tf / map_pt / inside、pan はフレームごとの枠)。
+  編集タブのプレビュー (`edit_hook._draw_frame_preview`) も同じ関数を使う。書き出し後に `trajectory_outside` ではみ出しを検査する。
 - `TrajectoryData.sources` は points と同じ長さで各点の由来 (`observed` / `estimated` / `manual`)。推定点は編集タブで中抜き表示、
   人が動かすと manual、`ai/dataset.py` は estimated のままの点を学習データに入れない。送出・縦型は由来を区別せず同じ見た目で描く。
   点を増減・並べ替えるコードは points / handles / sources を必ず同時に扱う (`_edit_ensure_sources`)。

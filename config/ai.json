@@ -24,5 +24,6 @@
     "min_wrist_ratio": 0.05
   },
   "_trajectory_fill": "prior = 観測の無い区間を推定で埋める (既定) / off = 推定区間は描かない",
-  "trajectory_fill": "prior"
+  "trajectory_fill": "prior",
+  "_sns_layout": "sns.layout: auto (収まれば固定クロップ、収まらなければ pad) / crop / pan (収まらなければ動的クロップ) / pad"
 }
