@@ -1,6 +1,7 @@
 """eval_prior — 推定 (trajectory_prior) の精度を、観測を隠して測る。
 
     python tools/eval_prior.py --split holdout|tune|all [--hide 0.3] [--block-sec 0.25] [--seed 0] [--tag <tag>]
+                               [--prior-dir <フォルダ>]   (日付付きの候補テンプレートを評価するとき。既定は models/)
 
 holdout には正解ラベルが無いので、信頼できる観測区間の一部を隠し (block-sec 秒のブロックを hide の割合)、
 隠したフレームを prior で推定して観測との px 誤差を測る。観測区間 (隠していないフレーム) は観測そのものなので誤差 0 だが、
@@ -63,6 +64,7 @@ def main() -> int:
     block_sec = float(args[args.index("--block-sec") + 1]) if "--block-sec" in args else 0.25
     seed = int(args[args.index("--seed") + 1]) if "--seed" in args else 0
     tag = args[args.index("--tag") + 1] if "--tag" in args else "prior"
+    prior_dir = args[args.index("--prior-dir") + 1] if "--prior-dir" in args else None
     sp = yaml.safe_load((ROOT / "tests" / "real" / "split.yaml").read_text(encoding="utf-8"))
     stems = []
     for part in (["tune", "holdout"] if split == "all" else [split]):
@@ -82,7 +84,7 @@ def main() -> int:
             ys = [p[1] for lm in res.landmarks.values() for p in lm]
             W, H = (1920, 1080) if max(xs) > 1100 or max(ys) > 1100 else (1280, 720)
         angle = estimate_camera_from_landmarks(res.landmarks, W or 1920, H or 1080, res.real_fps)
-        prior = load_prior(angle) if angle in ("dtl", "face_on") else None
+        prior = load_prior(angle, prior_dir) if angle in ("dtl", "face_on") else None
         good = [seg for seg, q, ok in res.segment_quality(gate=resolve_gate()) if ok]
         obs = {int(p[2]): (p[0], p[1]) for seg in good for p in seg}
         if len(obs) < 20:
@@ -111,7 +113,7 @@ def main() -> int:
             if errs:
                 rows.append((stem, angle, len(hidden), len(visible), round(float(np.median(errs)), 1), round(float(np.mean(errs)), 1),
                              ("prior" if use_prior else "物理のみ") + ("" if (prior is not None or not use_prior) else " (テンプレート無し→物理)")))
-    lines = [f"# 推定 (trajectory_prior) 評価 ({time.strftime('%Y%m%d_%H%M')}, tag={tag}, split={split}, hide={hide}, block={block_sec}s, seed={seed})", "",
+    lines = [f"# 推定 (trajectory_prior) 評価 ({time.strftime('%Y%m%d_%H%M')}, tag={tag}, split={split}, hide={hide}, block={block_sec}s, seed={seed}, prior_dir={prior_dir or 'models/'})", "",
              "観測区間の一部をブロック単位で隠し、隠したフレームを推定して観測との px 誤差 (元解像度) を測る。観測区間は観測そのものを使うので誤差 0。", "",
              f"{'素材':<26} {'方向':<8} {'隠した':>5} {'残した':>5} {'中央値px':>8} {'平均px':>7}  方式"]
     for r in rows:

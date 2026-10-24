@@ -38,13 +38,15 @@ EST_STEP_SEC = 0.05            # 推定点を制御点として置く間隔 (実
 RESIDUAL_TAU_SEC = 0.15        # 片側しか観測が無いときの残差の減衰時定数
 
 
-def prior_path(angle: str) -> Path:
+def prior_path(angle: str, prior_dir=None) -> Path:
     from ai import resource_root
-    return resource_root() / "models" / f"trajectory_prior_{angle}.json"
+    base = Path(prior_dir) if prior_dir else resource_root() / "models"
+    return base / f"trajectory_prior_{angle}.json"
 
 
-def load_prior(angle: str) -> Optional[dict]:
-    p = prior_path(angle)
+def load_prior(angle: str, prior_dir=None) -> Optional[dict]:
+    """テンプレートを読む。prior_dir を指定すると models/ 以外 (日付付きの候補フォルダ) から読む。"""
+    p = prior_path(angle, prior_dir)
     if not p.exists():
         return None
     try:

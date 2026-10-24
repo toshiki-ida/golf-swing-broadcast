@@ -22,9 +22,11 @@ param(
     [string]$Split = "holdout",
     [string]$Name = "",
     [string]$Previous = "",
+    [string]$PrevTrainGlob = "",
     [switch]$Curve,
     [switch]$SkipEval
 )
+# -PrevTrainGlob "models\clubhead_20261023_982*.train.json" : previous cycle's training records for the learning-curve comparison
 # -Previous <inventory.json> : show the delta against a previous inventory
 # -Curve                     : also train with 25/50/75% of the training clips (learning curve) and evaluate all models
 $ErrorActionPreference = "Stop"
@@ -53,8 +55,10 @@ $inv = Get-Content $invJson -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($inv.n_strong_usable -lt 20) { throw "not enough usable strong labels ($($inv.n_strong_usable)); collect more before retraining" }
 
 # ---------------------------------------------------------------- 1b. trajectory prior (template for filling unobserved spans)
-Step "1b. trajectory prior (models	rajectory_prior_<angle>.json)"
-cmd.exe /c ('"' + $py + '" toolsuild_prior.py --dataset "' + $Dataset + '" > "' + (Join-Path $work "prior.txt") + '" 2>&1')
+# The new templates go to a dated folder; models\trajectory_prior_<angle>.json (current) is NOT overwritten.
+$priorDir = Join-Path $root ("models\prior_" + $stamp)
+Step "1b. trajectory prior -> $priorDir (current models\trajectory_prior_*.json untouched)"
+cmd.exe /c ('"' + $py + '" tools\build_prior.py --dataset "' + $Dataset + '" --out "' + $priorDir + '" > "' + (Join-Path $work "prior.txt") + '" 2>&1')
 if ($LASTEXITCODE -ne 0) { Get-Content (Join-Path $work "prior.txt") -Encoding UTF8 -Tail 10; throw "build_prior failed" }
 Get-Content (Join-Path $work "prior.txt") -Encoding UTF8 | Select-String -Pattern "^(face_on|dtl|unknown)" | ForEach-Object { Write-Host ("  " + $_.Line) }
 
@@ -97,13 +101,32 @@ if (-not $SkipEval) {
     Write-Host ("result: " + $resultMd.FullName)
 }
 
+# ---------------------------------------------------------------- 3b. prior evaluation (current vs new) on the same split
+$priorResults = @()
+if (-not $SkipEval) {
+    Step "3b. trajectory prior evaluation on $Split : current vs new"
+    foreach ($pair in @(@("prior_current_" + $stamp, ""), @("prior_new_" + $stamp, $priorDir))) {
+        $ptag = $pair[0]; $pdir = $pair[1]
+        $pargs = ' tools\eval_prior.py --split ' + $Split + ' --tag ' + $ptag
+        if ($pdir) { $pargs += ' --prior-dir "' + $pdir + '"' }
+        $plog = Join-Path $work ($ptag + ".log")
+        cmd.exe /c ('"' + $py + '"' + $pargs + ' > "' + $plog + '" 2>&1')
+        if ($LASTEXITCODE -ne 0) { Get-Content $plog -Tail 10; throw "eval_prior failed ($ptag)" }
+        $pr = Get-ChildItem tests\real\results -Filter ("*_prior_" + $ptag + "_*.md") | Sort-Object LastWriteTime | Select-Object -Last 1
+        if ($pr) { $priorResults += $pr.FullName; Write-Host ("  " + $pr.Name) }
+    }
+}
+
 # ---------------------------------------------------------------- 4. report
 Step "4. report"
 $report = Join-Path $work "report.md"
 $rargs = @("tools\retrain_report.py", "--inventory", $invJson, "--inventory-txt", $invTxt, "--out", $report)
 foreach ($tj in $trainJsons) { $rargs += @("--train", $tj) }
+if ($PrevTrainGlob) { foreach ($pj in (Get-ChildItem $PrevTrainGlob -ErrorAction SilentlyContinue)) { $rargs += @("--prev-train", $pj.FullName) } }
+foreach ($pr in $priorResults) { $rargs += @("--prior-result", $pr) }
 if ($resultMd) { $rargs += @("--result", $resultMd.FullName) }
 & $py @rargs
 if ($LASTEXITCODE -ne 0) { throw "report failed" }
 Write-Host "`nreport : $report"
 Write-Host "model  : $model (current models\clubhead.onnx untouched)"
+Write-Host "prior  : $priorDir (current models\trajectory_prior_*.json untouched)"

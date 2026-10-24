@@ -56,6 +56,10 @@ def main() -> int:
             except UnicodeDecodeError:
                 continue
     train_paths = [Path(args[i + 1]) for i, a_ in enumerate(args) if a_ == "--train" and i + 1 < len(args)]
+    prev_paths = [Path(args[i + 1]) for i, a_ in enumerate(args) if a_ == "--prev-train" and i + 1 < len(args)]
+    prevs = [json.loads(p.read_text(encoding="utf-8")) for p in prev_paths if p.exists()]
+    prevs.sort(key=lambda t: (t.get("train_fraction", 1.0), t.get("n_strong_train", 0)))
+    prior_results = [Path(args[i + 1]) for i, a_ in enumerate(args) if a_ == "--prior-result" and i + 1 < len(args)]
     trains = [json.loads(p.read_text(encoding="utf-8")) for p in train_paths if p.exists()]
     trains.sort(key=lambda t: (t.get("train_fraction", 1.0), t.get("n_strong_train", 0)))
     train = trains[-1] if trains else {}
@@ -115,6 +119,27 @@ def main() -> int:
             v = t.get("val") or {}
             L.append(f"| {t.get('train_fraction', 1.0):.0%} | {len(t.get('train_clips', []))} | {t.get('n_strong_train')} | "
                      f"{v.get('median_px')} | {v.get('pck15')} | {v.get('pck30')} | {v.get('detected')}/{v.get('n')} | `{Path(t.get('onnx', '')).stem}` |")
+        if prevs:
+            L.append("\n前回の学習曲線との比較 (検証クリップは今回と前回で異なるので目安):\n")
+            L.append("| 割合 | 前回 学習点 | 前回 中央値 px | 前回 PCK@30 | 今回 学習点 | 今回 中央値 px | 今回 PCK@30 |\n|---|---|---|---|---|---|---|")
+            by_frac_prev = {round(t.get("train_fraction", 1.0), 2): t for t in prevs}
+            for t in trains:
+                fr = round(t.get("train_fraction", 1.0), 2)
+                pv = by_frac_prev.get(fr) or {}
+                pvv = pv.get("val") or {}
+                v = t.get("val") or {}
+                L.append(f"| {fr:.0%} | {pv.get('n_strong_train', '-')} | {pvv.get('median_px', '-')} | {pvv.get('pck30', '-')} | "
+                         f"{t.get('n_strong_train')} | {v.get('median_px')} | {v.get('pck30')} |")
+    if prior_results:
+        L.append("\n## 2c. 軌道テンプレート (trajectory_prior) の比較 (holdout、観測を隠すマスク評価)\n")
+        for pr in prior_results:
+            if not pr.exists():
+                continue
+            txt = pr.read_text(encoding="utf-8")
+            head = txt.splitlines()[0] if txt else pr.name
+            L.append(f"**{pr.name}** {head}\n")
+            if "## 撮影方向" in txt:
+                L.append("```\n" + txt.split("## 撮影方向", 1)[1].split("結果を保存")[0].strip() + "\n```")
     # ---- 3. holdout
     L.append("\n## 3. holdout での比較 (tools/eval_club.py)\n")
     if modes:
