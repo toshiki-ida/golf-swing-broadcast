@@ -1,0 +1,33 @@
+# 推定 (trajectory_prior) 評価 (20261024_1221, tag=c3_current, split=holdout, hide=0.3, block=0.25s, seed=0, prior_dir=models/)
+
+観測区間の一部をブロック単位で隠し、隠したフレームを推定して観測との px 誤差 (元解像度) を測る。観測区間は観測そのものを使うので誤差 0。
+
+素材                         方向         隠した   残した    中央値px    平均px  方式
+rec_0611_165010_trim       face_on     30    95    301.2   270.4  prior
+rec_0611_165010_trim       face_on     30    95    498.1   426.9  物理のみ
+rec_0611_130035_trim       face_on     30   124    214.7   225.4  prior
+rec_0611_130035_trim       face_on     30   124    259.7   241.7  物理のみ
+rec_0611_162834_trim       face_on     30   108    145.2   154.1  prior
+rec_0611_162834_trim       face_on     30   108    155.7   171.4  物理のみ
+rec_0611_151507_trim       dtl         30   141    152.6   224.1  prior (テンプレート無し→物理)
+rec_0611_151507_trim       dtl         30   141    152.6   224.1  物理のみ
+rec_0611_163425_trim       face_on     30    65     89.6    90.2  prior
+rec_0611_163425_trim       face_on     30    65     95.0    96.4  物理のみ
+rec_0612_122051_trim       face_on     15    39     71.4    63.0  prior
+rec_0612_122051_trim       face_on     15    39     42.7    45.6  物理のみ
+rec_0611_150726_trim       face_on     30   137    214.0   195.3  prior
+rec_0611_150726_trim       face_on     30   137    319.1   285.7  物理のみ
+
+## 撮影方向 × 局面 (誤差 / 身長代替値、中央値)
+
+方式       方向       局面               n     中央値      平均
+prior    dtl      down            13   0.499   0.575
+prior    dtl      follow          17   0.235   0.255
+prior    face_on  address-top     45   0.183   0.210
+prior    face_on  down            51   0.514   0.491
+prior    face_on  follow          69   0.338   0.380
+物理       dtl      down            13   0.499   0.575
+物理       dtl      follow          17   0.235   0.255
+物理       face_on  address-top     45   0.251   0.275
+物理       face_on  down            51   0.784   0.738
+物理       face_on  follow          69   0.354   0.404

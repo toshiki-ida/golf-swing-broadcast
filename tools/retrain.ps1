@@ -105,7 +105,9 @@ if (-not $SkipEval) {
 $priorResults = @()
 if (-not $SkipEval) {
     Step "3b. trajectory prior evaluation on $Split : current vs new"
-    foreach ($pair in @(@("prior_current_" + $stamp, ""), @("prior_new_" + $stamp, $priorDir))) {
+    # NOTE: "a" + $x, $y parses as "a" + ($x, $y) in PowerShell, so each element must be parenthesized
+    $pairs = @(, @(("prior_current_" + $stamp), "")) + @(, @(("prior_new_" + $stamp), $priorDir))
+    foreach ($pair in $pairs) {
         $ptag = $pair[0]; $pdir = $pair[1]
         $pargs = ' tools\eval_prior.py --split ' + $Split + ' --tag ' + $ptag
         if ($pdir) { $pargs += ' --prior-dir "' + $pdir + '"' }
