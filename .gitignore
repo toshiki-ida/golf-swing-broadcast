@@ -8,3 +8,13 @@ build/
 !GolfSwingBroadcast.spec
 .env
 *.exe
+
+# 仮想環境
+.venv/
+
+# setup_assets.py で取得するアセット (数十MB。exe には spec が同梱する)
+models/
+assets/fonts/
+handoff/*
+!handoff/README.md
+datasets/

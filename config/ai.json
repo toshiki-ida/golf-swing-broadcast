@@ -1,0 +1,29 @@
+{
+  "_comment": "AI 機能の現場調整用。exe 同階層の config/ai.json が _internal/config/ai.json より優先。settings.json の \"ai\" はさらに優先。",
+  "gate": {
+    "_comment": "信頼度ゲート。区間ごとに全条件を満たしたものだけ自動で描く。編集タブの AI 欄に各区間の値と結果が出る。値の根拠は docs/CLUB_TRACKING_EVAL.md §10",
+    "_min_observed": "区間の観測フレーム数の下限",
+    "_min_rate": "観測率 (観測フレーム / 区間長) の下限",
+    "_min_continuity": "連続性 (移動量が上限内だった割合) の下限",
+    "_min_hand_connect_ratio": "手元接続率の下限 (0 = 使わない)",
+    "_min_motion_bh": "ヘッドの道のり (身長比) の下限。静止物の追尾を止める",
+    "_max_on_head_ratio": "選手の頭に乗っていた割合の上限",
+    "_max_dist_std": "手首距離 (身長比) のばらつきの上限",
+    "_max_dist_change": "手首距離の 1 フレーム変化 (身長比) の上限",
+    "_min_speed_ratio": "ヘッド速度 / 手首速度 の下限",
+    "_min_wrist_ratio": "手の道のり / ヘッドの道のり の下限 (ヘッドが 2 身長以上動いたときだけ)",
+    "min_observed": 6,
+    "min_rate": 0.35,
+    "min_continuity": 0.7,
+    "min_hand_connect_ratio": 0.0,
+    "min_motion_bh": 0.3,
+    "max_on_head_ratio": 0.3,
+    "max_dist_std": 0.19,
+    "max_dist_change": 0.07,
+    "min_speed_ratio": 1.0,
+    "min_wrist_ratio": 0.05
+  },
+  "_trajectory_fill": "prior = 観測の無い区間を推定で埋める (既定) / off = 推定区間は描かない",
+  "trajectory_fill": "prior",
+  "_sns_layout": "sns.layout: auto (収まれば固定クロップ、収まらなければ pad) / crop / pan (収まらなければ動的クロップ) / pad"
+}

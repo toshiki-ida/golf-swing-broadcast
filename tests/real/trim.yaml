@@ -1,0 +1,28 @@
+# tests/real の素材を「スイング 1 回分」(アドレス前 2 秒 〜 フィニッシュ後 1 秒程度) に切り出す位置。
+# フレーム番号は元素材のもの。HFR 2x (29.97fps 記録) は 1 秒 = 120 フレーム、59.94p は 60 フレーム。
+# address_est / finish_est は 0.25 秒刻みのサムネイル目視による概算 (±30 フレーム程度)。
+# 終盤に選手の顔へズームする素材は、ズーム開始の手前で終わらせる (zoom_cut: true)。
+# 切り出しは tools/trim_real.py → tests/real/trimmed/<名前>_trim.mp4 (git 管理外)。
+# 評価 (tools/eval_club.py --all) と正解ラベルは切り出し後のファイルに対して行う。
+
+rec_0611_130035.mp4: {start: 0,   end: 265, address_est: 100, finish_est: 235, zoom_cut: true,  note: ギャラリー多数。f270 以降は顔へズーム}
+rec_0611_130128.mp4: {start: 0,   end: 290, address_est: 100, finish_est: 245, zoom_cut: true,  note: 同上。f300 以降ズーム}
+rec_0611_130219.mp4: {skip: true, note: 3.5 秒でテイクバック開始までしか収録されていない (スイングが収まっていない)}
+rec_0611_130952.mp4: {start: 0,   end: 360, address_est: 120, finish_est: 240, note: 以降は歩いて移動・キャディ合流}
+rec_0611_131029.mp4: {start: 0,   end: 182, address_est: 0,   finish_est: 120, note: 冒頭でテイクバック開始済み (アドレス前の余白なし)}
+rec_0611_141938.mp4: {start: 0,   end: 246, address_est: 60,  finish_est: 210, note: 手前にバッグ}
+rec_0611_150726.mp4: {start: 30,  end: 454, address_est: 270, finish_est: 390, note: 左にキャディが常時。アドレスが長い}
+rec_0611_151507.mp4: {start: 0,   end: 258, address_est: 60,  finish_est: 240}
+rec_0611_160311.mp4: {start: 0,   end: 364, address_est: 240, finish_est: 350, note: 斜面・人物小さい・左にカメラマン}
+rec_0611_161732.mp4: {start: 90,  end: 494, address_est: 330, finish_est: 480, note: 後ろにカメラマン 2 人}
+rec_0611_161853.mp4: {start: 0,   end: 392, address_est: 210, finish_est: 345, note: 右にキャディ}
+rec_0611_162655.mp4: {start: 0,   end: 328, address_est: 150, finish_est: 270, note: 看板・ギャラリー}
+rec_0611_162742.mp4: {start: 0,   end: 420, address_est: 150, finish_est: 300, note: 24 秒中にスイングが 2 回 (f600 付近に 2 回目)。1 回目を使う}
+rec_0611_162834.mp4: {start: 0,   end: 160, address_est: 20,  finish_est: 105, zoom_cut: true,  note: 59.94p。f165 以降は顔へズーム}
+rec_0611_163425.mp4: {start: 0,   end: 240, address_est: 75,  finish_est: 180, note: 59.94p。後ろに 2 人}
+rec_0611_164140.mp4: {start: 0,   end: 308, address_est: 150, finish_est: 270}
+rec_0611_164617.mp4: {start: 0,   end: 296, address_est: 30,  finish_est: 150, note: 左にキャディが常時}
+rec_0611_165010.mp4: {start: 30,  end: 450, address_est: 270, finish_est: 390, note: 後ろにカメラマン}
+rec_0612_122051.mp4: {start: 0,   end: 175, address_est: 30,  finish_est: 150, zoom_cut: true,  note: 59.94p。ギャラリー多数、f180 以降ズーム}
+rec_0612_123119.mp4: {start: 0,   end: 175, address_est: 45,  finish_est: 140, zoom_cut: true,  note: 59.94p。f180 以降ズーム}
+rec_0612_135231.mp4: {start: 180, end: 410, address_est: 300, finish_est: 390, note: 59.94p。引きの画で人物が小さい。長いワッグル}

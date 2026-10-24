@@ -1,7 +1,16 @@
-opencv-python>=4.5.0
+# -*- coding: utf-8 -*-
+# opencv-contrib-python: mediapipe の依存。opencv-python と同じ cv2 を上書きし合うので
+# どちらか一方だけを入れる (両方入れると壊れる)
+opencv-contrib-python>=4.5.0
 numpy>=1.20.0
 scipy>=1.7.0
 customtkinter>=5.0.0
 Pillow>=9.0.0
 comtypes>=1.1.0
 hidapi>=0.14.0
+# AI 解析 (MediaPipe Pose)。1.1 以降は numpy 2 対応・jax 不要
+mediapipe>=1.1.0
+# フィードバックコメントのルール (config/rules.yaml)
+PyYAML>=6.0
+
+onnxruntime>=1.17
